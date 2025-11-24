@@ -2,7 +2,7 @@
     "api_url": {
         "description": "【通用】API的URL地址",
         "type": "string",
-        "hint": "通用模式：填完整URL（如 .../v1/chat/completions）。Gemini官方模式：填Base URL（如 .../v1beta/models/），插件会自动拼接模型名。",
+        "hint": "通用模式：填完整URL（如 https://api.bltcy.ai/v1/chat/completions）。Gemini官方模式：填Base URL（如 https://反代或者官方地址），插件会自动拼接模型名。",
         "default": "https://api.bltcy.ai/v1/chat/completions"
     },
     "api_mode": {
@@ -167,3 +167,4 @@
         "default": []
     }
 }
+
