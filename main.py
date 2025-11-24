@@ -7,7 +7,7 @@ import random
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 import aiohttp
 from PIL import Image as PILImage
@@ -21,25 +21,25 @@ from astrbot.core.platform.astr_message_event import AstrMessageEvent
 
 
 PRESET_MODELS = [
-    "nano-banana",
-    "nano-banana-2-4k",
-    "nano-banana-2-2k",
-    "gemini-3-pro-image-preview",
-    "gemini-2.5-flash-image",
-    "nano-banana-hd",
-    "gemini-2.5-flash-image-preview"
+    "nano-banana",                    # 1
+    "nano-banana-2-4k",               # 2
+    "nano-banana-2-2k",               # 3
+    "gemini-3-pro-image-preview",     # 4
+    "gemini-2.5-flash-image",         # 5
+    "nano-banana-hd",                 # 6
+    "gemini-2.5-flash-image-preview"  # 7
 ]
 
 
 @register(
     "astrbot_plugin_shoubanhua",
     "shskjw",
-    "Google Gemini 手办化/图生图插件",
-    "1.5.0",
+    "支持第三方和原生Google Gemini 终极缝合怪，文生图/图生图插件",
+    "1.5.5",
     "https://github.com/shkjw/astrbot_plugin_shoubanhua",
 )
 class FigurineProPlugin(Star):
-    
+
     class ImageWorkflow:
         def __init__(self, proxy_url: str | None = None, max_retries: int = 3):
             if proxy_url:
@@ -48,24 +48,27 @@ class FigurineProPlugin(Star):
             self.max_retries = max_retries
 
         async def _download_image(self, url: str) -> bytes | None:
-            logger.info(f"正在下载图片: {url} (重试上限: {self.max_retries})")
+            """下载网络图片，包含重试机制"""
+            logger.info(f"正在下载图片: {url}")
             
             for i in range(self.max_retries + 1):
                 try:
+                    # 每次请求创建独立 Session，避免连接复用导致的意外断开
                     async with aiohttp.ClientSession() as session:
                         async with session.get(url, proxy=self.proxy, timeout=60) as resp:
                             resp.raise_for_status()
                             return await resp.read()
                 except Exception as e:
                     if i < self.max_retries:
-                        logger.warning(f"图片下载失败 (第{i+1}次): {e}, 1秒后重试...")
+                        logger.warning(f"下载失败 ({i + 1}/{self.max_retries}): {e}, 1秒后重试...")
                         await asyncio.sleep(1)
                     else:
-                        logger.error(f"图片下载最终失败: {url}, 错误: {e}")
+                        logger.error(f"下载最终失败: {url}, 错误: {e}")
                         return None
             return None
 
         async def _get_avatar(self, user_id: str) -> bytes | None:
+            """获取QQ头像"""
             if not user_id.isdigit():
                 return None
             
@@ -73,21 +76,25 @@ class FigurineProPlugin(Star):
             return await self._download_image(avatar_url)
 
         def _extract_first_frame_sync(self, raw: bytes) -> bytes:
+            """同步处理：GIF取首帧，转为PNG格式"""
             img_io = io.BytesIO(raw)
             try:
                 with PILImage.open(img_io) as img:
                     if getattr(img, "is_animated", False):
                         img.seek(0)
                     
-                    first_frame = img.convert("RGBA")
+                    # 统一转为 RGBA 模式并保存为 PNG
+                    img_converted = img.convert("RGBA")
                     out_io = io.BytesIO()
-                    first_frame.save(out_io, format="PNG")
+                    img_converted.save(out_io, format="PNG")
                     return out_io.getvalue()
             except Exception:
+                # 如果转换失败，原样返回，避免阻断流程
                 pass
             return raw
 
         async def _load_bytes(self, src: str) -> bytes | None:
+            """通用图片加载入口"""
             raw: bytes | None = None
             loop = asyncio.get_running_loop()
             
@@ -104,47 +111,42 @@ class FigurineProPlugin(Star):
             return await loop.run_in_executor(None, self._extract_first_frame_sync, raw)
 
         async def get_images(self, event: AstrMessageEvent) -> List[bytes]:
+            """从消息事件中提取所有图片"""
             img_bytes_list: List[bytes] = []
             at_user_ids: List[str] = []
 
+            # 1. 遍历回复链中的图片
             for seg in event.message_obj.message:
                 if isinstance(seg, Reply) and seg.chain:
                     for s_chain in seg.chain:
                         if isinstance(s_chain, Image):
-                            if s_chain.url:
-                                img = await self._load_bytes(s_chain.url)
-                                if img:
-                                    img_bytes_list.append(img)
-                            elif s_chain.file:
-                                img = await self._load_bytes(s_chain.file)
-                                if img:
-                                    img_bytes_list.append(img)
+                            if s_chain.url and (img := await self._load_bytes(s_chain.url)):
+                                img_bytes_list.append(img)
+                            elif s_chain.file and (img := await self._load_bytes(s_chain.file)):
+                                img_bytes_list.append(img)
 
+            # 2. 遍历消息本体中的图片
             for seg in event.message_obj.message:
                 if isinstance(seg, Image):
-                    if seg.url:
-                        img = await self._load_bytes(seg.url)
-                        if img:
-                            img_bytes_list.append(img)
-                    elif seg.file:
-                        img = await self._load_bytes(seg.file)
-                        if img:
-                            img_bytes_list.append(img)
+                    if seg.url and (img := await self._load_bytes(seg.url)):
+                        img_bytes_list.append(img)
+                    elif seg.file and (img := await self._load_bytes(seg.file)):
+                        img_bytes_list.append(img)
                 elif isinstance(seg, At):
                     at_user_ids.append(str(seg.qq))
 
             if img_bytes_list:
                 return img_bytes_list
 
+            # 3. 如果没有图片，检查是否有 At 用户，取其头像
             if at_user_ids:
                 for user_id in at_user_ids:
-                    avatar = await self._get_avatar(user_id)
-                    if avatar:
+                    if avatar := await self._get_avatar(user_id):
                         img_bytes_list.append(avatar)
                 return img_bytes_list
 
-            avatar = await self._get_avatar(event.get_sender_id())
-            if avatar:
+            # 4. 都没有，取发送者头像
+            if avatar := await self._get_avatar(event.get_sender_id()):
                 img_bytes_list.append(avatar)
 
             return img_bytes_list
@@ -152,24 +154,27 @@ class FigurineProPlugin(Star):
         async def terminate(self):
             pass
 
+
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.conf = config
         self.plugin_data_dir = StarTools.get_data_dir()
         
+        # 数据文件路径定义
         self.user_counts_file = self.plugin_data_dir / "user_counts.json"
-        self.user_counts: Dict[str, int] = {}
-        
         self.group_counts_file = self.plugin_data_dir / "group_counts.json"
-        self.group_counts: Dict[str, int] = {}
-        
         self.user_checkin_file = self.plugin_data_dir / "user_checkin.json"
-        self.user_checkin_data: Dict[str, str] = {}
         
+        # 内存数据缓存
+        self.user_counts: Dict[str, int] = {}
+        self.group_counts: Dict[str, int] = {}
+        self.user_checkin_data: Dict[str, str] = {}
         self.prompt_map: Dict[str, str] = {}
         
+        # Key 轮询相关
         self.key_index = 0
         self.key_lock = asyncio.Lock()
+        
         self.iwf: Optional[FigurineProPlugin.ImageWorkflow] = None
 
     async def initialize(self):
@@ -179,10 +184,10 @@ class FigurineProPlugin(Star):
         
         self.iwf = self.ImageWorkflow(proxy_url, max_retries=retries)
         
-        await self._load_prompt_map()
         await self._load_user_counts()
         await self._load_group_counts()
         await self._load_user_checkin_data()
+        await self._load_prompt_map()
         
         logger.info("FigurinePro 插件已加载")
         
@@ -190,18 +195,30 @@ class FigurineProPlugin(Star):
             logger.warning("FigurinePro: 未配置任何 API 密钥")
 
     async def _load_prompt_map(self):
+        """加载提示词配置"""
         self.prompt_map.clear()
+        
+        # 1. 从 conf.prompts 对象加载 (新版结构)
+        prompts_cfg = self.conf.get("prompts", {})
+        if isinstance(prompts_cfg, dict):
+            for k, v in prompts_cfg.items():
+                if isinstance(v, dict) and "default" in v:
+                    self.prompt_map[k] = v["default"]
+                elif isinstance(v, str):
+                    self.prompt_map[k] = v
+        
+        # 2. 兼容旧版 prompt_list 列表配置
         prompt_list = self.conf.get("prompt_list", [])
-        for item in prompt_list:
-            try:
+        if isinstance(prompt_list, list):
+            for item in prompt_list:
                 if ":" in item:
-                    key, value = item.split(":", 1)
-                    self.prompt_map[key.strip()] = value.strip()
-            except ValueError:
-                pass
+                    k, v = item.split(":", 1)
+                    self.prompt_map[k.strip()] = v.strip()
 
     def _get_all_models(self) -> List[str]:
+        """获取包含预设和自定义模型的所有模型列表"""
         models = list(PRESET_MODELS)
+        
         c1 = self.conf.get("custom_model_1", "").strip()
         c2 = self.conf.get("custom_model_2", "").strip()
         
@@ -211,6 +228,11 @@ class FigurineProPlugin(Star):
             models.append(c2)
             
         return models
+
+    def is_global_admin(self, event: AstrMessageEvent) -> bool:
+        """检查是否为全局管理员"""
+        return event.get_sender_id() in self.context.get_config().get("admins_id", [])
+
 
     @filter.command("切换API模式", aliases={"SwitchApi"}, prefix_optional=True)
     async def on_switch_api_mode(self, event: AstrMessageEvent):
@@ -251,6 +273,7 @@ class FigurineProPlugin(Star):
         raw_msg = event.message_str.strip()
         parts = raw_msg.split()
         
+        # 若无参数，显示列表
         if len(parts) == 1:
             current_model = self.conf.get("model", "nano-banana")
             current_api_mode = self.conf.get("api_mode", "generic")
@@ -264,7 +287,7 @@ class FigurineProPlugin(Star):
                 is_custom = idx >= len(PRESET_MODELS)
                 type_mark = " [自]" if is_custom else ""
                 msg += f"{seq_num}. {model_name}{type_mark} {status}\n"
-                
+            
             msg += "------------------\n"
             msg += f"📡 **当前API模式**: {current_api_mode}\n"
             msg += "------------------\n"
@@ -282,7 +305,7 @@ class FigurineProPlugin(Star):
             return
 
         if not arg.isdigit():
-            yield event.plain_result("❌ 格式错误。")
+            yield event.plain_result("❌ 格式错误。请输入数字序号。")
             return
         
         target_idx = int(arg) - 1
@@ -299,6 +322,193 @@ class FigurineProPlugin(Star):
         else:
             yield event.plain_result(f"❌ 序号无效。")
 
+
+    async def _get_pool_api_key(self) -> str | None:
+        """从通用池中轮询获取 Key"""
+        keys = self.conf.get("api_keys", [])
+        if not keys:
+            return None
+            
+        async with self.key_lock:
+            key = keys[self.key_index]
+            self.key_index = (self.key_index + 1) % len(keys)
+            return key
+
+    def _extract_image_url_from_response(self, data: Dict[str, Any]) -> str | None:
+        """从 API 响应中尝试多种路径提取图片"""
+        
+        # 1. 尝试 Gemini 官方格式
+        try:
+            if "candidates" in data:
+                parts = data["candidates"][0]["content"]["parts"]
+                for p in parts:
+                    if "inlineData" in p:
+                        return f"data:{p['inlineData']['mimeType']};base64,{p['inlineData']['data']}"
+                    if "text" in p:
+                        match = re.search(r'https?://[^\s<>")\]]+', p["text"])
+                        if match:
+                            return match.group(0).rstrip(")>,'\"")
+        except:
+            pass
+            
+        # 2. 尝试 Generic (OpenAI) JSON 格式
+        try:
+            return data["choices"][0]["message"]["images"][0]["image_url"]["url"]
+        except:
+            pass
+            
+        # 3. 尝试 Generic 文本内容格式 (Markdown)
+        try:
+            if "choices" in data:
+                content = data["choices"][0]["message"]["content"]
+                match = re.search(r'https?://[^\s<>")\]]+', content)
+                if match:
+                    return match.group(0).rstrip(")>,'\"")
+        except:
+            pass
+            
+        return None
+
+    async def _call_api(self, image_bytes_list: List[bytes], prompt: str, override_model: str | None = None) -> bytes | str:
+        """统一 API 调用入口"""
+        api_url = self.conf.get("api_url")
+        if not api_url:
+            return "API URL 未配置"
+        
+        # 确定使用的模型
+        model_name = override_model or self.conf.get("model", "nano-banana")
+        
+        # --- Key 选择逻辑 ---
+        api_key = None
+        c1 = self.conf.get("custom_model_1", "").strip()
+        c2 = self.conf.get("custom_model_2", "").strip()
+        
+        # 优先使用自定义模型的专用 Key
+        if c1 and model_name == c1:
+            api_key = self.conf.get("custom_model_1_key") or await self._get_pool_api_key()
+        elif c2 and model_name == c2:
+            api_key = self.conf.get("custom_model_2_key") or await self._get_pool_api_key()
+        else:
+            api_key = await self._get_pool_api_key()
+            
+        if not api_key:
+            return "无可用 API Key (请检查通用池或自定义Key配置)"
+
+        headers = {
+            "Content-Type": "application/json",
+            "Connection": "close"
+        }
+        
+        api_mode = self.conf.get("api_mode", "generic")
+        payload = {}
+        final_url = api_url
+
+        # --- 模式分发 ---
+        if api_mode == "gemini_official":
+            # >>> 模式 A: Gemini 官方原生协议 <<<
+            
+            # 1. URL 智能拼接 (处理 /models/ 路径重复问题)
+            if "models/" in api_url:
+                base = api_url.split("models/")[0]
+                final_url = f"{base}models/{model_name}:generateContent"
+            else:
+                base = api_url.rstrip("/")
+                if not base.endswith("v1beta"):
+                    base += "/v1beta"
+                final_url = f"{base}/models/{model_name}:generateContent"
+
+            # 2. 鉴权: 使用 x-goog-api-key 头 (解决反代 401 问题)
+            headers["x-goog-api-key"] = api_key
+            
+            # 3. Payload 构造
+            parts = [{"text": prompt}]
+            for img in image_bytes_list:
+                b64 = base64.b64encode(img).decode("utf-8")
+                parts.append({
+                    "inlineData": {
+                        "mimeType": "image/png",
+                        "data": b64
+                    }
+                })
+            
+            payload = {
+                "contents": [{"parts": parts}],
+                "generationConfig": {"maxOutputTokens": 2048},
+                "safetySettings": [
+                    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
+                ]
+            }
+        
+        else:
+            # >>> 模式 B: Generic / OpenAI 兼容协议 <<<
+            headers["Authorization"] = f"Bearer {api_key}"
+            
+            content = [{"type": "text", "text": prompt}]
+            for img in image_bytes_list:
+                b64 = base64.b64encode(img).decode("utf-8")
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{b64}"}
+                })
+            
+            payload = {
+                "model": model_name,
+                "max_tokens": 1500,
+                "stream": False,
+                "messages": [
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": content}
+                ]
+            }
+
+        # --- 发送请求 ---
+        try:
+            if not self.iwf:
+                return "工作流未初始化"
+                
+            async with aiohttp.ClientSession() as session:
+                async with session.post(final_url, json=payload, headers=headers, proxy=self.iwf.proxy, timeout=120) as resp:
+                    
+                    # 特定错误处理
+                    if resp.status == 404 and api_mode == "gemini_official":
+                        return f"API 404错误: 模型 '{model_name}' 不存在或路径错误。\nURL: {final_url}"
+                    
+                    if resp.status != 200:
+                        text = await resp.text()
+                        return f"API 请求失败 (HTTP {resp.status}): {text[:300]}"
+                    
+                    data = await resp.json()
+                    
+                    if "error" in data:
+                        return json.dumps(data["error"], ensure_ascii=False)
+                    
+                    if "promptFeedback" in data:
+                        pf = data["promptFeedback"]
+                        if pf.get("blockReason"):
+                            return f"Gemini 安全拦截: {pf['blockReason']}"
+                    
+                    url_or_b64 = self._extract_image_url_from_response(data)
+                    
+                    if not url_or_b64:
+                        return f"生成失败，无图片数据。响应: {json.dumps(data)[:200]}..."
+                    
+                    # 图片下载
+                    if url_or_b64.startswith("data:"):
+                        b64 = url_or_b64.split(",")[-1]
+                        return base64.b64decode(b64)
+                    else:
+                        return await self.iwf._download_image(url_or_b64) or "下载生成图片失败"
+
+        except asyncio.TimeoutError:
+            return "请求超时"
+        except Exception as e:
+            logger.error(f"API 调用异常: {e}", exc_info=True)
+            return f"系统错误: {e}"
+
+
     @filter.event_message_type(filter.EventMessageType.ALL, priority=5)
     async def on_figurine_request(self, event: AstrMessageEvent):
         if self.conf.get("prefix", True) and not event.is_at_or_wake_command:
@@ -308,6 +518,7 @@ class FigurineProPlugin(Star):
         if not text:
             return
         
+        # 1. 解析指令和 (序号) 后缀
         full_cmd_match = text.split()[0].strip()
         suffix_match = re.search(r"[\(（](\d+)[\)）]$", full_cmd_match)
         
@@ -322,95 +533,134 @@ class FigurineProPlugin(Star):
         user_prompt = ""
         is_bnn = False
         
+        # 2. 匹配指令与提示词
+        
+        # 2.1 BNN 自定义指令
         if cmd == bnn_command:
             user_prompt = text.removeprefix(full_cmd_match).strip()
             is_bnn = True
             if not user_prompt:
                 return
-        elif cmd in self.prompt_map:
+        
+        # 2.2 检查 prompt_map (包含 config 配置和 lm添加 的内容)
+        elif cmd in self.prompt_map: 
             user_prompt = self.prompt_map.get(cmd)
+        
+        # 2.3 旧版硬编码映射 (兼容性后备)
         else:
+            cmd_map = {
+                "手办化": "figurine_1", "手办化2": "figurine_2", "手办化3": "figurine_3", 
+                "手办化4": "figurine_4", "手办化5": "figurine_5", "手办化6": "figurine_6",
+                "Q版化": "q_version", 
+                "痛屋化": "pain_room_1", "痛屋化2": "pain_room_2",
+                "痛车化": "pain_car", 
+                "cos化": "cos", "cos自拍": "cos_selfie",
+                "孤独的我": "clown", 
+                "第三视角": "view_3", "鬼图": "ghost", "第一视角": "view_1",
+                "手办化帮助": "help"
+            }
+            if cmd in cmd_map:
+                key = cmd_map[cmd]
+                if key == "help": 
+                    yield event.plain_result(self.conf.get("help_text", "帮助未配置"))
+                    return
+                user_prompt = self.prompt_map.get(key)
+            
+            if not user_prompt:
+                return
+
+        if not user_prompt:
+            yield event.plain_result(f"❌ 指令 '{cmd}' 未配置提示词。")
             return
 
+        # 3. 鉴权与次数检查
         sender_id = event.get_sender_id()
         group_id = event.get_group_id()
         is_master = self.is_global_admin(event)
 
         if not is_master:
-            if sender_id in self.conf.get("user_blacklist", []):
-                return
-            if group_id and group_id in self.conf.get("group_blacklist", []):
-                return
-            if self.conf.get("user_whitelist", []) and sender_id not in self.conf.get("user_whitelist", []):
-                return
-            if group_id and self.conf.get("group_whitelist", []) and group_id not in self.conf.get("group_whitelist", []):
-                return
+            # 名单检查
+            if sender_id in self.conf.get("user_blacklist", []): return
+            if group_id and group_id in self.conf.get("group_blacklist", []): return
+            if self.conf.get("user_whitelist", []) and sender_id not in self.conf.get("user_whitelist", []): return
+            if group_id and self.conf.get("group_whitelist", []) and group_id not in self.conf.get("group_whitelist", []): return
             
+            # 次数计算
             user_count = self._get_user_count(sender_id)
-            group_count = self._get_group_count(group_id) if group_id else 0
-            user_limit_on = self.conf.get("enable_user_limit", True)
-            group_limit_on = self.conf.get("enable_group_limit", False) and group_id
+            has_user_cnt = self.conf.get("enable_user_limit", True) and user_count > 0
             
-            has_group_count = not group_limit_on or group_count > 0
-            has_user_count = not user_limit_on or user_count > 0
-            
-            if group_id:
-                if not has_group_count and not has_user_count:
-                    yield event.plain_result("❌ 次数已用尽。")
+            if self.conf.get("enable_user_limit", True) and not has_user_cnt:
+                if group_id and self.conf.get("enable_group_limit", False):
+                    if self._get_group_count(group_id) <= 0:
+                        yield event.plain_result("❌ 本群和您的次数均已用尽。")
+                        return
+                else:
+                    yield event.plain_result("❌ 您的使用次数已用完。")
                     return
-            elif not has_user_count:
-                yield event.plain_result("❌ 次数已用尽。")
-                return
 
-        img_bytes_list = await self.iwf.get_images(event)
-        if not img_bytes_list:
+        # 4. 获取输入图片
+        if not self.iwf or not (img_bytes_list := await self.iwf.get_images(event)):
             if not is_bnn:
                 yield event.plain_result("请发送或引用一张图片。")
                 return
         
         images_to_process = []
-        if is_bnn and len(img_bytes_list) > 5:
-            images_to_process = img_bytes_list[:5]
+        display_cmd = cmd
+        if is_bnn:
+            MAX_IMAGES = 5
+            if len(img_bytes_list) > MAX_IMAGES:
+                images_to_process = img_bytes_list[:MAX_IMAGES]
+                yield event.plain_result(f"🎨 检测到 {len(img_bytes_list)} 张图片，已选取前 {MAX_IMAGES} 张…")
+            else:
+                images_to_process = img_bytes_list
+            display_cmd = user_prompt[:10] + '...' if len(user_prompt) > 10 else user_prompt
         else:
-            images_to_process = img_bytes_list
-            
-        if not is_bnn:
             images_to_process = [img_bytes_list[0]]
-            
-        display_cmd = user_prompt[:10] + '...' if is_bnn else cmd
-        yield event.plain_result(f"🎨 收到请求，正在生成 [{display_cmd}]...")
         
+        # 5. 确定模型 (临时切换逻辑)
         override_model_name = None
         all_models = self._get_all_models()
-        
         if temp_model_idx is not None:
             if 1 <= temp_model_idx <= len(all_models):
                 override_model_name = all_models[temp_model_idx - 1]
+                display_cmd += f" (模型: {override_model_name})"
             else:
-                yield event.plain_result(f"⚠️ 序号 {temp_model_idx} 无效。")
+                yield event.plain_result(f"⚠️ 指定的模型序号 {temp_model_idx} 无效，将使用默认模型。")
         
+        # 6. 发送生成提示
+        yield event.plain_result(f"🎨 收到请求，正在生成 [{display_cmd}]...")
+
+        # 7. 预扣次 (生成前扣除)
         if not is_master:
             if self.conf.get("enable_group_limit", False) and group_id and self._get_group_count(group_id) > 0:
                 await self._decrease_group_count(group_id)
             elif self.conf.get("enable_user_limit", True) and self._get_user_count(sender_id) > 0:
                 await self._decrease_user_count(sender_id)
 
+        # 8. 执行生成
         start_time = datetime.now()
         res = await self._call_api(images_to_process, user_prompt, override_model=override_model_name)
         elapsed = (datetime.now() - start_time).total_seconds()
 
         if isinstance(res, bytes):
-            caption_parts = [f"✅ 生成成功 ({elapsed:.2f}s)"]
+            caption_parts = [f"✅ 生成成功 ({elapsed:.2f}s)", f"预设: {display_cmd}"]
             if is_master:
                 caption_parts.append("剩余: ∞")
+            else:
+                if self.conf.get("enable_user_limit", True):
+                    caption_parts.append(f"个人: {self._get_user_count(sender_id)}")
+            
             yield event.chain_result([Image.fromBytes(res), Plain(" | ".join(caption_parts))])
         else:
-            yield event.plain_result(f"❌ 生成失败 ({elapsed:.2f}s)\n原因: {res}")
+            msg = f"❌ 生成失败 ({elapsed:.2f}s)\n原因: {res}"
+            if not is_master:
+                msg += "\n(注: 触发即扣次)"
+            yield event.plain_result(msg)
         
         event.stop_event()
 
     @filter.command("文生图", prefix_optional=True)
-    async def on_text_to_image_request(self, event: AstrMessageEvent):
+    async def on_text_to_image(self, event: AstrMessageEvent):
         raw_cmd = event.message_str.strip()
         prompt = raw_cmd
         override_model_name = None
@@ -423,13 +673,13 @@ class FigurineProPlugin(Star):
             if 1 <= idx <= len(all_models):
                 override_model_name = all_models[idx-1]
             else:
-                 yield event.plain_result(f"⚠️ 序号 {idx} 无效。")
+                 yield event.plain_result(f"⚠️ 指定的模型序号 {idx} 无效。")
                  return
 
         if not prompt:
-            yield event.plain_result("请提供文生图描述。")
+            yield event.plain_result("请提供描述。用法: #文生图 [可选:(序号)] <描述>")
             return
-        
+
         sender_id = event.get_sender_id()
         if not self.is_global_admin(event):
             if self.conf.get("enable_user_limit", True) and self._get_user_count(sender_id) <= 0:
@@ -456,6 +706,8 @@ class FigurineProPlugin(Star):
         
         event.stop_event()
 
+
+
     @filter.command("设置自定义key", aliases={"setk"}, prefix_optional=True)
     async def set_custom_key(self, event: AstrMessageEvent):
         if not self.is_global_admin(event):
@@ -468,7 +720,6 @@ class FigurineProPlugin(Star):
         
         idx = parts[1]
         key_val = parts[2]
-        
         if idx == "1":
             self.conf["custom_model_1_key"] = key_val
             msg = "✅ 自定义模型1 的 Key 已更新。"
@@ -492,9 +743,7 @@ class FigurineProPlugin(Star):
         if not self.is_global_admin(event):
             return
             
-        raw = event.message_str.strip()
-        raw = re.sub(r'^[#\/]?(lm添加|lma)\s*', '', raw, flags=re.IGNORECASE).strip()
-        
+        raw = re.sub(r'^[#\/]?(lm添加|lma)\s*', '', event.message_str.strip(), flags=re.IGNORECASE).strip()
         if ":" not in raw:
             yield event.plain_result('格式错误, 示例: 触发词:提示词')
             return
@@ -525,24 +774,17 @@ class FigurineProPlugin(Star):
         keyword = parts[1] if len(parts) > 1 else ""
         
         if not keyword:
-            help_text = self.conf.get("help_text")
-            if help_text:
+            if help_text := self.conf.get("help_text"):
                 yield event.plain_result(help_text)
                 return
-            
             keys = sorted(list(self.prompt_map.keys()))
             yield event.plain_result(f"🎨 预设列表: {', '.join(keys) or '(无)'}")
             return
             
         prompt = self.prompt_map.get(keyword)
-        if prompt:
-            yield event.plain_result(f"📄 预设 [{keyword}] 内容:\n{prompt}")
-        else:
-            yield event.plain_result(f"❌ 未找到 [{keyword}]")
+        yield event.plain_result(f"📄 预设 [{keyword}] 内容:\n{prompt}" if prompt else f"❌ 未找到 [{keyword}]")
 
-    def is_global_admin(self, event: AstrMessageEvent) -> bool:
-        admin_ids = self.context.get_config().get("admins_id", [])
-        return event.get_sender_id() in admin_ids
+
 
     async def _load_user_counts(self):
         if not self.user_counts_file.exists():
@@ -717,7 +959,7 @@ class FigurineProPlugin(Star):
             return
             
         keys = self.conf.get("api_keys", [])
-        msg = "\n".join([f"{i+1}. {k[:8]}..." for i, k in enumerate(keys)])
+        msg = "\n".join([f"{i+1}. {k[:6]}..." for i, k in enumerate(keys)])
         yield event.plain_result(f"🔑 通用 Key 池:\n{msg}")
 
     @filter.command("手办化删除key", prefix_optional=True)
@@ -745,206 +987,6 @@ class FigurineProPlugin(Star):
             self.conf.save()
             
         yield event.plain_result("✅ 操作完成。")
-
-    async def _get_pool_api_key(self) -> str | None:
-        keys = self.conf.get("api_keys", [])
-        if not keys:
-            return None
-            
-        async with self.key_lock:
-            key = keys[self.key_index]
-            self.key_index = (self.key_index + 1) % len(keys)
-            return key
-
-    def _find_url_recursively(self, data: Any) -> str | None:
-        if isinstance(data, str):
-            if data.startswith("http") and "://" in data:
-                return data
-            if "![image](" in data:
-                match = re.search(r'!\[.*?\]\((http.*?)\)', data)
-                if match:
-                    return match.group(1)
-            return None
-            
-        if isinstance(data, list):
-            for item in data:
-                res = self._find_url_recursively(item)
-                if res:
-                    return res
-                    
-        if isinstance(data, dict):
-            if "url" in data and isinstance(data["url"], str) and data["url"].startswith("http"):
-                return data["url"]
-            if "image_url" in data:
-                if isinstance(data["image_url"], str):
-                    return data["image_url"]
-                if isinstance(data["image_url"], dict) and "url" in data["image_url"]:
-                    return data["image_url"]["url"]
-            
-            for v in data.values():
-                res = self._find_url_recursively(v)
-                if res:
-                    return res
-        return None
-
-    def _extract_image_url_from_response(self, data: Dict[str, Any]) -> str | None:
-        try:
-            return data["choices"][0]["message"]["images"][0]["image_url"]["url"]
-        except:
-            pass
-            
-        try:
-            return data["choices"][0]["message"]["images"][0]["url"]
-        except:
-            pass
-            
-        try:
-            content = data["choices"][0]["message"]["content"]
-            match = re.search(r'https?://[^\s<>")\]]+', content)
-            if match:
-                return match.group(0).rstrip(")>,'\"")
-        except:
-            pass
-            
-        try:
-            if "data" in data and isinstance(data["data"], list):
-                return data["data"][0]["url"]
-        except:
-            pass
-            
-        try:
-            if "candidates" in data:
-                parts = data["candidates"][0]["content"]["parts"]
-                for p in parts:
-                    if "text" in p:
-                        match = re.search(r'https?://[^\s<>")\]]+', p["text"])
-                        if match:
-                            return match.group(0).rstrip(")>,'\"")
-                    if "inlineData" in p:
-                        return f"data:{p['inlineData']['mimeType']};base64,{p['inlineData']['data']}"
-        except:
-            pass
-            
-        return self._find_url_recursively(data)
-
-    async def _call_api(self, image_bytes_list: List[bytes], prompt: str, override_model: str | None = None) -> bytes | str:
-        api_url = self.conf.get("api_url")
-        if not api_url:
-            return "API URL 未配置"
-            
-        model_name = override_model or self.conf.get("model", "nano-banana")
-        
-        api_key = None
-        c1 = self.conf.get("custom_model_1", "").strip()
-        c2 = self.conf.get("custom_model_2", "").strip()
-        
-        if c1 and model_name == c1:
-            api_key = self.conf.get("custom_model_1_key") or await self._get_pool_api_key()
-        elif c2 and model_name == c2:
-            api_key = self.conf.get("custom_model_2_key") or await self._get_pool_api_key()
-        else:
-            api_key = await self._get_pool_api_key()
-            
-        if not api_key:
-            return "无可用 API Key"
-
-        headers = {
-            "Content-Type": "application/json",
-            "Connection": "close"
-        }
-        
-        api_mode = self.conf.get("api_mode", "generic")
-        payload = {}
-        final_url = api_url
-
-        if api_mode == "gemini_official":
-            if "models/" in api_url:
-                base = api_url.split("models/")[0]
-                final_url = f"{base}models/{model_name}:generateContent"
-            else:
-                base = api_url.rstrip("/")
-                final_url = f"{base}/v1beta/models/{model_name}:generateContent"
-            
-            joiner = "&" if "?" in final_url else "?"
-            if "goog" in api_url or "generativelanguage" in api_url:
-                final_url += f"{joiner}key={api_key}"
-            else:
-                headers["Authorization"] = f"Bearer {api_key}"
-
-            parts = [{"text": prompt}]
-            for img in image_bytes_list:
-                b64 = base64.b64encode(img).decode("utf-8")
-                parts.append({
-                    "inlineData": {
-                        "mimeType": "image/png",
-                        "data": b64
-                    }
-                })
-            
-            payload = {
-                "contents": [{"parts": parts}],
-                "generationConfig": {"maxOutputTokens": 1500}
-            }
-        
-        else:
-            headers["Authorization"] = f"Bearer {api_key}"
-            
-            content = [{"type": "text", "text": prompt}]
-            for img in image_bytes_list:
-                b64 = base64.b64encode(img).decode("utf-8")
-                content.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{b64}"}
-                })
-            
-            payload = {
-                "model": model_name,
-                "max_tokens": 1500,
-                "stream": False,
-                "messages": [
-                    {"role": "system", "content": "You are a helpful assistant."},
-                    {"role": "user", "content": content}
-                ]
-            }
-
-        try:
-            if not self.iwf:
-                return "工作流未初始化"
-                
-            async with aiohttp.ClientSession() as session:
-                async with session.post(final_url, json=payload, headers=headers, proxy=self.iwf.proxy, timeout=120) as resp:
-                    if resp.status == 404 and api_mode == "gemini_official":
-                        return f"API 404: 模型 '{model_name}' 可能不存在或 URL 配置错误。"
-                    
-                    if resp.status != 200:
-                        text = await resp.text()
-                        return f"API Error {resp.status}: {text[:200]}"
-                    
-                    data = await resp.json()
-                    if "error" in data:
-                        return json.dumps(data["error"])
-                    
-                    if "promptFeedback" in data:
-                        pf = data["promptFeedback"]
-                        if pf.get("blockReason"):
-                            return f"Gemini 安全拦截: {pf['blockReason']}"
-                    
-                    url_or_b64 = self._extract_image_url_from_response(data)
-                    
-                    if not url_or_b64:
-                        return f"生成失败，无图片数据。响应: {json.dumps(data)[:200]}..."
-                    
-                    if url_or_b64.startswith("data:"):
-                        b64 = url_or_b64.split(",")[-1]
-                        return base64.b64decode(b64)
-                    else:
-                        return await self.iwf._download_image(url_or_b64) or "下载图片失败"
-
-        except asyncio.TimeoutError:
-            return "请求超时"
-        except Exception as e:
-            logger.error(f"API Exception: {e}", exc_info=True)
-            return f"系统错误: {e}"
 
     async def terminate(self):
         if self.iwf:
