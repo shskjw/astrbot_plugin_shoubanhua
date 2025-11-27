@@ -16,7 +16,7 @@ from astrbot import logger
 from astrbot.api.event import filter
 from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.core import AstrBotConfig
-from astrbot.core.message.components import At, Image, Reply, Plain
+from astrbot.core.message.components import At, Image, Reply, Plain, Node, Nodes
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
 
 PRESET_MODELS = [
@@ -34,7 +34,7 @@ PRESET_MODELS = [
     "astrbot_plugin_shoubanhua",
     "shskjw",
     "Google Gemini 手办化/图生图插件",
-    "1.5.6",
+    "1.5.11",
     "https://github.com/shkjw/astrbot_plugin_shoubanhua",
 )
 class FigurineProPlugin(Star):
@@ -149,13 +149,16 @@ class FigurineProPlugin(Star):
         self.user_counts_file = self.plugin_data_dir / "user_counts.json"
         self.group_counts_file = self.plugin_data_dir / "group_counts.json"
         self.user_checkin_file = self.plugin_data_dir / "user_checkin.json"
+        self.daily_stats_file = self.plugin_data_dir / "daily_stats.json"
 
         self.user_counts: Dict[str, int] = {}
         self.group_counts: Dict[str, int] = {}
         self.user_checkin_data: Dict[str, str] = {}
+        self.daily_stats: Dict[str, Any] = {}
         self.prompt_map: Dict[str, str] = {}
 
-        self.key_index = 0
+        self.generic_key_index = 0
+        self.gemini_key_index = 0
         self.key_lock = asyncio.Lock()
 
         self.iwf: Optional[FigurineProPlugin.ImageWorkflow] = None
@@ -163,7 +166,7 @@ class FigurineProPlugin(Star):
     async def initialize(self):
         use_proxy = self.conf.get("use_proxy", False)
         proxy_url = self.conf.get("proxy_url") if use_proxy else None
-        
+
         retries = self.conf.get("download_retries", 3)
         timeout = self.conf.get("timeout", 120)
 
@@ -172,13 +175,15 @@ class FigurineProPlugin(Star):
         await self._load_user_counts()
         await self._load_group_counts()
         await self._load_user_checkin_data()
+        await self._load_daily_stats()
         await self._load_prompt_map()
 
         logger.info("FigurinePro 插件已加载")
-
-        if not self.conf.get("api_keys") and not self.conf.get("custom_model_1_key") and not self.conf.get(
-                "custom_model_2_key"):
-            logger.warning("FigurinePro: 未配置任何 API 密钥")
+        
+        g_keys = self.conf.get("generic_api_keys", [])
+        o_keys = self.conf.get("gemini_api_keys", [])
+        if not g_keys and not o_keys and not self.conf.get("custom_model_1_key"):
+             logger.warning("FigurinePro: 未配置任何 API Key")
 
     async def _load_prompt_map(self):
         self.prompt_map.clear()
@@ -228,8 +233,8 @@ class FigurineProPlugin(Star):
         if not target_mode:
             msg = f"ℹ️ 当前 API 模式: **{current_mode}**\n"
             msg += "可选项:\n"
-            msg += "1. `generic` (通用格式)\n"
-            msg += "2. `gemini_official` (Gemini原生格式)\n"
+            msg += "1. `generic` (通用OpenAI格式)\n"
+            msg += "2. `gemini_official` (Gemini官方格式)\n"
             msg += "用法: `#切换API模式 <模式名>`"
             yield event.plain_result(msg)
             return
@@ -245,7 +250,7 @@ class FigurineProPlugin(Star):
         except:
             pass
 
-        yield event.plain_result(f"✅ API 模式已切换为: **{target_mode}**")
+        yield event.plain_result(f"✅ API 模式已切换为: **{target_mode}**\n注意：Key管理指令现在将操作 {target_mode} 的Key池。")
 
     @filter.command("切换模型", aliases={"SwitchModel", "模型列表"}, prefix_optional=True)
     async def on_switch_model(self, event: AstrMessageEvent):
@@ -301,15 +306,21 @@ class FigurineProPlugin(Star):
         else:
             yield event.plain_result(f"❌ 序号无效。")
 
-    async def _get_pool_api_key(self) -> str | None:
-        keys = self.conf.get("api_keys", [])
-        if not keys:
-            return None
-
+    async def _get_pool_api_key(self, mode: str) -> str | None:
+        keys = []
         async with self.key_lock:
-            key = keys[self.key_index]
-            self.key_index = (self.key_index + 1) % len(keys)
-            return key
+            if mode == "gemini_official":
+                keys = self.conf.get("gemini_api_keys", [])
+                if not keys: return None
+                key = keys[self.gemini_key_index]
+                self.gemini_key_index = (self.gemini_key_index + 1) % len(keys)
+                return key
+            else:
+                keys = self.conf.get("generic_api_keys", [])
+                if not keys: return None
+                key = keys[self.generic_key_index]
+                self.generic_key_index = (self.generic_key_index + 1) % len(keys)
+                return key
 
     def _extract_image_url_from_response(self, data: Dict[str, Any]) -> str | None:
         try:
@@ -343,8 +354,15 @@ class FigurineProPlugin(Star):
 
     async def _call_api(self, image_bytes_list: List[bytes], prompt: str,
                         override_model: str | None = None) -> bytes | str:
-        api_url = self.conf.get("api_url")
-        if not api_url:
+        
+        api_mode = self.conf.get("api_mode", "generic")
+        
+        if api_mode == "gemini_official":
+            base_url = self.conf.get("gemini_api_url", "https://generativelanguage.googleapis.com")
+        else:
+            base_url = self.conf.get("generic_api_url", "https://api.bltcy.ai/v1/chat/completions")
+
+        if not base_url:
             return "API URL 未配置"
 
         model_name = override_model or self.conf.get("model", "nano-banana")
@@ -354,33 +372,32 @@ class FigurineProPlugin(Star):
         c2 = self.conf.get("custom_model_2", "").strip()
 
         if c1 and model_name == c1:
-            api_key = self.conf.get("custom_model_1_key") or await self._get_pool_api_key()
+            api_key = self.conf.get("custom_model_1_key") or await self._get_pool_api_key(api_mode)
         elif c2 and model_name == c2:
-            api_key = self.conf.get("custom_model_2_key") or await self._get_pool_api_key()
+            api_key = self.conf.get("custom_model_2_key") or await self._get_pool_api_key(api_mode)
         else:
-            api_key = await self._get_pool_api_key()
+            api_key = await self._get_pool_api_key(api_mode)
 
         if not api_key:
-            return "无可用 API Key (请检查通用池或自定义Key配置)"
+            return f"无可用 API Key (请检查 {api_mode} 模式的Key池配置)"
 
         headers = {
             "Content-Type": "application/json",
             "Connection": "close"
         }
 
-        api_mode = self.conf.get("api_mode", "generic")
         payload = {}
-        final_url = api_url
+        final_url = base_url
 
         if api_mode == "gemini_official":
-            if "models/" in api_url:
-                base = api_url.split("models/")[0]
-                final_url = f"{base}models/{model_name}:generateContent"
-            else:
-                base = api_url.rstrip("/")
-                if not base.endswith("v1beta"):
-                    base += "/v1beta"
-                final_url = f"{base}/models/{model_name}:generateContent"
+            base = base_url.rstrip("/")
+            if "models/" in base:
+                 base = base.split("models/")[0].rstrip("/")
+            
+            if not base.endswith("v1beta"):
+                 base += "/v1beta"
+            
+            final_url = f"{base}/models/{model_name}:generateContent"
 
             headers["x-goog-api-key"] = api_key
 
@@ -407,7 +424,7 @@ class FigurineProPlugin(Star):
 
         else:
             headers["Authorization"] = f"Bearer {api_key}"
-
+            
             content = [{"type": "text", "text": prompt}]
             for img in image_bytes_list:
                 b64 = base64.b64encode(img).decode("utf-8")
@@ -426,7 +443,7 @@ class FigurineProPlugin(Star):
                     {"role": "user", "content": content}
                 ]
             }
-        
+
         timeout = self.conf.get("timeout", 120)
 
         try:
@@ -444,7 +461,6 @@ class FigurineProPlugin(Star):
                         text = await resp.text()
                         return f"API 请求失败 (HTTP {resp.status}): {text[:300]}"
 
-                    # 处理流式响应
                     if api_mode == "generic" and payload.get("stream"):
                         full_content = ""
                         try:
@@ -452,10 +468,8 @@ class FigurineProPlugin(Star):
                                 line_str = line.decode('utf-8').strip()
                                 if not line_str or line_str.startswith(":"):
                                     continue
-                                
                                 if line_str == "data: [DONE]":
                                     break
-                                
                                 if line_str.startswith("data: "):
                                     json_str = line_str[6:]
                                     try:
@@ -466,8 +480,6 @@ class FigurineProPlugin(Star):
                                                 full_content += delta["content"]
                                     except json.JSONDecodeError:
                                         continue
-                            
-                            # 构造模拟响应数据以复用现有提取逻辑
                             data = {
                                 "choices": [{
                                     "message": {
@@ -479,7 +491,6 @@ class FigurineProPlugin(Star):
                             logger.error(f"流式响应解析失败: {e}", exc_info=True)
                             return f"流式响应解析错误: {e}"
                     else:
-                        # 非流式响应
                         data = await resp.json()
 
                     if "error" in data:
@@ -554,7 +565,8 @@ class FigurineProPlugin(Star):
             if cmd in cmd_map:
                 key = cmd_map[cmd]
                 if key == "help":
-                    yield event.plain_result(self.conf.get("help_text", "帮助未配置"))
+                    # 修复：直接 yield 结果，不再使用 await
+                    yield self._get_help_result(event)
                     return
                 user_prompt = self.prompt_map.get(key)
 
@@ -569,22 +581,32 @@ class FigurineProPlugin(Star):
         group_id = event.get_group_id()
         is_master = self.is_global_admin(event)
 
-        if not is_master:
-            if sender_id in self.conf.get("user_blacklist", []): return
-            if group_id and group_id in self.conf.get("group_blacklist", []): return
-            if self.conf.get("user_whitelist", []) and sender_id not in self.conf.get("user_whitelist", []): return
-            if group_id and self.conf.get("group_whitelist", []) and group_id not in self.conf.get("group_whitelist",
-                                                                                                   []): return
+        if sender_id in self.conf.get("user_blacklist", []): return
+        if group_id and group_id in self.conf.get("group_blacklist", []): return
 
-            user_count = self._get_user_count(sender_id)
-            has_user_cnt = self.conf.get("enable_user_limit", True) and user_count > 0
+        group_whitelist = self.conf.get("group_whitelist", [])
+        is_in_whitelist = group_id and group_id in group_whitelist
+        is_whitelist_strict_mode = len(group_whitelist) > 0
 
-            if self.conf.get("enable_user_limit", True) and not has_user_cnt:
-                if group_id and self.conf.get("enable_group_limit", False):
-                    if self._get_group_count(group_id) <= 0:
-                        yield event.plain_result("❌ 本群和您的次数均已用尽。")
-                        return
-                else:
+        skip_deduction = False
+
+        if is_master:
+            skip_deduction = True
+        elif is_in_whitelist:
+            skip_deduction = True
+        elif is_whitelist_strict_mode and group_id:
+            yield event.plain_result("❌ 本群未授权使用此功能。")
+            return
+        elif self.conf.get("user_whitelist", []) and sender_id not in self.conf.get("user_whitelist", []):
+            return
+
+        if not skip_deduction:
+            if group_id and self.conf.get("enable_group_limit", False):
+                if self._get_group_count(group_id) <= 0:
+                    yield event.plain_result("❌ 本群的生成次数已用尽。")
+                    return
+            if self.conf.get("enable_user_limit", True):
+                if self._get_user_count(sender_id) <= 0:
                     yield event.plain_result("❌ 您的使用次数已用完。")
                     return
 
@@ -617,10 +639,10 @@ class FigurineProPlugin(Star):
 
         yield event.plain_result(f"🎨 收到请求，正在生成 [{display_cmd}]...")
 
-        if not is_master:
-            if self.conf.get("enable_group_limit", False) and group_id and self._get_group_count(group_id) > 0:
+        if not skip_deduction:
+            if group_id and self.conf.get("enable_group_limit", False):
                 await self._decrease_group_count(group_id)
-            elif self.conf.get("enable_user_limit", True) and self._get_user_count(sender_id) > 0:
+            if self.conf.get("enable_user_limit", True):
                 await self._decrease_user_count(sender_id)
 
         start_time = datetime.now()
@@ -628,21 +650,45 @@ class FigurineProPlugin(Star):
         elapsed = (datetime.now() - start_time).total_seconds()
 
         if isinstance(res, bytes):
+            await self._record_daily_usage(sender_id, group_id)
+            
             caption_parts = [f"✅ 生成成功 ({elapsed:.2f}s)", f"预设: {display_cmd}"]
-            if is_master:
+            if skip_deduction:
                 caption_parts.append("剩余: ∞")
             else:
                 if self.conf.get("enable_user_limit", True):
                     caption_parts.append(f"个人: {self._get_user_count(sender_id)}")
+                if group_id and self.conf.get("enable_group_limit", False):
+                    caption_parts.append(f"本群: {self._get_group_count(group_id)}")
 
             yield event.chain_result([Image.fromBytes(res), Plain(" | ".join(caption_parts))])
         else:
             msg = f"❌ 生成失败 ({elapsed:.2f}s)\n原因: {res}"
-            if not is_master:
+            if not skip_deduction:
                 msg += "\n(注: 触发即扣次)"
             yield event.plain_result(msg)
 
         event.stop_event()
+
+    def _get_help_result(self, event: AstrMessageEvent):
+        """生成合并转发帮助消息对象"""
+        help_text = self.conf.get("help_text", "帮助文档未配置")
+        
+        bot_uin = "2854196310"
+        try:
+            if hasattr(event, "robot") and event.robot:
+                 bot_uin = str(event.robot.id)
+            elif hasattr(event, "bot") and hasattr(event.bot, "self_id"):
+                 bot_uin = str(event.bot.self_id)
+        except:
+            pass
+
+        node = Node(
+            name="手办化助手",
+            uin=str(bot_uin), # 强制转str，防止Pydantic校验失败
+            content=[Plain(help_text)]
+        )
+        return event.chain_result([Nodes(nodes=[node])])
 
     @filter.command("文生图", prefix_optional=True)
     async def on_text_to_image(self, event: AstrMessageEvent):
@@ -667,7 +713,7 @@ class FigurineProPlugin(Star):
 
         sender_id = event.get_sender_id()
         if not self.is_global_admin(event):
-            if self.conf.get("enable_user_limit", True) and self._get_user_count(sender_id) <= 0:
+             if self.conf.get("enable_user_limit", True) and self._get_user_count(sender_id) <= 0:
                 yield event.plain_result("❌ 您的使用次数已用完。")
                 return
 
@@ -677,7 +723,7 @@ class FigurineProPlugin(Star):
         yield event.plain_result(info_str)
 
         if not self.is_global_admin(event):
-            if self.conf.get("enable_user_limit", True) and self._get_user_count(sender_id) > 0:
+             if self.conf.get("enable_user_limit", True):
                 await self._decrease_user_count(sender_id)
 
         start_time = datetime.now()
@@ -685,6 +731,7 @@ class FigurineProPlugin(Star):
         elapsed = (datetime.now() - start_time).total_seconds()
 
         if isinstance(res, bytes):
+            await self._record_daily_usage(sender_id, event.get_group_id())
             yield event.chain_result([Image.fromBytes(res), Plain(f"✅ 生成成功 ({elapsed:.2f}s)")])
         else:
             yield event.plain_result(f"❌ 生成失败: {res}")
@@ -726,17 +773,31 @@ class FigurineProPlugin(Star):
         if not self.is_global_admin(event):
             return
 
-        raw = re.sub(r'^[#\/]?(lm添加|lma)\s*', '', event.message_str.strip(), flags=re.IGNORECASE).strip()
-        if ":" not in raw:
-            yield event.plain_result('格式错误, 示例: 触发词:提示词')
+        full_msg = event.message_str or ""
+        clean_msg = full_msg.strip()
+        
+        cmd_prefix = "lm添加"
+        if "lma" in clean_msg.lower() and not clean_msg.startswith(cmd_prefix):
+             cmd_prefix = "lma"
+        
+        if clean_msg.lower().startswith(cmd_prefix.lower()):
+            clean_msg = clean_msg[len(cmd_prefix):].strip()
+        
+        clean_msg = clean_msg.lstrip("#/ ")
+
+        if ":" not in clean_msg:
+            yield event.plain_result('格式错误, 示例: #lm添加 触发词:提示词')
             return
 
-        key, new_value = map(str.strip, raw.split(":", 1))
+        key, new_value = map(str.strip, clean_msg.split(":", 1))
+        
         prompt_list = self.conf.get("prompt_list", [])
+        if not isinstance(prompt_list, list):
+            prompt_list = []
+            
         found = False
-
         for idx, item in enumerate(prompt_list):
-            if item.strip().startswith(key + ":"):
+            if isinstance(item, str) and item.strip().startswith(key + ":"):
                 prompt_list[idx] = f"{key}:{new_value}"
                 found = True
                 break
@@ -745,11 +806,30 @@ class FigurineProPlugin(Star):
             prompt_list.append(f"{key}:{new_value}")
 
         self.conf["prompt_list"] = prompt_list
-        if hasattr(self.conf, "save"):
-            self.conf.save()
+        try:
+            if hasattr(self.conf, "save"):
+                self.conf.save()
+        except Exception as e:
+            logger.error(f"保存配置失败: {e}")
 
         await self._load_prompt_map()
         yield event.plain_result(f"✅ 已保存预设:\n{key}:{new_value}")
+
+    @filter.command("lm查看", aliases={"lmv", "lm预览"}, prefix_optional=True)
+    async def lm_preview_prompt(self, event: AstrMessageEvent):
+        raw = event.message_str.strip()
+        parts = raw.split()
+        if len(parts) < 2:
+             yield event.plain_result("用法: #lm查看 <关键词>")
+             return
+        
+        keyword = parts[1].strip()
+        prompt_content = self.prompt_map.get(keyword)
+        
+        if prompt_content:
+            yield event.plain_result(f"🔍 关键词【{keyword}】的提示词：\n\n{prompt_content}")
+        else:
+            yield event.plain_result(f"❌ 未找到关键词【{keyword}】的预设。")
 
     @filter.command("lm帮助", aliases={"lmh", "手办化帮助"}, prefix_optional=True)
     async def on_prompt_help(self, event: AstrMessageEvent):
@@ -757,15 +837,31 @@ class FigurineProPlugin(Star):
         keyword = parts[1] if len(parts) > 1 else ""
 
         if not keyword:
-            if help_text := self.conf.get("help_text"):
-                yield event.plain_result(help_text)
-                return
-            keys = sorted(list(self.prompt_map.keys()))
-            yield event.plain_result(f"🎨 预设列表: {', '.join(keys) or '(无)'}")
+            # 修复：直接 yield 结果，不再使用 await
+            yield self._get_help_result(event)
             return
 
         prompt = self.prompt_map.get(keyword)
-        yield event.plain_result(f"📄 预设 [{keyword}] 内容:\n{prompt}" if prompt else f"❌ 未找到 [{keyword}]")
+        content = f"📄 预设 [{keyword}] 内容:\n{prompt}" if prompt else f"❌ 未找到 [{keyword}]"
+        
+        # Pydantic 类型兼容处理
+        bot_uin = "2854196310"
+        try:
+            if hasattr(event, "robot") and event.robot:
+                 bot_uin = str(event.robot.id)
+            elif hasattr(event, "bot") and hasattr(event.bot, "self_id"):
+                 bot_uin = str(event.bot.self_id)
+        except:
+            pass
+
+        node = Node(
+            name="手办化助手",
+            uin=str(bot_uin),
+            content=[Plain(content)]
+        )
+        yield event.chain_result([Nodes(nodes=[node])])
+
+    # ---------------- 统计与存储 ----------------
 
     async def _load_user_counts(self):
         if not self.user_counts_file.exists():
@@ -835,6 +931,76 @@ class FigurineProPlugin(Star):
             await asyncio.to_thread(self.user_checkin_file.write_text, data, "utf-8")
         except:
             pass
+
+    async def _load_daily_stats(self):
+        if not self.daily_stats_file.exists():
+            self.daily_stats = {"date": "", "users": {}, "groups": {}}
+            return
+        try:
+            content = await asyncio.to_thread(self.daily_stats_file.read_text, "utf-8")
+            self.daily_stats = json.loads(content)
+        except:
+            self.daily_stats = {"date": "", "users": {}, "groups": {}}
+
+    async def _save_daily_stats(self):
+        try:
+            data = json.dumps(self.daily_stats, indent=4)
+            await asyncio.to_thread(self.daily_stats_file.write_text, data, "utf-8")
+        except:
+            pass
+
+    async def _record_daily_usage(self, user_id: str, group_id: str | None):
+        today = datetime.now().strftime("%Y-%m-%d")
+        
+        if self.daily_stats.get("date") != today:
+            self.daily_stats = {
+                "date": today,
+                "users": {},
+                "groups": {}
+            }
+        
+        uid = str(user_id)
+        current_u = self.daily_stats["users"].get(uid, 0)
+        self.daily_stats["users"][uid] = current_u + 1
+        
+        if group_id:
+            gid = str(group_id)
+            current_g = self.daily_stats["groups"].get(gid, 0)
+            self.daily_stats["groups"][gid] = current_g + 1
+            
+        await self._save_daily_stats()
+
+    @filter.command("手办化今日统计", prefix_optional=True)
+    async def get_daily_stats_report(self, event: AstrMessageEvent):
+        if not self.is_global_admin(event):
+            yield event.plain_result("❌ 权限不足")
+            return
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        if self.daily_stats.get("date") != today:
+            yield event.plain_result(f"📊 {today} 今日暂无统计数据。")
+            return
+        
+        users_sorted = sorted(self.daily_stats["users"].items(), key=lambda x: x[1], reverse=True)[:10]
+        groups_sorted = sorted(self.daily_stats["groups"].items(), key=lambda x: x[1], reverse=True)[:10]
+        
+        msg = f"📊 **手办化今日统计 ({today})**\n"
+        msg += "--------------------\n"
+        msg += "👥 **群组消耗排行**:\n"
+        if groups_sorted:
+            for i, (gid, count) in enumerate(groups_sorted):
+                msg += f"{i+1}. 群{gid}: {count}次\n"
+        else:
+            msg += "(无数据)\n"
+            
+        msg += "\n👤 **用户消耗排行**:\n"
+        if users_sorted:
+            for i, (uid, count) in enumerate(users_sorted):
+                msg += f"{i+1}. {uid}: {count}次\n"
+        else:
+            msg += "(无数据)\n"
+            
+        yield event.plain_result(msg)
 
     @filter.command("手办化签到", prefix_optional=True)
     async def on_checkin(self, event: AstrMessageEvent):
@@ -922,26 +1088,34 @@ class FigurineProPlugin(Star):
 
         new_keys = event.message_str.strip().split()[1:]
         if not new_keys:
-            yield event.plain_result("格式错误。")
+            yield event.plain_result("格式错误。用法: #手办化添加key <key1> ...")
             return
 
-        keys = self.conf.get("api_keys", [])
+        # 获取当前模式，添加到对应池子
+        current_mode = self.conf.get("api_mode", "generic")
+        target_field = "gemini_api_keys" if current_mode == "gemini_official" else "generic_api_keys"
+        
+        keys = self.conf.get(target_field, [])
         added = [k for k in new_keys if k not in keys]
         keys.extend(added)
-        self.conf["api_keys"] = keys
+        self.conf[target_field] = keys
+        
         if hasattr(self.conf, "save"):
             self.conf.save()
 
-        yield event.plain_result(f"✅ 添加 {len(added)} 个Key。")
+        yield event.plain_result(f"✅ 已向 【{current_mode}】 模式添加 {len(added)} 个Key。")
 
     @filter.command("手办化key列表", prefix_optional=True)
     async def on_list_keys(self, event: AstrMessageEvent):
         if not self.is_global_admin(event):
             return
 
-        keys = self.conf.get("api_keys", [])
+        current_mode = self.conf.get("api_mode", "generic")
+        target_field = "gemini_api_keys" if current_mode == "gemini_official" else "generic_api_keys"
+        
+        keys = self.conf.get(target_field, [])
         msg = "\n".join([f"{i + 1}. {k[:6]}..." for i, k in enumerate(keys)])
-        yield event.plain_result(f"🔑 通用 Key 池:\n{msg}")
+        yield event.plain_result(f"🔑 当前模式 【{current_mode}】 Key 池:\n{msg}")
 
     @filter.command("手办化删除key", prefix_optional=True)
     async def on_delete_key(self, event: AstrMessageEvent):
@@ -954,20 +1128,24 @@ class FigurineProPlugin(Star):
             return
 
         param = parts[1]
-        keys = self.conf.get("api_keys", [])
+        
+        current_mode = self.conf.get("api_mode", "generic")
+        target_field = "gemini_api_keys" if current_mode == "gemini_official" else "generic_api_keys"
+        
+        keys = self.conf.get(target_field, [])
 
         if param == "all":
-            self.conf["api_keys"] = []
+            self.conf[target_field] = []
         elif param.isdigit():
             idx = int(param) - 1
             if 0 <= idx < len(keys):
                 keys.pop(idx)
-                self.conf["api_keys"] = keys
+                self.conf[target_field] = keys
 
         if hasattr(self.conf, "save"):
             self.conf.save()
 
-        yield event.plain_result("✅ 操作完成。")
+        yield event.plain_result(f"✅ 已从 【{current_mode}】 模式删除Key。")
 
     async def terminate(self):
         if self.iwf:
