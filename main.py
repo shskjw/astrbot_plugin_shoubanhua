@@ -416,10 +416,11 @@ class FigurineProPlugin(Star):
                     "image_url": {"url": f"data:image/png;base64,{b64}"}
                 })
 
+            use_stream = self.conf.get("use_stream", True)
             payload = {
                 "model": model_name,
                 "max_tokens": 1500,
-                "stream": False,
+                "stream": use_stream,
                 "messages": [
                     {"role": "system", "content": "You are a helpful assistant."},
                     {"role": "user", "content": content}
@@ -443,7 +444,43 @@ class FigurineProPlugin(Star):
                         text = await resp.text()
                         return f"API 请求失败 (HTTP {resp.status}): {text[:300]}"
 
-                    data = await resp.json()
+                    # 处理流式响应
+                    if api_mode == "generic" and payload.get("stream"):
+                        full_content = ""
+                        try:
+                            async for line in resp.content:
+                                line_str = line.decode('utf-8').strip()
+                                if not line_str or line_str.startswith(":"):
+                                    continue
+                                
+                                if line_str == "data: [DONE]":
+                                    break
+                                
+                                if line_str.startswith("data: "):
+                                    json_str = line_str[6:]
+                                    try:
+                                        chunk = json.loads(json_str)
+                                        if "choices" in chunk and len(chunk["choices"]) > 0:
+                                            delta = chunk["choices"][0].get("delta", {})
+                                            if "content" in delta:
+                                                full_content += delta["content"]
+                                    except json.JSONDecodeError:
+                                        continue
+                            
+                            # 构造模拟响应数据以复用现有提取逻辑
+                            data = {
+                                "choices": [{
+                                    "message": {
+                                        "content": full_content
+                                    }
+                                }]
+                            }
+                        except Exception as e:
+                            logger.error(f"流式响应解析失败: {e}", exc_info=True)
+                            return f"流式响应解析错误: {e}"
+                    else:
+                        # 非流式响应
+                        data = await resp.json()
 
                     if "error" in data:
                         return json.dumps(data["error"], ensure_ascii=False)

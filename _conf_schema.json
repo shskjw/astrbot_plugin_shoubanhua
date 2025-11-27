@@ -85,6 +85,12 @@
         "hint": "API 请求和图片下载的最大等待时间。",
         "default": 120
     },
+    "use_stream": {
+        "description": "【网络】启用流式请求（仅generic模式）",
+        "type": "bool",
+        "hint": "开启后使用SSE流式请求，避免Cloudflare 100秒超时限制（524错误）。推荐开启，仅对generic模式生效。",
+        "default": false
+    },
     "download_retries": {
         "description": "【网络】图片下载重试次数",
         "type": "int",
