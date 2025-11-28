@@ -34,7 +34,7 @@ PRESET_MODELS = [
     "astrbot_plugin_shoubanhua",
     "shskjw",
     "Google Gemini 手办化/图生图插件",
-    "1.6.1",
+    "1.5.17",
     "https://github.com/shkjw/astrbot_plugin_shoubanhua",
 )
 class FigurineProPlugin(Star):
@@ -425,7 +425,13 @@ class FigurineProPlugin(Star):
                     {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
                     {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
                     {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
-                ]
+                ],
+                # 修复 MALFORMED_FUNCTION_CALL 错误：强制禁用工具调用
+                "toolConfig": {
+                    "functionCallingConfig": {
+                        "mode": "NONE"
+                    }
+                }
             }
 
         else:
@@ -444,6 +450,7 @@ class FigurineProPlugin(Star):
                 "model": model_name,
                 "max_tokens": 1500,
                 "stream": use_stream,
+                "tool_choice": "none", # 通用模式下也尝试禁用工具
                 "messages": [
                     {"role": "system", "content": "You are a helpful assistant."},
                     {"role": "user", "content": content}
@@ -1142,9 +1149,9 @@ class FigurineProPlugin(Star):
             if at_seg:
                 uid = self._norm_id(at_seg.qq)
             else:
-                match = re.search(r"(\d+)", event.message_str)
-                if match:
-                    uid = self._norm_id(match.group(1))
+                parts = event.message_str.strip().split()
+                if len(parts) > 1 and parts[1].isdigit():
+                    uid = self._norm_id(parts[1])
 
         msg = f"👤 用户 {uid} 剩余: {self._get_user_count(uid)}"
         if gid := event.get_group_id():
