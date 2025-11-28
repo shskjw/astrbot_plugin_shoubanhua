@@ -34,7 +34,7 @@ PRESET_MODELS = [
     "astrbot_plugin_shoubanhua",
     "shskjw",
     "Google Gemini 手办化/图生图插件",
-    "1.5.17",
+    "1.6.2",
     "https://github.com/shkjw/astrbot_plugin_shoubanhua",
 )
 class FigurineProPlugin(Star):
@@ -426,7 +426,6 @@ class FigurineProPlugin(Star):
                     {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
                     {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
                 ],
-                # 修复 MALFORMED_FUNCTION_CALL 错误：强制禁用工具调用
                 "toolConfig": {
                     "functionCallingConfig": {
                         "mode": "NONE"
@@ -450,7 +449,7 @@ class FigurineProPlugin(Star):
                 "model": model_name,
                 "max_tokens": 1500,
                 "stream": use_stream,
-                "tool_choice": "none", # 通用模式下也尝试禁用工具
+                "tool_choice": "none",
                 "messages": [
                     {"role": "system", "content": "You are a helpful assistant."},
                     {"role": "user", "content": content}
@@ -758,22 +757,35 @@ class FigurineProPlugin(Star):
 
         # --- 权限逻辑复用 ---
         deduction_source = None
-        if self.is_global_admin(event):
+        is_master = self.is_global_admin(event)
+        
+        # 简单白名单逻辑复用(如果不复用全部逻辑，至少复用Master免费)
+        if is_master:
             deduction_source = 'free'
-        else:
+        
+        # 如果不是Master，执行常规扣费检查
+        if deduction_source is None:
+            # 优先扣除群组
             if group_id and self.conf.get("enable_group_limit", False):
                 if self._get_group_count(group_id) > 0:
                     deduction_source = 'group'
             
+            # 其次扣除个人
             if deduction_source is None and self.conf.get("enable_user_limit", True):
                 if self._get_user_count(sender_id) > 0:
                     deduction_source = 'user'
             
+            # 都没开启限制 -> 免费
             if deduction_source is None:
                 if not self.conf.get("enable_group_limit", False) and not self.conf.get("enable_user_limit", True):
                     deduction_source = 'free'
                 else:
-                    yield event.plain_result("❌ 您的使用次数已用完。")
+                    msg = "❌ 次数不足。"
+                    if group_id and self.conf.get("enable_group_limit", False):
+                         msg = "❌ 本群或您的使用次数已用尽 (文生图优先扣除群次数)。"
+                    else:
+                         msg = "❌ 您的使用次数已用完。"
+                    yield event.plain_result(msg)
                     return
 
         info_str = f"🎨 收到文生图请求，正在生成 [{prompt[:10]}...]"
@@ -792,7 +804,17 @@ class FigurineProPlugin(Star):
 
         if isinstance(res, bytes):
             await self._record_daily_usage(sender_id, group_id)
-            yield event.chain_result([Image.fromBytes(res), Plain(f"✅ 生成成功 ({elapsed:.2f}s)")])
+            
+            caption_parts = [f"✅ 生成成功 ({elapsed:.2f}s)"]
+            if deduction_source == 'free':
+                caption_parts.append("剩余: ∞")
+            else:
+                if group_id and self.conf.get("enable_group_limit", False):
+                    caption_parts.append(f"本群剩余: {self._get_group_count(group_id)}")
+                if self.conf.get("enable_user_limit", True):
+                    caption_parts.append(f"用户剩余: {self._get_user_count(sender_id)}")
+
+            yield event.chain_result([Image.fromBytes(res), Plain(" | ".join(caption_parts))])
         else:
             yield event.plain_result(f"❌ 生成失败: {res}")
 
