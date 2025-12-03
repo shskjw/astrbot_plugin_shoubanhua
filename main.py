@@ -871,8 +871,35 @@ class FigurineProPlugin(Star):
     @filter.command("文生图", prefix_optional=True)
     async def on_text_to_image(self, event: AstrMessageEvent):
         raw_cmd = event.message_str.strip()
-        prompt = raw_cmd
+        cmd_name = "文生图"
         override_model_name = None
+
+        # --- 提取命令前后文本，用于解析强力模式 ---
+        cmd_pos = raw_cmd.find(cmd_name)
+        before_cmd = raw_cmd[:cmd_pos].strip() if cmd_pos != -1 else ""
+        prompt = raw_cmd[cmd_pos + len(cmd_name):].strip() if cmd_pos != -1 else raw_cmd
+
+        enable_power = self.conf.get("enable_power_model", False)
+        power_model_name = (self.conf.get("power_model_id") or "").strip()
+        power_mode_requested = False
+
+        if enable_power:
+            keyword = (self.conf.get("power_model_keyword") or "").strip()
+            trigger_mode = (self.conf.get("power_model_trigger_mode", "suffix") or "suffix").lower()
+            if keyword:
+                keyword_lower = keyword.lower()
+                if trigger_mode == "prefix":
+                    if before_cmd.lower() == keyword_lower:
+                        power_mode_requested = True
+                else:
+                    prompt_lower = prompt.lower()
+                    if prompt_lower.startswith(keyword_lower):
+                        power_mode_requested = True
+                        prompt = prompt[len(keyword):].lstrip()
+
+        if power_mode_requested and not power_model_name:
+            yield event.plain_result("⚠️ 强力模式触发失败：请先在管理面板配置强力模型ID。")
+            return
 
         match = re.match(r"^[\(（](\d+)[\)）]\s*(.*)", prompt)
         if match:
@@ -885,6 +912,10 @@ class FigurineProPlugin(Star):
                 yield event.plain_result(f"⚠️ 指定的模型序号 {idx} 无效。")
                 return
 
+        if power_mode_requested:
+            override_model_name = power_model_name
+
+        prompt = prompt.strip()
         if not prompt:
             yield event.plain_result("请提供描述。用法: #文生图 [可选:(序号)] <描述>")
             return
@@ -893,26 +924,32 @@ class FigurineProPlugin(Star):
         group_id = self._norm_id(event.get_group_id()) if event.get_group_id() else None
 
         # --- 权限逻辑复用 ---
+        use_power_model = power_mode_requested
+        required_cost = self._get_required_invocation_cost(use_power_model)
+
         deduction_source = None
         if self.is_global_admin(event):
             deduction_source = 'free'
         else:
             if group_id and self.conf.get("enable_group_limit", False):
-                if self._get_group_count(group_id) > 0:
+                if self._get_group_count(group_id) >= required_cost:
                     deduction_source = 'group'
             
             if deduction_source is None and self.conf.get("enable_user_limit", True):
-                if self._get_user_count(sender_id) > 0:
+                if self._get_user_count(sender_id) >= required_cost:
                     deduction_source = 'user'
             
             if deduction_source is None:
                 if not self.conf.get("enable_group_limit", False) and not self.conf.get("enable_user_limit", True):
                     deduction_source = 'free'
                 else:
-                    yield event.plain_result(self._build_limit_exhausted_message(group_id))
+                    yield event.plain_result(
+                        self._build_limit_exhausted_message(group_id, use_power_model, required_cost)
+                    )
                     return
 
-        info_str = f"🎨 收到文生图请求，正在生成 [{prompt[:10]}...]"
+        display_prompt = prompt[:10] + "..." if len(prompt) > 10 else prompt
+        info_str = f"🎨 收到文生图请求，正在生成 [{display_prompt}]"
         if override_model_name:
             info_str += f" (模型: {override_model_name})"
         yield event.plain_result(info_str)
@@ -921,10 +958,10 @@ class FigurineProPlugin(Star):
         model_in_use = (override_model_name or base_model_name).strip() or base_model_name
         show_model_info = self.conf.get("show_model_info", False)
 
-        if deduction_source == 'group':
-            await self._decrease_group_count(group_id)
+        if deduction_source == 'group' and group_id:
+            await self._decrease_group_count(group_id, required_cost)
         elif deduction_source == 'user':
-            await self._decrease_user_count(sender_id)
+            await self._decrease_user_count(sender_id, required_cost)
 
         start_time = datetime.now()
         res = await self._call_api([], prompt, override_model=override_model_name)
