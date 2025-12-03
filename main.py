@@ -755,32 +755,24 @@ class FigurineProPlugin(Star):
             images_to_process = [img_bytes_list[0]]
 
         override_model_name = None
-        model_hint = None
         all_models = self._get_all_models()
         if temp_model_idx is not None:
             if 1 <= temp_model_idx <= len(all_models):
                 override_model_name = all_models[temp_model_idx - 1]
-                model_hint = override_model_name
             else:
                 yield event.plain_result(f"⚠️ 指定的模型序号 {temp_model_idx} 无效，将使用默认模型。")
 
         if use_power_model:
             override_model_name = power_model_name
-            model_hint = override_model_name
 
         display_label = display_cmd
-        if model_hint:
-            display_label = f"{display_cmd} (模型: {model_hint})"
 
         base_model_name = (self.conf.get("model", "nano-banana") or "nano-banana").strip() or "nano-banana"
         model_in_use = (override_model_name or base_model_name).strip() or base_model_name
         show_model_info = self.conf.get("show_model_info", False)
 
-        info_msg = f"🎨 收到请求，正在生成 [{display_label}]..."
-        if not use_power_model:
-            if hint := self._get_power_mode_hint(cmd):
-                info_msg += f"\n{hint}"
-
+        mode_prefix = "增强" if use_power_model else ""
+        info_msg = f"🎨 收到{mode_prefix}请求，正在生成 [{display_label}]..."
         yield event.plain_result(info_msg)
 
         # --- 扣费执行 ---
@@ -796,7 +788,8 @@ class FigurineProPlugin(Star):
         if isinstance(res, bytes):
             await self._record_daily_usage(sender_id, group_id)
             
-            caption_parts = [f"✅ 生成成功 ({elapsed:.2f}s)", f"预设: {display_label}"]
+            status_text = "增强生成成功" if use_power_model else "生成成功"
+            caption_parts = [f"✅ {status_text} ({elapsed:.2f}s)", f"预设: {display_label}"]
             
             if deduction_source == 'free':
                 caption_parts.append("剩余: ∞")
@@ -811,13 +804,22 @@ class FigurineProPlugin(Star):
             if show_model_info:
                 caption_parts.append(f"模型: {model_in_use}")
 
-            yield event.chain_result([Image.fromBytes(res), Plain(" | ".join(caption_parts))])
+            message_text = " | ".join(caption_parts)
+            if not use_power_model:
+                if hint := self._get_power_mode_hint(cmd):
+                    message_text += f"\n{hint}"
+
+            yield event.chain_result([Image.fromBytes(res), Plain(message_text)])
         else:
-            msg = f"❌ 生成失败 ({elapsed:.2f}s)\n原因: {res}"
+            status_text = "增强生成失败" if use_power_model else "生成失败"
+            msg = f"❌ {status_text} ({elapsed:.2f}s)\n原因: {res}"
             if deduction_source in ['group', 'user']:
                 msg += "\n(注: 触发即扣次)"
             if show_model_info:
                 msg += f"\n模型: {model_in_use}"
+            if not use_power_model:
+                if hint := self._get_power_mode_hint(cmd):
+                    msg += f"\n{hint}"
             yield event.plain_result(msg)
 
         event.stop_event()
@@ -914,12 +916,8 @@ class FigurineProPlugin(Star):
                     return
 
         display_prompt = prompt[:10] + "..." if len(prompt) > 10 else prompt
-        info_str = f"🎨 收到文生图请求，正在生成 [{display_prompt}]"
-        if override_model_name:
-            info_str += f" (模型: {override_model_name})"
-        if not power_mode_requested:
-            if hint := self._get_power_mode_hint(cmd_name):
-                info_str += f"\n{hint}"
+        mode_prefix = "增强" if power_mode_requested else ""
+        info_str = f"🎨 收到{mode_prefix}文生图请求，正在生成 [{display_prompt}]"
         yield event.plain_result(info_str)
 
         base_model_name = (self.conf.get("model", "nano-banana") or "nano-banana").strip() or "nano-banana"
@@ -938,7 +936,8 @@ class FigurineProPlugin(Star):
         if isinstance(res, bytes):
             await self._record_daily_usage(sender_id, group_id)
             
-            caption_parts = [f"✅ 生成成功 ({elapsed:.2f}s)"]
+            status_text = "增强生成成功" if power_mode_requested else "生成成功"
+            caption_parts = [f"✅ {status_text} ({elapsed:.2f}s)"]
             if deduction_source == 'free':
                 caption_parts.append("剩余: ∞")
             else:
@@ -949,11 +948,20 @@ class FigurineProPlugin(Star):
             if show_model_info:
                 caption_parts.append(f"模型: {model_in_use}")
 
-            yield event.chain_result([Image.fromBytes(res), Plain(" | ".join(caption_parts))])
+            message_text = " | ".join(caption_parts)
+            if not power_mode_requested:
+                if hint := self._get_power_mode_hint(cmd_name):
+                    message_text += f"\n{hint}"
+
+            yield event.chain_result([Image.fromBytes(res), Plain(message_text)])
         else:
-            msg = f"❌ 生成失败: {res}"
+            status_text = "增强生成失败" if power_mode_requested else "生成失败"
+            msg = f"❌ {status_text}: {res}"
             if show_model_info:
                 msg += f"\n模型: {model_in_use}"
+            if not power_mode_requested:
+                if hint := self._get_power_mode_hint(cmd_name):
+                    msg += f"\n{hint}"
             yield event.plain_result(msg)
 
         event.stop_event()
