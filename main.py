@@ -23,7 +23,7 @@ from astrbot.core.platform.astr_message_event import AstrMessageEvent
 @register(
     "astrbot_plugin_shoubanhua",
     "shskjw",
-    "Google Gemini 手办化/图生图插件",
+    "支持第三方所有OpenAI绘图格式和原生Google Gemini 终极缝合怪，文生图/图生图插件",
     "1.6.8",
     "https://github.com/shkjw/astrbot_plugin_shoubanhua",
 )
@@ -1447,3 +1447,4 @@ class FigurineProPlugin(Star):
         if self.iwf:
             await self.iwf.terminate()
         logger.info("[FigurinePro] 插件已终止")
+
