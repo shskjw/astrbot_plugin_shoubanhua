@@ -230,22 +230,41 @@
         "type": "bool",
         "hint": "开启后用户可通过 #手办化签到 获取次数。",
         "default": false
-    },
+    }，
     "checkin_fixed_reward": {
         "description": "【签到】固定奖励",
         "type": "int",
         "hint": "关闭随机奖励时，每次签到获得的次数。",
         "default": 3
-    },
+    }，
     "enable_random_checkin": {
         "description": "【签到】启用随机奖励",
         "type": "bool",
         "default": false
-    },
+    }，
     "checkin_random_reward_max": {
         "description": "【签到】随机奖励最大值",
         "type": "int",
         "default": 5
+    }，
+    "preset_table_quality": {
+        "description": "【显示】预设表格清晰度",
+        "type": "string",
+        "hint": "控制#lm列表命令生成的表格图片清晰度。标准: 200x250px; 高清: 300x380px; 超清: 400x500px",
+        "default": "高清",
+        "options": [
+            "标准"，
+            "高清",
+            "超清"
+        ]
+    },
+    "preset_table_columns": {
+        "description": "【显示】预设表格列数",
+        "type": "int",
+        "hint": "控制#lm列表命令生成的表格每行显示几个预设，建议3-6列。",
+        "default": 5,
+        "min": 1,
+        "max": 10
     },
     "prompt_list": {
         "description": "提示词预设列表",
