@@ -1,4 +1,8 @@
 # 支持gemini官方api
+# docker部署输出lm列表的时候全是符号 解决办法 请运行 
+apt update
+apt install -y fonts-dejavu fonts-noto fonts-freefont-ttf
+手办部署请什root权限运行（针对linux）
 # 通过第三方柏拉图api调用 Banana的api使用
 注册地址 [柏拉图1]( https://api.bltcy.ai/register?aff=dcc39044557)
 # 原先bnn涨价原因
