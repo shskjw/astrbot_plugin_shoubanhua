@@ -1,4 +1,5 @@
 # 支持gemini官方api
+征求api请求格式 请提ls  看到了可以考虑融合在一起
 # docker部署输出lm列表的时候全是符号 解决办法 请运行 
 apt update 
 
