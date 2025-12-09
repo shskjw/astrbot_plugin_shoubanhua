@@ -112,6 +112,38 @@
         "hint": "开启强力模式时除了基础扣费外额外扣除的次数，至少为0。",
         "default": 1
     },
+    "power_generic_api_url": {
+        "description": "【强力模式-Generic】API地址",
+        "type": "string",
+        "hint": "强力模式Generic模式专用：填完整URL（如 https://api.bltcy.ai/v1/chat/completions）。如果为空则使用普通模式的API地址。",
+        "default": ""
+    },
+    "power_generic_api_keys": {
+        "description": "【强力模式-Generic】API Key 池",
+        "type": "list",
+        "hint": "强力模式Generic模式专用的Key轮询池。如果为空则使用普通模式的Key池。",
+        "items": {
+            "type": "string",
+            "description": "sk-..."
+        },
+        "default": []
+    },
+    "power_gemini_api_url": {
+        "description": "【强力模式-Gemini官方】API Base地址",
+        "type": "string",
+        "hint": "强力模式Gemini官方模式专用：填Base URL（如 https://generativelanguage.googleapis.com）。如果为空则使用普通模式的API地址。",
+        "default": ""
+    },
+    "power_gemini_api_keys": {
+        "description": "【强力模式-Gemini官方】API Key 池",
+        "type": "list",
+        "hint": "强力模式Gemini官方模式专用的Key轮询池。如果为空则使用普通模式的Key池。",
+        "items": {
+            "type": "string",
+            "description": "AIza..."
+        },
+        "default": []
+    },
     "show_model_info": {
         "description": "【显示】显示模型信息",
         "type": "bool",
@@ -218,7 +250,7 @@
         "type": "bool",
         "hint": "开启后，限制每个用户的调用次数。",
         "default": true
-    },
+    }，
     "enable_group_limit": {
         "description": "【次数】启用群组限制",
         "type": "bool",
@@ -236,7 +268,7 @@
         "type": "int",
         "hint": "关闭随机奖励时，每次签到获得的次数。",
         "default": 3
-    },
+    }，
     "enable_random_checkin": {
         "description": "【签到】启用随机奖励",
         "type": "bool",
@@ -253,8 +285,8 @@
         "hint": "控制#lm列表命令生成的表格图片清晰度。标准: 200x250px; 高清: 300x380px; 超清: 400x500px",
         "default": "高清",
         "options": [
-            "标准"，
-            "高清"，
+            "标准",
+            "高清",
             "超清"
         ]
     },
