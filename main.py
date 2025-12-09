@@ -24,7 +24,7 @@ from astrbot.core.platform.astr_message_event import AstrMessageEvent
     "astrbot_plugin_shoubanhua",
     "shskjw",
     "支持第三方所有OpenAI绘图格式和原生Google Gemini 终极缝合怪，文生图/图生图插件",
-    "1.6.8",
+    "1.7.3",
     "https://github.com/shkjw/astrbot_plugin_shoubanhua",
 )
 class FigurineProPlugin(Star):
@@ -35,6 +35,10 @@ class FigurineProPlugin(Star):
             self.proxy = proxy_url
             self.max_retries = max_retries
             self.timeout = timeout
+
+        async def terminate(self):
+            """清理资源"""
+            pass
 
         async def _download_image(self, url: str) -> bytes | None:
             logger.info(f"正在下载图片: {url}")
@@ -207,29 +211,29 @@ class FigurineProPlugin(Star):
         await self._load_daily_stats()
         await self._load_prompt_map()
         await self._load_preset_images()
-        
+
         # 创建预设图片目录
         if not self.preset_images_dir.exists():
             self.preset_images_dir.mkdir(parents=True, exist_ok=True)
 
         logger.info("FigurinePro 插件已加载")
-        
+
         g_keys = self.conf.get("generic_api_keys", [])
         o_keys = self.conf.get("gemini_api_keys", [])
-        
+
         if not g_keys and not o_keys:
-             logger.warning("FigurinePro: 未配置任何 API Key")
+            logger.warning("FigurinePro: 未配置任何 API Key")
 
     def _extract_image_urls_from_text(self, text: str) -> List[str]:
         """从文本中提取图片链接和本地文件路径"""
         image_urls = []
-        
+
         # 1. 匹配本地文件路径 (仅Windows绝对路径)
         # 匹配 C:\path\to\image.jpg 格式
         local_file_patterns = [
             r'[a-zA-Z]:\\[^\s,，。！？\n]+\.(?:jpg|jpeg|png|gif|bmp|webp)',  # Windows绝对路径
         ]
-        
+
         for pattern in local_file_patterns:
             matches = re.findall(pattern, text, re.IGNORECASE)
             for match in matches:
@@ -237,30 +241,30 @@ class FigurineProPlugin(Star):
                     # 检查文件是否存在
                     if Path(match).exists():
                         image_urls.append(match)
-        
+
         # 2. 匹配常见的图片链接格式
         url_patterns = [
             r'https?://[^\s<>"\'\)]+\.(?:jpg|jpeg|png|gif|bmp|webp)(?:\?[^\s<>"\'\)]*)?(?=[\s<>"\'\)|$])',
             r'https?://[^\s<>"\'\)]+/(?:s\d+/|upload/|image/|img/|pic/)[^\s<>"\'\)]+\.(?:jpg|jpeg|png|gif|bmp|webp)(?:\?[^\s<>"\'\)]*)?(?=[\s<>"\'\)|$])',
             r'https?://youke\d+\.picui\.cn/[^\s<>"\'\)]+\.(?:jpg|jpeg|png|gif|bmp|webp)(?:\?[^\s<>"\'\)]*)?(?=[\s<>"\'\)|$])'
         ]
-        
+
         for pattern in url_patterns:
             matches = re.findall(pattern, text, re.IGNORECASE)
             for match in matches:
                 if match and match not in image_urls:
                     image_urls.append(match)
-        
+
         return image_urls
 
     async def _download_preset_image(self, image_url: str) -> bytes | None:
         """下载预设内容中的图片（支持本地文件和网络图片）"""
         import ssl
         from pathlib import Path
-        
+
         # 清理URL，移除可能的尾随标点符号
         clean_url = image_url.strip().rstrip('.,;:!?')
-        
+
         # 检查是否是本地文件路径
         if Path(clean_url).is_file():
             logger.info(f"检测到本地文件路径: {clean_url}")
@@ -270,21 +274,21 @@ class FigurineProPlugin(Star):
             except Exception as e:
                 logger.error(f"加载本地文件失败: {clean_url}, 错误: {e}")
                 return None
-        
+
         # 网络图片处理（原有的下载逻辑）
         for attempt in range(3):  # 最多重试3次
             try:
                 logger.info(f"正在下载预设内容中的网络图片: {clean_url} (尝试 {attempt + 1}/3)")
-                
+
                 # 创建SSL上下文，允许更多SSL配置
                 ssl_context = ssl.create_default_context()
                 ssl_context.check_hostname = False
                 ssl_context.verify_mode = ssl.CERT_NONE
-                
+
                 # 创建不使用代理的下载器，使用自定义SSL上下文
                 timeout = aiohttp.ClientTimeout(total=60)
                 connector = aiohttp.TCPConnector(ssl=ssl_context, limit=10)
-                
+
                 async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
                     headers = {
                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
@@ -292,7 +296,7 @@ class FigurineProPlugin(Star):
                     async with session.get(clean_url, headers=headers) as resp:
                         resp.raise_for_status()
                         return await resp.read()
-                        
+
             except Exception as e:
                 logger.warning(f"下载预设图片失败 (尝试 {attempt + 1}/3): {clean_url}, 错误: {e}")
                 if attempt < 2:  # 如果不是最后一次尝试，等待1秒
@@ -304,7 +308,7 @@ class FigurineProPlugin(Star):
 
     async def _load_prompt_map(self):
         self.prompt_map.clear()
-        
+
         # 1. 内置基础映射 (硬编码的指令)
         base_cmd_map = {
             "手办化": "figurine_1", "手办化2": "figurine_2", "手办化3": "figurine_3",
@@ -366,9 +370,20 @@ class FigurineProPlugin(Star):
         current_mode = self.conf.get("api_mode", "generic")
         raw = event.message_str.strip()
         parts = raw.split()
-        target_mode = parts[1].lower() if len(parts) > 1 else ""
+        
+        # 别名映射
+        alias_map = {
+            "gemini": "gemini_official",
+            "google": "gemini_official",
+            "official": "gemini_official",
+            "openai": "generic",
+            "gpt": "generic",
+            "3rd": "generic",
+            "generic": "generic",
+            "gemini_official": "gemini_official"
+        }
 
-        if not target_mode:
+        if len(parts) <= 1:
             msg = f"ℹ️ 当前 API 模式: **{current_mode}**\n"
             msg += "可选项:\n"
             msg += "1. `generic` (通用OpenAI格式)\n"
@@ -377,8 +392,11 @@ class FigurineProPlugin(Star):
             yield event.plain_result(msg)
             return
 
-        if target_mode not in ["generic", "gemini_official"]:
-            yield event.plain_result("❌ 模式无效。")
+        input_mode = parts[1].lower().strip()
+        target_mode = alias_map.get(input_mode)
+
+        if not target_mode:
+            yield event.plain_result("❌ 模式无效。支持: generic, gemini_official (或 gemini, openai)")
             return
 
         self.conf["api_mode"] = target_mode
@@ -469,9 +487,9 @@ class FigurineProPlugin(Star):
                     keys = self.conf.get("gemini_api_keys", [])
                 else:
                     keys = self.conf.get("generic_api_keys", [])
-            
+
             if not keys: return None
-            
+
             if mode == "gemini_official":
                 key = keys[self.gemini_key_index]
                 self.gemini_key_index = (self.gemini_key_index + 1) % len(keys)
@@ -540,10 +558,10 @@ class FigurineProPlugin(Star):
         return None
 
     def _build_limit_exhausted_message(
-        self,
-        group_id: Optional[str],
-        use_power_mode: bool = False,
-        required_cost: int = 1,
+            self,
+            group_id: Optional[str],
+            use_power_mode: bool = False,
+            required_cost: int = 1,
     ) -> str:
         if use_power_mode:
             # 强力模式只提示个人次数不足
@@ -589,13 +607,14 @@ class FigurineProPlugin(Star):
     def _format_error_message(self, status_text: str, elapsed: float, detail: Any) -> str:
         """构造错误消息：默认只发overview，调试模式下在终端输出完整错误"""
         summary = f"❌ {status_text} ({elapsed:.2f}s)"
-        
+
         # 如果detail包含图片下载失败的信息，返回概述+详细信息给用户
-        if isinstance(detail, str) and ("图片下载失败" in detail or "图片获取未完成" in detail) and "请手动访问链接查看" in detail:
+        if isinstance(detail, str) and (
+                "图片下载失败" in detail or "图片获取未完成" in detail) and "请手动访问链接查看" in detail:
             # 移除"失败"等敏感词，避免被插件拦截
             safe_detail = detail.replace("图片下载失败", "图片获取未完成").replace("失败", "未完成")
             return f"{summary}\n{safe_detail}"
-        
+
         if self.conf.get("debug_mode", False):
             logger.error(f"调试模式错误详情: {detail}")
         return summary
@@ -627,7 +646,7 @@ class FigurineProPlugin(Star):
             return "API URL 未配置"
 
         model_name = override_model or self.conf.get("model", "nano-banana")
-        
+
         # 根据是否强力模式选择对应的API密钥
         api_key = await self._get_pool_api_key(api_mode, use_power_mode)
         if not api_key:
@@ -636,7 +655,8 @@ class FigurineProPlugin(Star):
         # --- 应用分辨率设置 ---
         resolution_setting = self.conf.get("image_resolution", "1K")
         if resolution_setting and resolution_setting != "1K":
-            prompt = f"{prompt}, (Best quality, {resolution_setting} Resolution, Highly detailed)"
+            # 修复：将分辨率提示词移到最前面，并加强权重，确保 Gemini 等模型能生效
+            prompt = f"(Masterpiece, Best Quality, {resolution_setting} Resolution), {prompt}"
 
         headers = {
             "Content-Type": "application/json",
@@ -649,11 +669,11 @@ class FigurineProPlugin(Star):
         if api_mode == "gemini_official":
             base = base_url.rstrip("/")
             if "models/" in base:
-                 base = base.split("models/")[0].rstrip("/")
-            
+                base = base.split("models/")[0].rstrip("/")
+
             if not base.endswith("v1beta"):
-                 base += "/v1beta"
-            
+                base += "/v1beta"
+
             final_url = f"{base}/models/{model_name}:generateContent"
 
             headers["x-goog-api-key"] = api_key
@@ -686,7 +706,7 @@ class FigurineProPlugin(Star):
 
         else:
             headers["Authorization"] = f"Bearer {api_key}"
-            
+
             messages = []
             # 优化 System Prompt，防止模型因为人设问题拒绝画图
             messages.append({"role": "system", "content": "You are a creative AI artist capable of generating images."})
@@ -709,7 +729,7 @@ class FigurineProPlugin(Star):
             use_stream = self.conf.get("use_stream", True)
             payload = {
                 "model": model_name,
-                "max_tokens": 4000, # 增加 max_tokens 以容纳可能的 Base64 图片返回
+                "max_tokens": 4000,  # 增加 max_tokens 以容纳可能的 Base64 图片返回
                 "stream": use_stream,
                 "messages": messages
             }
@@ -743,7 +763,7 @@ class FigurineProPlugin(Star):
                                     try:
                                         line_data, buffer = buffer.split(b'\n', 1)
                                         line_str = line_data.decode('utf-8').strip()
-                                        
+
                                         if not line_str or line_str.startswith(":"):
                                             continue
                                         if line_str == "data: [DONE]":
@@ -761,7 +781,7 @@ class FigurineProPlugin(Star):
                                     except ValueError:
                                         # 解码失败等情况，跳过当前行
                                         break
-                            
+
                             # 构造完整的响应对象，供后续提取图片使用
                             data = {
                                 "choices": [{
@@ -807,8 +827,9 @@ class FigurineProPlugin(Star):
             logger.error(f"API 调用异常: {e}", exc_info=True)
             return f"系统错误: {e}"
 
+    # 修复：添加 *args 参数以吸收框架传递的额外参数，防止 TypeError
     @filter.event_message_type(filter.EventMessageType.ALL, priority=5)
-    async def on_figurine_request(self, event: AstrMessageEvent):
+    async def on_figurine_request(self, event: AstrMessageEvent, *args):
         if self.conf.get("prefix", True) and not event.is_at_or_wake_command:
             return
 
@@ -840,7 +861,7 @@ class FigurineProPlugin(Star):
         raw_power_keyword = (self.conf.get("power_model_keyword") or "").strip()
         keyword_lower = raw_power_keyword.lower()
         power_mode_requested = False
-        
+
         # 先检查是否在命令本身中包含强力模式触发词
         if keyword_lower and keyword_lower in cmd.lower():
             # 从命令中移除触发词
@@ -871,7 +892,7 @@ class FigurineProPlugin(Star):
         # %符号分割逻辑 - 支持在命令中分割基础命令和追加内容
         base_cmd = cmd
         append_text = ""
-        
+
         # 检查命令中是否包含%符号（在强力模式处理之后）
         if "%" in cmd:
             # 分割命令，只分割第一个%
@@ -917,43 +938,43 @@ class FigurineProPlugin(Star):
                 if append_text:
                     user_prompt = user_prompt + append_text
                     logger.info(f"将追加内容'{append_text}'添加到映射命令prompt后面")
-        
+
         # 记录强力模式状态用于调试
         if power_mode_requested:
             logger.info(f"🚀 强力模式已激活！触发词: '{raw_power_keyword}', 使用模型: '{power_model_name}'")
 
         if not user_prompt:
-             if is_bnn:
-                 if not user_prompt and not power_mode_requested: 
-                     pass
-             else:
-                return # 不是已知指令，忽略
+            if is_bnn:
+                if not user_prompt and not power_mode_requested:
+                    pass
+            else:
+                return  # 不是已知指令，忽略
 
         # --- 权限与次数逻辑 ---
         sender_id = self._norm_id(event.get_sender_id())
         group_id = self._norm_id(event.get_group_id()) if event.get_group_id() else None
-        
+
         user_blacklist = [self._norm_id(x) for x in (self.conf.get("user_blacklist") or [])]
         if sender_id in user_blacklist: return
-        
+
         if group_id:
             group_blacklist = [self._norm_id(x) for x in (self.conf.get("group_blacklist") or [])]
             if group_id in group_blacklist: return
 
         raw_g_whitelist = self.conf.get("group_whitelist") or []
         group_whitelist = [self._norm_id(x) for x in raw_g_whitelist]
-        
+
         raw_u_whitelist = self.conf.get("user_whitelist") or []
         user_whitelist = [self._norm_id(x) for x in raw_u_whitelist]
-        
+
         is_master = self.is_global_admin(event)
-        deduction_source = None 
+        deduction_source = None
         required_cost = self._get_required_invocation_cost(use_power_model)
 
         if is_master:
             deduction_source = 'free'
         elif group_id and group_id in group_whitelist:
-            deduction_source = 'free' 
+            deduction_source = 'free'
         elif group_id and len(group_whitelist) > 0:
             yield event.plain_result("❌ 本群未授权使用此功能。")
             return
@@ -978,12 +999,12 @@ class FigurineProPlugin(Star):
                     g_cnt = self._get_group_count(group_id)
                     if g_cnt >= required_cost:
                         deduction_source = 'group'
-                
+
                 if deduction_source is None and self.conf.get("enable_user_limit", True):
                     u_cnt = self._get_user_count(sender_id)
                     if u_cnt >= required_cost:
                         deduction_source = 'user'
-                
+
                 if deduction_source is None:
                     if not self.conf.get("enable_group_limit", False) and not self.conf.get("enable_user_limit", True):
                         deduction_source = 'free'
@@ -996,27 +1017,27 @@ class FigurineProPlugin(Star):
         # --- 图片获取 (融合逻辑) ---
         images_to_process = []
         is_text_to_image = False
-        
+
         if self.iwf:
-             img_bytes_list = await self.iwf.get_images(event)
-             
-             if not img_bytes_list:
-                 # 未检测到图片
-                 if is_bnn:
-                     # bnn 模式 + 无图 = 文生图
-                     if not user_prompt:
-                         yield event.plain_result(f"请在指令后添加描述。例如: #{bnn_command} 一个可爱的女孩")
-                         return
-                     is_text_to_image = True
-                     images_to_process = []
-                 else:
-                     # 手办化等预设模式 + 无图 = 尝试取头像 (兼容旧习惯)
-                     if avatar := await self.iwf._get_avatar(sender_id):
+            img_bytes_list = await self.iwf.get_images(event)
+
+            if not img_bytes_list:
+                # 未检测到图片
+                if is_bnn:
+                    # bnn 模式 + 无图 = 文生图
+                    if not user_prompt:
+                        yield event.plain_result(f"请在指令后添加描述。例如: #{bnn_command} 一个可爱的女孩")
+                        return
+                    is_text_to_image = True
+                    images_to_process = []
+                else:
+                    # 手办化等预设模式 + 无图 = 尝试取头像 (兼容旧习惯)
+                    if avatar := await self.iwf._get_avatar(sender_id):
                         img_bytes_list = [avatar]
-                     else:
+                    else:
                         yield event.plain_result("请发送或引用一张图片。")
-             
-             if not is_text_to_image and img_bytes_list:
+
+            if not is_text_to_image and img_bytes_list:
                 images_to_process = img_bytes_list
 
         # --- 检查预设内容中的图片链接 ---
@@ -1039,15 +1060,16 @@ class FigurineProPlugin(Star):
             if len(images_to_process) > MAX_IMAGES:
                 images_to_process = images_to_process[:MAX_IMAGES]
                 yield event.plain_result(f"🎨 检测到 {len(img_bytes_list)} 张图片，已选取前 {MAX_IMAGES} 张…")
-            
+
             display_cmd = user_prompt[:10] + '...' if len(user_prompt) > 10 else user_prompt
         elif len(images_to_process) > 0:
             # 对于非bnn模式，如果有多个@用户，保留所有头像，但限制最大数量
             MAX_FIGURINE_IMAGES = 10  # 手办化等预设模式最多处理10张图片
             if len(images_to_process) > MAX_FIGURINE_IMAGES:
                 images_to_process = images_to_process[:MAX_FIGURINE_IMAGES]
-                yield event.plain_result(f"🎨 检测到 {len(img_bytes_list)} 张图片（含@用户头像），已选取前 {MAX_FIGURINE_IMAGES} 张…")
-        
+                yield event.plain_result(
+                    f"🎨 检测到 {len(img_bytes_list)} 张图片（含@用户头像），已选取前 {MAX_FIGURINE_IMAGES} 张…")
+
         # 如果有追加内容，在显示命令中包含追加内容提示
         if append_text:
             display_cmd = f"{base_cmd}%{append_text[:5]}..."
@@ -1071,7 +1093,7 @@ class FigurineProPlugin(Star):
 
         mode_prefix = "增强" if use_power_model else ""
         action_type = "文生图" if is_text_to_image else "图生图"
-        
+
         info_msg = f"🎨 收到{mode_prefix}{action_type}请求，正在生成 [{display_label}]..."
         yield event.plain_result(info_msg)
 
@@ -1082,19 +1104,20 @@ class FigurineProPlugin(Star):
             await self._decrease_user_count(sender_id, required_cost)
 
         start_time = datetime.now()
-        res = await self._call_api(images_to_process, user_prompt, override_model=override_model_name, use_power_mode=use_power_model)
+        res = await self._call_api(images_to_process, user_prompt, override_model=override_model_name,
+                                   use_power_mode=use_power_model)
         elapsed = (datetime.now() - start_time).total_seconds()
 
         if isinstance(res, bytes):
             await self._record_daily_usage(sender_id, group_id)
-            
+
             # 保存预设图片（如果是预设命令）
             if base_cmd in self.prompt_map and not is_bnn:
                 await self._save_preset_image(base_cmd, res)
-            
+
             status_text = "增强生成成功" if use_power_model else "生成成功"
             caption_parts = [f"✅ {status_text} ({elapsed:.2f}s)", f"预设: {display_label}"]
-            
+
             if deduction_source == 'free':
                 caption_parts.append("剩余: ∞")
             else:
@@ -1129,13 +1152,13 @@ class FigurineProPlugin(Star):
     def _get_help_result(self, event: AstrMessageEvent):
         """生成合并转发帮助消息对象"""
         help_text = self.conf.get("help_text", "帮助文档未配置")
-        
+
         bot_uin = "2854196310"
         try:
             if hasattr(event, "robot") and event.robot:
-                 bot_uin = str(event.robot.id)
+                bot_uin = str(event.robot.id)
             elif hasattr(event, "bot") and hasattr(event.bot, "self_id"):
-                 bot_uin = str(event.bot.self_id)
+                bot_uin = str(event.bot.self_id)
         except:
             pass
 
@@ -1147,7 +1170,7 @@ class FigurineProPlugin(Star):
         return event.chain_result([Nodes(nodes=[node])])
 
     @filter.command("文生图", prefix_optional=True)
-    async def on_text_to_image(self, event: AstrMessageEvent):
+    async def on_text_to_image(self, event: AstrMessageEvent, *args):
         raw_cmd = event.message_str.strip()
         cmd_name = "文生图"
         override_model_name = None
@@ -1215,11 +1238,11 @@ class FigurineProPlugin(Star):
                 if group_id and self.conf.get("enable_group_limit", False):
                     if self._get_group_count(group_id) >= required_cost:
                         deduction_source = 'group'
-                
+
                 if deduction_source is None and self.conf.get("enable_user_limit", True):
                     if self._get_user_count(sender_id) >= required_cost:
                         deduction_source = 'user'
-                
+
                 if deduction_source is None:
                     if not self.conf.get("enable_group_limit", False) and not self.conf.get("enable_user_limit", True):
                         deduction_source = 'free'
@@ -1249,7 +1272,7 @@ class FigurineProPlugin(Star):
 
         if isinstance(res, bytes):
             await self._record_daily_usage(sender_id, group_id)
-            
+
             status_text = "增强生成成功" if power_mode_requested else "生成成功"
             caption_parts = [f"✅ {status_text} ({elapsed:.2f}s)"]
             if deduction_source == 'free':
@@ -1287,14 +1310,14 @@ class FigurineProPlugin(Star):
 
         full_msg = event.message_str or ""
         clean_msg = full_msg.strip()
-        
+
         cmd_prefix = "lm添加"
         if "lma" in clean_msg.lower() and not clean_msg.startswith(cmd_prefix):
-             cmd_prefix = "lma"
-        
+            cmd_prefix = "lma"
+
         if clean_msg.lower().startswith(cmd_prefix.lower()):
             clean_msg = clean_msg[len(cmd_prefix):].strip()
-        
+
         clean_msg = clean_msg.lstrip("#/ ")
 
         if ":" not in clean_msg:
@@ -1302,11 +1325,11 @@ class FigurineProPlugin(Star):
             return
 
         key, new_value = map(str.strip, clean_msg.split(":", 1))
-        
+
         prompt_list = self.conf.get("prompt_list", [])
         if not isinstance(prompt_list, list):
             prompt_list = []
-            
+
         found = False
         for idx, item in enumerate(prompt_list):
             if isinstance(item, str) and item.strip().startswith(key + ":"):
@@ -1332,12 +1355,12 @@ class FigurineProPlugin(Star):
         raw = event.message_str.strip()
         parts = raw.split()
         if len(parts) < 2:
-             yield event.plain_result("用法: #lm查看 <关键词>")
-             return
-        
+            yield event.plain_result("用法: #lm查看 <关键词>")
+            return
+
         keyword = parts[1].strip()
         prompt_content = self.prompt_map.get(keyword)
-        
+
         if prompt_content:
             yield event.plain_result(f"🔍 关键词【{keyword}】的提示词：\n\n{prompt_content}")
         else:
@@ -1362,17 +1385,17 @@ class FigurineProPlugin(Star):
 
         built_in.sort()
         custom.sort()
-        
+
         # 合并所有预设并按名称排序
         all_presets = []
         for preset in built_in:
             all_presets.append((preset, True))  # True表示内置预设
         for preset in custom:
             all_presets.append((preset, False))  # False表示自定义预设
-        
+
         # 按预设名称排序
         all_presets.sort(key=lambda x: x[0])
-        
+
         if not all_presets:
             yield event.plain_result("⚠️ 当前没有可用的预设。")
             return
@@ -1380,26 +1403,24 @@ class FigurineProPlugin(Star):
         try:
             # 创建表格图片
             table_image = await self._create_preset_table_image(all_presets)
-            
 
-            
             # 发送图片和标题
             yield event.chain_result([
                 Image.fromBytes(table_image)
             ])
-            
+
         except Exception as e:
             logger.error(f"创建预设表格图片失败: {e}")
             # 如果图片创建失败，回退到文本模式
             plain_msg = "📜 **可用预设列表**\n"
             plain_msg += "==================\n"
-            
+
             if built_in:
                 plain_msg += "📌 **内置预设**:\n"
                 for preset in built_in:
                     plain_msg += f"  • {preset}\n"
                 plain_msg += "\n"
-            
+
             if custom:
                 plain_msg += "✨ **自定义预设**:\n"
                 for preset in custom:
@@ -1409,21 +1430,21 @@ class FigurineProPlugin(Star):
 
             plain_msg += "==================\n"
             plain_msg += "使用方法: #预设名 [图片]"
-            
+
             yield event.plain_result(plain_msg)
 
     async def _create_preset_table_image(self, presets: List[Tuple[str, bool]]) -> bytes:
         """创建5xN表格图片，上面是图片，下面是预设名称"""
         # 根据配置选择表格质量
         quality = self.conf.get("preset_table_quality", "高清")
-        
+
         # 表格参数 - 根据质量设置尺寸
         cols = self.conf.get("preset_table_columns", 5)  # 从配置获取列数，默认5列
         if quality == "标准":
             cell_width = 200  # 标准单元格宽度
             cell_height = 250  # 标准单元格高度
             image_area_height = 200  # 标准图片区域
-            text_area_height = 50   # 标准文字区域
+            text_area_height = 50  # 标准文字区域
             padding = 10  # 标准内边距
             font_size = 16
             title_font_size = 20
@@ -1431,7 +1452,7 @@ class FigurineProPlugin(Star):
             cell_width = 300  # 增大单元格宽度
             cell_height = 380  # 增大单元格高度
             image_area_height = 320  # 增大图片区域
-            text_area_height = 60   # 增大文字区域
+            text_area_height = 60  # 增大文字区域
             padding = 15  # 增大内边距
             font_size = 24
             title_font_size = 32
@@ -1439,36 +1460,36 @@ class FigurineProPlugin(Star):
             cell_width = 400  # 超大单元格宽度
             cell_height = 500  # 超大单元格高度
             image_area_height = 420  # 超大图片区域
-            text_area_height = 80   # 超大文字区域
+            text_area_height = 80  # 超大文字区域
             padding = 20  # 超大内边距
             font_size = 30
             title_font_size = 40
-        
+
         # 计算行数
         rows = (len(presets) + cols - 1) // cols
-        
+
         # 计算图片尺寸
         table_width = cols * cell_width + (cols + 1) * padding
         table_height = rows * cell_height + (rows + 1) * padding
-        
+
         # 创建白色背景图片
         table_img = PILImage.new('RGB', (table_width, table_height), 'white')
-        
+
         # 准备字体（尝试使用支持中文的字体）
         try:
             from PIL import ImageFont
             # 尝试使用支持中文的字体
             font_paths = [
-                "C:/Windows/Fonts/simhei.ttf",     # 黑体
-                "C:/Windows/Fonts/simsun.ttc",     # 宋体
-                "C:/Windows/Fonts/msyh.ttc",       # 微软雅黑
-                "C:/Windows/Fonts/msyhbd.ttc",     # 微软雅黑粗体
-                "arial.ttf"                         # 英文字体作为最后备选
+                "C:/Windows/Fonts/simhei.ttf",  # 黑体
+                "C:/Windows/Fonts/simsun.ttc",  # 宋体
+                "C:/Windows/Fonts/msyh.ttc",  # 微软雅黑
+                "C:/Windows/Fonts/msyhbd.ttc",  # 微软雅黑粗体
+                "arial.ttf"  # 英文字体作为最后备选
             ]
-            
+
             font = None
             title_font = None
-            
+
             for font_path in font_paths:
                 try:
                     if Path(font_path).exists():
@@ -1477,20 +1498,20 @@ class FigurineProPlugin(Star):
                         break
                 except:
                     continue
-            
+
             # 如果都找不到，使用默认字体
             if not font:
                 font = ImageFont.load_default()
                 title_font = ImageFont.load_default()
-                
+
         except:
             font = None
             title_font = None
-        
+
         # 创建绘图对象
         from PIL import ImageDraw
         draw = ImageDraw.Draw(table_img)
-        
+
         # 启用抗锯齿（如果可用）
         try:
             from PIL import ImageDraw
@@ -1499,19 +1520,19 @@ class FigurineProPlugin(Star):
                 pass  # PIL版本支持
         except ImportError:
             pass
-        
+
         # 绘制每个单元格
         for i, (preset_name, is_built_in) in enumerate(presets):
             row = i // cols
             col = i % cols
-            
+
             # 计算单元格位置
             x = padding + col * (cell_width + padding)
             y = padding + row * (cell_height + padding)
-            
+
             # 获取预设图片
             image_path = self._get_preset_image_path(preset_name)
-            
+
             # 绘制图片区域
             if image_path:
                 try:
@@ -1521,21 +1542,23 @@ class FigurineProPlugin(Star):
                     if preset_img.mode != 'RGB':
                         preset_img = preset_img.convert('RGB')
                     # 保持纵横比，填充到更大尺寸，使用最高质量的LANCZOS重采样
-                    preset_img.thumbnail((cell_width - 2*padding, image_area_height - 2*padding), PILImage.Resampling.LANCZOS)
-                    
+                    preset_img.thumbnail((cell_width - 2 * padding, image_area_height - 2 * padding),
+                                         PILImage.Resampling.LANCZOS)
+
                     # 计算居中位置
                     img_width, img_height = preset_img.size
                     img_x = x + (cell_width - img_width) // 2
                     img_y = y + (image_area_height - img_height) // 2
-                    
+
                     # 粘贴图片
                     table_img.paste(preset_img, (img_x, img_y))
-                    
+
                 except Exception as e:
                     logger.error(f"加载预设图片失败 {preset_name}: {e}")
                     # 绘制占位符
-                    draw.rectangle([x + padding, y + padding, x + cell_width - padding, y + image_area_height - padding], 
-                                 outline='lightgray', width=2)
+                    draw.rectangle(
+                        [x + padding, y + padding, x + cell_width - padding, y + image_area_height - padding],
+                        outline='lightgray', width=2)
                     placeholder_text = "无图片"
                     if font:
                         bbox = draw.textbbox((0, 0), placeholder_text, font=font)
@@ -1549,8 +1572,8 @@ class FigurineProPlugin(Star):
                     draw.text((text_x, text_y), placeholder_text, fill='gray', font=font)
             else:
                 # 没有图片，绘制占位符
-                draw.rectangle([x + padding, y + padding, x + cell_width - padding, y + image_area_height - padding], 
-                             outline='lightgray', width=2)
+                draw.rectangle([x + padding, y + padding, x + cell_width - padding, y + image_area_height - padding],
+                               outline='lightgray', width=2)
                 placeholder_text = "无图片"
                 if font:
                     bbox = draw.textbbox((0, 0), placeholder_text, font=font)
@@ -1562,25 +1585,25 @@ class FigurineProPlugin(Star):
                 text_x = x + (cell_width - text_width) // 2
                 text_y = y + (image_area_height - text_height) // 2
                 draw.text((text_x, text_y), placeholder_text, fill='gray', font=font)
-            
+
             # 绘制文字区域背景
             text_y_pos = y + image_area_height
             draw.rectangle([x, text_y_pos, x + cell_width, text_y_pos + text_area_height], fill='lightgray')
-            
+
             # 绘制预设名称
             # 根据字体大小调整截断长度
             if font_size <= 16:
                 max_length = 10  # 小字体可以显示更多字符
             elif font_size <= 24:
-                max_length = 8   # 中等字体
+                max_length = 8  # 中等字体
             else:
-                max_length = 6   # 大字体显示更少字符
+                max_length = 6  # 大字体显示更少字符
             display_name = preset_name[:max_length] + '...' if len(preset_name) > max_length else preset_name
             if is_built_in:
                 display_name = f"📌{display_name}"
             else:
                 display_name = f"✨{display_name}"
-            
+
             if font:
                 bbox = draw.textbbox((0, 0), display_name, font=font)
                 text_width = bbox[2] - bbox[0]
@@ -1588,14 +1611,14 @@ class FigurineProPlugin(Star):
             else:
                 text_width = len(display_name) * (font_size // 2)  # 根据字体大小调整字符宽度
                 text_height = font_size
-            
+
             text_x = x + (cell_width - text_width) // 2
             text_y = text_y_pos + (text_area_height - text_height) // 2
             draw.text((text_x, text_y), display_name, fill='black', font=font)
-            
+
             # 绘制单元格边框
             draw.rectangle([x, y, x + cell_width, y + cell_height], outline='black', width=1)
-        
+
         # 保存为字节 - 使用更高质量设置
         img_byte_arr = io.BytesIO()
         # 使用PNG格式，质量设置为最高
@@ -1613,13 +1636,13 @@ class FigurineProPlugin(Star):
 
         prompt = self.prompt_map.get(keyword)
         content = f"📄 预设 [{keyword}] 内容:\n{prompt}" if prompt else f"❌ 未找到 [{keyword}]"
-        
+
         bot_uin = "2854196310"
         try:
             if hasattr(event, "robot") and event.robot:
-                 bot_uin = str(event.robot.id)
+                bot_uin = str(event.robot.id)
             elif hasattr(event, "bot") and hasattr(event.bot, "self_id"):
-                 bot_uin = str(event.bot.self_id)
+                bot_uin = str(event.bot.self_id)
         except:
             pass
 
@@ -1726,23 +1749,23 @@ class FigurineProPlugin(Star):
 
     async def _record_daily_usage(self, user_id: str, group_id: str | None):
         today = datetime.now().strftime("%Y-%m-%d")
-        
+
         if self.daily_stats.get("date") != today:
             self.daily_stats = {
                 "date": today,
                 "users": {},
                 "groups": {}
             }
-        
+
         uid = self._norm_id(user_id)
         current_u = self.daily_stats["users"].get(uid, 0)
         self.daily_stats["users"][uid] = current_u + 1
-        
+
         if group_id:
             gid = self._norm_id(group_id)
             current_g = self.daily_stats["groups"].get(gid, 0)
             self.daily_stats["groups"][gid] = current_g + 1
-            
+
         await self._save_daily_stats()
 
     async def _load_preset_images(self):
@@ -1769,21 +1792,21 @@ class FigurineProPlugin(Star):
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"{preset_key}_{timestamp}.png"
             filepath = self.preset_images_dir / filename
-            
+
             # 保存图片文件
             await asyncio.to_thread(filepath.write_bytes, image_bytes)
-            
+
             # 删除旧的图片文件（如果存在）
             if preset_key in self.preset_images:
                 old_filename = self.preset_images[preset_key]
                 old_filepath = self.preset_images_dir / old_filename
                 if old_filepath.exists():
                     await asyncio.to_thread(old_filepath.unlink)
-            
+
             # 更新记录
             self.preset_images[preset_key] = filename
             await self._save_preset_images()
-            
+
             logger.info(f"已保存预设图片: {preset_key} -> {filename}")
             return True
         except Exception as e:
@@ -1794,10 +1817,10 @@ class FigurineProPlugin(Star):
         """获取预设图片的文件路径"""
         if preset_key not in self.preset_images:
             return None
-        
+
         filename = self.preset_images[preset_key]
         filepath = self.preset_images_dir / filename
-        
+
         if filepath.exists():
             return str(filepath)
         else:
@@ -1811,25 +1834,25 @@ class FigurineProPlugin(Star):
         try:
             current_time = datetime.now()
             cleaned_count = 0
-            
+
             for preset_key, filename in list(self.preset_images.items()):
                 filepath = self.preset_images_dir / filename
                 if filepath.exists():
                     # 获取文件创建时间
                     file_time = datetime.fromtimestamp(filepath.stat().st_mtime)
                     age_days = (current_time - file_time).days
-                    
+
                     if age_days > max_age_days:
                         # 删除文件和记录
                         await asyncio.to_thread(filepath.unlink)
                         del self.preset_images[preset_key]
                         cleaned_count += 1
                         logger.info(f"清理过期预设图片: {preset_key} ({filename})")
-            
+
             if cleaned_count > 0:
                 await self._save_preset_images()
                 logger.info(f"预设图片清理完成，共清理 {cleaned_count} 个文件")
-            
+
             return cleaned_count
         except Exception as e:
             logger.error(f"清理预设图片失败: {e}")
@@ -1841,21 +1864,21 @@ class FigurineProPlugin(Star):
         if not self.is_global_admin(event):
             yield event.plain_result("❌ 只有管理员可以执行此操作。")
             return
-        
+
         # 默认清理30天前的图片
         max_age_days = 30
         args = event.message_str.strip().split()
         if len(args) > 1 and args[1].isdigit():
             max_age_days = int(args[1])
-        
+
         cleaned_count = await self._cleanup_preset_images(max_age_days)
-        
+
         total_images = len(self.preset_images)
         msg = f"✅ 预设图片清理完成！\n"
         msg += f"📊 清理了 {cleaned_count} 个过期图片\n"
         msg += f"📁 当前剩余 {total_images} 个预设图片\n"
         msg += f"⏰ 清理条件: 超过 {max_age_days} 天的图片"
-        
+
         yield event.plain_result(msg)
 
     @filter.command("预设图片统计", prefix_optional=True)
@@ -1864,26 +1887,26 @@ class FigurineProPlugin(Star):
         if not self.is_global_admin(event):
             yield event.plain_result("❌ 只有管理员可以执行此操作。")
             return
-        
+
         total_images = len(self.preset_images)
-        
+
         # 统计文件大小
         total_size = 0
         for filename in self.preset_images.values():
             filepath = self.preset_images_dir / filename
             if filepath.exists():
                 total_size += filepath.stat().st_size
-        
+
         # 转换为MB
         total_size_mb = total_size / (1024 * 1024)
-        
+
         # 显示每个预设的图片信息
         msg = f"📊 **预设图片统计**\n"
         msg += f"==================\n"
         msg += f"📁 总预设数: {total_images}\n"
         msg += f"💾 总大小: {total_size_mb:.2f} MB\n"
         msg += f"📂 存储目录: {self.preset_images_dir}\n\n"
-        
+
         if total_images > 0:
             msg += "📸 **详细列表**:\n"
             for preset, filename in sorted(self.preset_images.items()):
@@ -1891,7 +1914,7 @@ class FigurineProPlugin(Star):
                 if filepath.exists():
                     size_mb = filepath.stat().st_size / (1024 * 1024)
                     msg += f"  • {preset}: {size_mb:.2f} MB\n"
-        
+
         yield event.plain_result(msg)
 
     @filter.command("手办化今日统计", prefix_optional=True)
@@ -1904,26 +1927,26 @@ class FigurineProPlugin(Star):
         if self.daily_stats.get("date") != today:
             yield event.plain_result(f"📊 {today} 今日暂无统计数据。")
             return
-        
+
         users_sorted = sorted(self.daily_stats["users"].items(), key=lambda x: x[1], reverse=True)[:10]
         groups_sorted = sorted(self.daily_stats["groups"].items(), key=lambda x: x[1], reverse=True)[:10]
-        
+
         msg = f"📊 **手办化今日统计 ({today})**\n"
         msg += "--------------------\n"
         msg += "👥 **群组消耗排行**:\n"
         if groups_sorted:
             for i, (gid, count) in enumerate(groups_sorted):
-                msg += f"{i+1}. 群{gid}: {count}次\n"
+                msg += f"{i + 1}. 群{gid}: {count}次\n"
         else:
             msg += "(无数据)\n"
-            
+
         msg += "\n👤 **用户消耗排行**:\n"
         if users_sorted:
             for i, (uid, count) in enumerate(users_sorted):
-                msg += f"{i+1}. {uid}: {count}次\n"
+                msg += f"{i + 1}. {uid}: {count}次\n"
         else:
             msg += "(无数据)\n"
-            
+
         yield event.plain_result(msg)
 
     @filter.command("手办化签到", prefix_optional=True)
@@ -1975,13 +1998,13 @@ class FigurineProPlugin(Star):
             new_cnt = old_cnt + count
             self.user_counts[target] = new_cnt
             await self._save_user_counts()
-            
+
             msg = f"✅ 已为用户 {target} 增加 {count} 次。\n"
             msg += f"📊 变动: {old_cnt} + {count} = {new_cnt}\n"
             msg += f"👤 用户剩余: {new_cnt}"
             if gid := event.get_group_id():
                 msg += f"\n👥 本群剩余: {self._get_group_count(self._norm_id(gid))}"
-            
+
             yield event.plain_result(msg)
 
     @filter.command("手办化增加群组次数", prefix_optional=True)
@@ -1992,22 +2015,22 @@ class FigurineProPlugin(Star):
         match = re.search(r"(\d+)\s+(\d+)", event.message_str.strip())
         if match:
             gid, count = self._norm_id(match.group(1)), int(match.group(2))
-            
+
             old_cnt = self._get_group_count(gid)
             new_cnt = old_cnt + count
             self.group_counts[gid] = new_cnt
             await self._save_group_counts()
-            
+
             msg = f"✅ 已为群 {gid} 增加 {count} 次。\n"
             msg += f"📊 变动: {old_cnt} + {count} = {new_cnt}\n"
             msg += f"👥 本群剩余: {new_cnt}"
-            
+
             yield event.plain_result(msg)
 
     @filter.command("手办化查询次数", prefix_optional=True)
     async def on_query_counts(self, event: AstrMessageEvent):
         uid = self._norm_id(event.get_sender_id())
-        
+
         if self.is_global_admin(event):
             at_seg = next((s for s in event.message_obj.message if isinstance(s, At)), None)
             if at_seg:
@@ -2034,17 +2057,17 @@ class FigurineProPlugin(Star):
             return
 
         current_mode = self.conf.get("api_mode", "generic")
-        
+
         # 检查是否有强力模式参数
         use_power_mode = False
         if new_keys and new_keys[0].lower() in ["power", "强力", "p"]:
             use_power_mode = True
             new_keys = new_keys[1:]  # 移除参数
-        
+
         if not new_keys:
             yield event.plain_result("格式错误。用法: #手办化添加key [power/强力/p] <key1> ...")
             return
-        
+
         # 根据模式和是否强力模式选择目标字段
         if use_power_mode:
             target_field = "power_gemini_api_keys" if current_mode == "gemini_official" else "power_generic_api_keys"
@@ -2052,12 +2075,12 @@ class FigurineProPlugin(Star):
         else:
             target_field = "gemini_api_keys" if current_mode == "gemini_official" else "generic_api_keys"
             mode_desc = f"【{current_mode}】"
-        
+
         keys = self.conf.get(target_field, [])
         added = [k for k in new_keys if k not in keys]
         keys.extend(added)
         self.conf[target_field] = keys
-        
+
         if hasattr(self.conf, "save"):
             self.conf.save()
 
@@ -2069,35 +2092,35 @@ class FigurineProPlugin(Star):
             return
 
         current_mode = self.conf.get("api_mode", "generic")
-        
+
         # 获取普通模式Key池
         normal_target_field = "gemini_api_keys" if current_mode == "gemini_official" else "generic_api_keys"
         normal_keys = self.conf.get(normal_target_field, [])
-        
+
         # 获取强力模式Key池
         power_target_field = "power_gemini_api_keys" if current_mode == "gemini_official" else "power_generic_api_keys"
         power_keys = self.conf.get(power_target_field, [])
-        
+
         msg = f"🔑 API模式: 【{current_mode}】\n\n"
-        
+
         # 普通模式Key列表
         msg += f"📌 普通模式Key池 ({len(normal_keys)}个):\n"
         if normal_keys:
             msg += "\n".join([f"{i + 1}. {k[:6]}..." for i, k in enumerate(normal_keys)]) + "\n"
         else:
             msg += "(空)\n"
-        
+
         # 强力模式Key列表
         msg += f"\n⚡ 强力模式Key池 ({len(power_keys)}个):\n"
         if power_keys:
             msg += "\n".join([f"{i + 1}. {k[:6]}..." for i, k in enumerate(power_keys)]) + "\n"
         else:
             msg += "(空)\n"
-        
+
         # 如果强力模式Key池为空，显示提示
         if not power_keys:
             msg += "\n💡 提示: 强力模式Key池为空时将使用普通模式Key池"
-        
+
         yield event.plain_result(msg)
 
     @filter.command("手办化删除key", prefix_optional=True)
@@ -2113,18 +2136,18 @@ class FigurineProPlugin(Star):
         # 检查是否有强力模式参数
         use_power_mode = False
         param_idx = 1
-        
+
         if parts[1].lower() in ["power", "强力", "p"]:
             use_power_mode = True
             param_idx = 2
             if len(parts) < 3:
                 yield event.plain_result("格式: #手办化删除key [power/强力/p] <序号|all>")
                 return
-        
+
         param = parts[param_idx]
-        
+
         current_mode = self.conf.get("api_mode", "generic")
-        
+
         # 根据是否强力模式选择目标字段
         if use_power_mode:
             target_field = "power_gemini_api_keys" if current_mode == "gemini_official" else "power_generic_api_keys"
@@ -2132,7 +2155,7 @@ class FigurineProPlugin(Star):
         else:
             target_field = "gemini_api_keys" if current_mode == "gemini_official" else "generic_api_keys"
             mode_desc = f"【{current_mode}】"
-        
+
         keys = self.conf.get(target_field, [])
 
         if param == "all":
@@ -2152,5 +2175,3 @@ class FigurineProPlugin(Star):
         if self.iwf:
             await self.iwf.terminate()
         logger.info("[FigurinePro] 插件已终止")
-
-
