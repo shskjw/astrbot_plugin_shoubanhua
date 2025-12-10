@@ -24,7 +24,7 @@ from astrbot.core.platform.astr_message_event import AstrMessageEvent
     "astrbot_plugin_shoubanhua",
     "shskjw",
     "支持第三方所有OpenAI绘图格式和原生Google Gemini 终极缝合怪，文生图/图生图插件",
-    "1.7.3",
+    "1.7.6",
     "https://github.com/shkjw/astrbot_plugin_shoubanhua",
 )
 class FigurineProPlugin(Star):
@@ -159,14 +159,6 @@ class FigurineProPlugin(Star):
                         logger.warning(f"无法获取用户 [{user_id}] 的头像")
 
             logger.info(f"成功获取 {len(img_bytes_list)} 个@用户头像")
-
-            # 6. 如果没有图片且没有@用户，尝试获取发送者头像
-            if not img_bytes_list and not at_user_ids:
-                sender_id = str(event.get_sender_id())
-                logger.info(f"未找到图片和@用户，尝试获取发送者 [{sender_id}] 的头像...")
-                if avatar := await self._get_avatar(sender_id):
-                    img_bytes_list.append(avatar)
-                    logger.info("成功获取发送者头像作为兜底")
 
             logger.info(f"最终获取到 {len(img_bytes_list)} 张图片")
             return img_bytes_list
@@ -652,11 +644,19 @@ class FigurineProPlugin(Star):
         if not api_key:
             return f"无可用 API Key (请在 {api_mode} 池中添加Key)"
 
+        # --- 构造最终 Prompt (注入指令以强制画图) ---
+        if len(image_bytes_list) > 0:
+            # 图生图
+            final_prompt = f"Re-imagine the attached image with the following style/description: {prompt}. Draw it directly. Do not analyze."
+        else:
+            # 文生图
+            final_prompt = f"Generate a high quality image based on this description: {prompt}"
+        
         # --- 应用分辨率设置 ---
         resolution_setting = self.conf.get("image_resolution", "1K")
         if resolution_setting and resolution_setting != "1K":
             # 修复：将分辨率提示词移到最前面，并加强权重，确保 Gemini 等模型能生效
-            prompt = f"(Masterpiece, Best Quality, {resolution_setting} Resolution), {prompt}"
+            final_prompt = f"(Masterpiece, Best Quality, {resolution_setting} Resolution), {final_prompt}"
 
         headers = {
             "Content-Type": "application/json",
@@ -678,7 +678,7 @@ class FigurineProPlugin(Star):
 
             headers["x-goog-api-key"] = api_key
 
-            parts = [{"text": prompt}]
+            parts = [{"text": final_prompt}]
             for img in image_bytes_list:
                 b64 = base64.b64encode(img).decode("utf-8")
                 parts.append({
@@ -708,12 +708,17 @@ class FigurineProPlugin(Star):
             headers["Authorization"] = f"Bearer {api_key}"
 
             messages = []
-            # 优化 System Prompt，防止模型因为人设问题拒绝画图
-            messages.append({"role": "system", "content": "You are a creative AI artist capable of generating images."})
+            # 优化 System Prompt，极度严格地禁止聊天，强制画图模式
+            system_instruction = (
+                "You are an expert AI artist tool. Your ONLY job is to generate images based on user inputs. "
+                "Do NOT describe the image. Do NOT ask questions. Do NOT start a conversation. "
+                "Directly output the generated image url or data."
+            )
+            messages.append({"role": "system", "content": system_instruction})
 
             if len(image_bytes_list) > 0:
                 # 包含图片的 Vision 请求结构
-                user_content_list = [{"type": "text", "text": prompt}]
+                user_content_list = [{"type": "text", "text": final_prompt}]
                 for img in image_bytes_list:
                     b64 = base64.b64encode(img).decode("utf-8")
                     user_content_list.append({
@@ -722,14 +727,13 @@ class FigurineProPlugin(Star):
                     })
                 messages.append({"role": "user", "content": user_content_list})
             else:
-                # 纯文本请求结构：直接发送字符串 content
-                # 这样可以兼容那些对 Vision 列表格式支持不佳的 API 网关或模型
-                messages.append({"role": "user", "content": prompt})
+                # 纯文本请求结构
+                messages.append({"role": "user", "content": final_prompt})
 
             use_stream = self.conf.get("use_stream", True)
             payload = {
                 "model": model_name,
-                "max_tokens": 4000,  # 增加 max_tokens 以容纳可能的 Base64 图片返回
+                "max_tokens": 4000,
                 "stream": use_stream,
                 "messages": messages
             }
@@ -827,9 +831,9 @@ class FigurineProPlugin(Star):
             logger.error(f"API 调用异常: {e}", exc_info=True)
             return f"系统错误: {e}"
 
-    # 修复：添加 *args 参数以吸收框架传递的额外参数，防止 TypeError
+    # 修复：使用 ctx=None 替代 *args 以避免 _empty() 错误，同时兼容框架传递的额外参数
     @filter.event_message_type(filter.EventMessageType.ALL, priority=5)
-    async def on_figurine_request(self, event: AstrMessageEvent, *args):
+    async def on_figurine_request(self, event: AstrMessageEvent, ctx=None):
         if self.conf.get("prefix", True) and not event.is_at_or_wake_command:
             return
 
@@ -857,19 +861,16 @@ class FigurineProPlugin(Star):
         if not cmd:
             return
 
-        # 强力模式参数解析 - 需要在%符号分割之前处理
+        # 强力模式参数解析
         raw_power_keyword = (self.conf.get("power_model_keyword") or "").strip()
         keyword_lower = raw_power_keyword.lower()
         power_mode_requested = False
 
-        # 先检查是否在命令本身中包含强力模式触发词
         if keyword_lower and keyword_lower in cmd.lower():
-            # 从命令中移除触发词
             cmd = cmd.lower().replace(keyword_lower, "").strip()
             power_mode_requested = True
             logger.info(f"在命令中检测到强力模式触发词'{keyword_lower}'，移除后命令='{cmd}'")
         elif keyword_lower and len(tokens) > consumed_tokens:
-            # 检查下一个token是否是触发词
             next_token = tokens[consumed_tokens].strip().lower()
             if next_token == keyword_lower:
                 power_mode_requested = True
@@ -877,25 +878,22 @@ class FigurineProPlugin(Star):
                 logger.info(f"检测到强力模式触发词作为独立token: '{keyword_lower}'")
 
         power_model_name = (self.conf.get("power_model_id") or "").strip()
-        use_power_model = False
+        use_power_model = False  # [FIX] 确保变量名正确初始化
         if power_mode_requested:
             if not power_model_name:
                 yield event.plain_result("⚠️ 强力模式触发失败：请先在管理面板配置强力模型ID。")
                 return
-            use_power_model = True
+            use_power_model = True  # [FIX] 使用 use_power_model
 
         # 指令解析
         bnn_command = self.conf.get("extra_prefix", "bnn")
         user_prompt = ""
         is_bnn = False
 
-        # %符号分割逻辑 - 支持在命令中分割基础命令和追加内容
         base_cmd = cmd
         append_text = ""
 
-        # 检查命令中是否包含%符号（在强力模式处理之后）
         if "%" in cmd:
-            # 分割命令，只分割第一个%
             parts = cmd.split("%", 1)
             if len(parts) == 2:
                 base_cmd = parts[0].strip()
@@ -911,7 +909,6 @@ class FigurineProPlugin(Star):
             val = self.prompt_map.get(base_cmd)
             if val and val != "[内置预设]":
                 user_prompt = val
-                # 如果有追加内容，拼接到prompt后面
                 if append_text:
                     user_prompt = user_prompt + append_text
                     logger.info(f"将追加内容'{append_text}'添加到预设prompt后面")
@@ -934,12 +931,10 @@ class FigurineProPlugin(Star):
                     yield self._get_help_result(event)
                     return
                 user_prompt = self.prompt_map.get(key) or self.prompt_map.get(base_cmd)
-                # 如果有追加内容，拼接到prompt后面
                 if append_text:
                     user_prompt = user_prompt + append_text
                     logger.info(f"将追加内容'{append_text}'添加到映射命令prompt后面")
 
-        # 记录强力模式状态用于调试
         if power_mode_requested:
             logger.info(f"🚀 强力模式已激活！触发词: '{raw_power_keyword}', 使用模型: '{power_model_name}'")
 
@@ -948,7 +943,7 @@ class FigurineProPlugin(Star):
                 if not user_prompt and not power_mode_requested:
                     pass
             else:
-                return  # 不是已知指令，忽略
+                return
 
         # --- 权限与次数逻辑 ---
         sender_id = self._norm_id(event.get_sender_id())
@@ -982,7 +977,6 @@ class FigurineProPlugin(Star):
             return
 
         if deduction_source is None:
-            # 强力模式只扣除个人次数
             if use_power_model:
                 if self.conf.get("enable_user_limit", True):
                     u_cnt = self._get_user_count(sender_id)
@@ -994,7 +988,6 @@ class FigurineProPlugin(Star):
                 else:
                     deduction_source = 'free'
             else:
-                # 普通模式保持原有逻辑
                 if group_id and self.conf.get("enable_group_limit", False):
                     g_cnt = self._get_group_count(group_id)
                     if g_cnt >= required_cost:
@@ -1019,34 +1012,39 @@ class FigurineProPlugin(Star):
         is_text_to_image = False
 
         if self.iwf:
+            # [修改] ImageWorkflow.get_images 现在不会自动获取头像
             img_bytes_list = await self.iwf.get_images(event)
 
             if not img_bytes_list:
-                # 未检测到图片
+                # [修改] 智能判断 BNN 模式
                 if is_bnn:
-                    # bnn 模式 + 无图 = 文生图
+                    # bnn 模式 + 无图 = 纯文生图
                     if not user_prompt:
                         yield event.plain_result(f"请在指令后添加描述。例如: #{bnn_command} 一个可爱的女孩")
                         return
                     is_text_to_image = True
                     images_to_process = []
+                    logger.info("BNN模式下未检测到图片，自动切换为纯文生图模式")
                 else:
-                    # 手办化等预设模式 + 无图 = 尝试取头像 (兼容旧习惯)
+                    # 手办化等预设模式 + 无图 = 尝试取发送者头像 (兼容旧习惯)
+                    logger.info(f"预设模式下未检测到图片，尝试获取发送者 [{sender_id}] 的头像...")
                     if avatar := await self.iwf._get_avatar(sender_id):
                         img_bytes_list = [avatar]
+                        logger.info("成功获取发送者头像作为图生图源")
                     else:
                         yield event.plain_result("请发送或引用一张图片。")
+            else:
+                # 检测到图片，走图生图
+                is_text_to_image = False
+                logger.info("检测到明确的图片输入，模式确定为图生图")
 
             if not is_text_to_image and img_bytes_list:
                 images_to_process = img_bytes_list
 
-        # --- 检查预设内容中的图片链接 ---
         if not is_bnn and user_prompt and not is_text_to_image:
-            # 从预设内容中提取图片链接
             image_urls = self._extract_image_urls_from_text(user_prompt)
             if image_urls:
                 logger.info(f"在预设内容中发现 {len(image_urls)} 个图片链接: {image_urls}")
-                # 下载图片链接并添加到处理列表的最后
                 for image_url in image_urls:
                     if downloaded_image := await self._download_preset_image(image_url):
                         images_to_process.append(downloaded_image)
@@ -1056,25 +1054,23 @@ class FigurineProPlugin(Star):
 
         display_cmd = cmd
         if is_bnn:
-            MAX_IMAGES = 5
-            if len(images_to_process) > MAX_IMAGES:
-                images_to_process = images_to_process[:MAX_IMAGES]
-                yield event.plain_result(f"🎨 检测到 {len(img_bytes_list)} 张图片，已选取前 {MAX_IMAGES} 张…")
+            if not is_text_to_image:
+                MAX_IMAGES = 5
+                if len(images_to_process) > MAX_IMAGES:
+                    images_to_process = images_to_process[:MAX_IMAGES]
+                    yield event.plain_result(f"🎨 检测到 {len(img_bytes_list)} 张图片，已选取前 {MAX_IMAGES} 张…")
 
             display_cmd = user_prompt[:10] + '...' if len(user_prompt) > 10 else user_prompt
         elif len(images_to_process) > 0:
-            # 对于非bnn模式，如果有多个@用户，保留所有头像，但限制最大数量
-            MAX_FIGURINE_IMAGES = 10  # 手办化等预设模式最多处理10张图片
+            MAX_FIGURINE_IMAGES = 10
             if len(images_to_process) > MAX_FIGURINE_IMAGES:
                 images_to_process = images_to_process[:MAX_FIGURINE_IMAGES]
                 yield event.plain_result(
                     f"🎨 检测到 {len(img_bytes_list)} 张图片（含@用户头像），已选取前 {MAX_FIGURINE_IMAGES} 张…")
 
-        # 如果有追加内容，在显示命令中包含追加内容提示
         if append_text:
             display_cmd = f"{base_cmd}%{append_text[:5]}..."
 
-        # 模型选择
         override_model_name = None
         all_models = self._get_all_models()
         if temp_model_idx is not None:
@@ -1097,13 +1093,13 @@ class FigurineProPlugin(Star):
         info_msg = f"🎨 收到{mode_prefix}{action_type}请求，正在生成 [{display_label}]..."
         yield event.plain_result(info_msg)
 
-        # --- 扣费执行 ---
         if deduction_source == 'group' and group_id:
             await self._decrease_group_count(group_id, required_cost)
         elif deduction_source == 'user':
             await self._decrease_user_count(sender_id, required_cost)
 
         start_time = datetime.now()
+        # [FIX] 使用 use_power_model (布尔值)
         res = await self._call_api(images_to_process, user_prompt, override_model=override_model_name,
                                    use_power_mode=use_power_model)
         elapsed = (datetime.now() - start_time).total_seconds()
@@ -1111,7 +1107,6 @@ class FigurineProPlugin(Star):
         if isinstance(res, bytes):
             await self._record_daily_usage(sender_id, group_id)
 
-            # 保存预设图片（如果是预设命令）
             if base_cmd in self.prompt_map and not is_bnn:
                 await self._save_preset_image(base_cmd, res)
 
@@ -1169,8 +1164,9 @@ class FigurineProPlugin(Star):
         )
         return event.chain_result([Nodes(nodes=[node])])
 
+    # 修复：使用 ctx=None 替代 *args
     @filter.command("文生图", prefix_optional=True)
-    async def on_text_to_image(self, event: AstrMessageEvent, *args):
+    async def on_text_to_image(self, event: AstrMessageEvent, ctx=None):
         raw_cmd = event.message_str.strip()
         cmd_name = "文生图"
         override_model_name = None
@@ -1222,7 +1218,6 @@ class FigurineProPlugin(Star):
         if self.is_global_admin(event):
             deduction_source = 'free'
         else:
-            # 强力模式只扣除个人次数
             if use_power_model:
                 if self.conf.get("enable_user_limit", True):
                     u_cnt = self._get_user_count(sender_id)
@@ -1234,7 +1229,6 @@ class FigurineProPlugin(Star):
                 else:
                     deduction_source = 'free'
             else:
-                # 普通模式保持原有逻辑
                 if group_id and self.conf.get("enable_group_limit", False):
                     if self._get_group_count(group_id) >= required_cost:
                         deduction_source = 'group'
