@@ -978,13 +978,24 @@ class FigurineProPlugin(Star):
 
         if deduction_source is None:
             if use_power_model:
+                allow_group_fallback = bool(self.conf.get("power_mode_fallback_to_group", False))
                 if self.conf.get("enable_user_limit", True):
                     u_cnt = self._get_user_count(sender_id)
                     if u_cnt >= required_cost:
                         deduction_source = 'user'
                     else:
-                        yield event.plain_result(f"❌ 个人次数不足。需要 {required_cost} 次，当前剩余 {u_cnt} 次。")
-                        return
+                        if allow_group_fallback and group_id and self.conf.get("enable_group_limit", False):
+                            g_cnt = self._get_group_count(group_id)
+                            if g_cnt >= required_cost:
+                                deduction_source = 'group'
+                            else:
+                                yield event.plain_result(
+                                    f"❌ 次数不足。需要 {required_cost} 次。\n👤 用户剩余: {u_cnt}\n👥 本群剩余: {g_cnt}"
+                                )
+                                return
+                        else:
+                            yield event.plain_result(f"❌ 个人次数不足。需要 {required_cost} 次，当前剩余 {u_cnt} 次。")
+                            return
                 else:
                     deduction_source = 'free'
             else:
@@ -1219,13 +1230,24 @@ class FigurineProPlugin(Star):
             deduction_source = 'free'
         else:
             if use_power_model:
+                allow_group_fallback = bool(self.conf.get("power_mode_fallback_to_group", False))
                 if self.conf.get("enable_user_limit", True):
                     u_cnt = self._get_user_count(sender_id)
                     if u_cnt >= required_cost:
                         deduction_source = 'user'
                     else:
-                        yield event.plain_result(f"❌ 个人次数不足。需要 {required_cost} 次，当前剩余 {u_cnt} 次。")
-                        return
+                        if allow_group_fallback and group_id and self.conf.get("enable_group_limit", False):
+                            g_cnt = self._get_group_count(group_id)
+                            if g_cnt >= required_cost:
+                                deduction_source = 'group'
+                            else:
+                                yield event.plain_result(
+                                    f"❌ 次数不足。需要 {required_cost} 次。\n👤 用户剩余: {u_cnt}\n👥 本群剩余: {g_cnt}"
+                                )
+                                return
+                        else:
+                            yield event.plain_result(f"❌ 个人次数不足。需要 {required_cost} 次，当前剩余 {u_cnt} 次。")
+                            return
                 else:
                     deduction_source = 'free'
             else:
