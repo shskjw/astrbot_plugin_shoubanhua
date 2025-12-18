@@ -112,6 +112,12 @@
         "hint": "开启强力模式时除了基础扣费外额外扣除的次数，至少为0。",
         "default": 1
     },
+    "power_mode_fallback_to_group": {
+        "description": "【高级】强力模式群次数回退",
+        "type": "bool",
+        "hint": "开启后：强力模式优先扣个人次数；若个人次数不足且已启用群组次数限制，则顺位扣群次数。",
+        "default": false
+    },
     "power_generic_api_url": {
         "description": "【强力模式-Generic】API地址",
         "type": "string",
