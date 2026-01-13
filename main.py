@@ -21,7 +21,7 @@ from .utils import norm_id, extract_image_urls_from_text
     "astrbot_plugin_shoubanhua",
     "shskjw",
     "支持第三方所有OpenAI绘图格式和原生Google Gemini 终极缝合怪，文生图/图生图插件",
-    "1.8.3",
+    "1.8.1",
     "https://github.com/shkjw/astrbot_plugin_shoubanhua",
 )
 class FigurineProPlugin(Star):
