@@ -59,6 +59,10 @@ class ApiManager:
                 part = data["candidates"][0]["content"]["parts"][0]
                 if "inlineData" in part:
                     return f"data:{part['inlineData']['mimeType']};base64,{part['inlineData']['data']}"
+                # Sometimes raw text contains url? (rare for gemini, but possible)
+                if "text" in part:
+                    if match := re.search(r'https?://[^\s<>")\]]+', part["text"]):
+                        return match.group(0).rstrip(")>,'\"")
         except:
             pass
         return None
@@ -84,25 +88,47 @@ class ApiManager:
         # 3. 构造请求
         headers = {"Content-Type": "application/json"}
         payload = {}
-        url = base
+        url = base.rstrip("/")
 
         # 画质强化 Prompt
         res_set = self.config.get("image_resolution", "1K")
         final_prompt = f"(Masterpiece, Best Quality, {res_set} Resolution), {prompt}" if res_set != "1K" else prompt
 
         if mode == "gemini_official":
-            # Gemini 构造
-            if "models/" not in url and not url.endswith(":generateContent"):
-                url = url.rstrip("/") + f"/models/{model}:generateContent"
+            # --- 修复核心：Gemini URL 智能构造 ---
+            # 如果 URL 里没有 'models' 关键字且不是 OneAPI 风格，说明填的是 Base URL
+
+            # 补全 v1/v1beta
+            if "/v1" not in url and "/v1beta" not in url:
+                url += "/v1beta"
+
+            # 补全 /models
+            if "/models" not in url:
+                url += "/models"
+
+            # 拼接 Model (防止 url 中已经包含了 model)
+            if f"/{model}" not in url:
+                url += f"/{model}"
+
+            # 拼接动作
+            if ":generateContent" not in url:
+                url += ":generateContent"
+
+            # 认证：Query 参数 + Header 双重保险
+            if "?" in url:
+                url += f"&key={key}"
+            else:
+                url += f"?key={key}"
             headers["x-goog-api-key"] = key
 
             parts = [{"text": final_prompt}]
             for img in images:
+                # Gemini 官方协议不需要 data:image/png;base64 前缀，只需要纯 base64 字符串
                 parts.append({"inlineData": {"mimeType": "image/png", "data": base64.b64encode(img).decode()}})
 
             payload = {
                 "contents": [{"parts": parts}],
-                "generationConfig": {"maxOutputTokens": 2048},
+                "generationConfig": {"maxOutputTokens": 4096},
                 "safetySettings": [{"category": c, "threshold": "BLOCK_NONE"} for c in
                                    ["HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH",
                                     "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT"]]
@@ -116,7 +142,15 @@ class ApiManager:
                 u_content = [{"type": "text", "text": final_prompt}]
                 for img in images:
                     b64 = base64.b64encode(img).decode()
-                    u_content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}})
+                    # OpenAI 格式通常需要 data URL scheme
+                    # 增加 detail: high
+                    u_content.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{b64}",
+                            "detail": "high"
+                        }
+                    })
                 msgs.append({"role": "user", "content": u_content})
             else:
                 msgs.append({"role": "user", "content": final_prompt})
@@ -125,20 +159,35 @@ class ApiManager:
 
         # 4. 发送请求
         try:
-            timeout = aiohttp.ClientTimeout(total=self.config.get("timeout", 120))
+            timeout_val = self.config.get("timeout", 120)
+            timeout = aiohttp.ClientTimeout(total=timeout_val)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(url, json=payload, headers=headers, proxy=proxy) as resp:
-                    if resp.status != 200:
-                        return f"HTTP {resp.status}: {await resp.text()}"
+                    resp_text = await resp.text()
 
-                    res_data = await resp.json()
+                    if resp.status != 200:
+                        try:
+                            err_json = json.loads(resp_text)
+                            if "error" in err_json:
+                                err_msg = json.dumps(err_json['error'], ensure_ascii=False)
+                                return f"API Error {resp.status}: {err_msg}"
+                        except:
+                            pass
+                        if "<html" in resp_text.lower():
+                            return f"HTTP {resp.status}: 服务端返回了网页而非数据，请检查URL配置。"
+                        return f"HTTP {resp.status}: {resp_text[:200]}"
+
+                    try:
+                        res_data = json.loads(resp_text)
+                    except json.JSONDecodeError:
+                        return f"数据解析失败: 返回内容不是 JSON. 内容: {resp_text[:100]}..."
 
                     if "error" in res_data:
                         return json.dumps(res_data["error"], ensure_ascii=False)
 
                     img_url = self.extract_image_url(res_data)
                     if not img_url:
-                        return f"未找到图片数据: {str(res_data)[:100]}..."
+                        return f"API返回成功但未找到图片数据: {str(res_data)[:100]}..."
 
                     # 如果是 Base64 直接返回 Bytes
                     if img_url.startswith("data:"):

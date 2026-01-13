@@ -21,7 +21,7 @@ from .utils import norm_id, extract_image_urls_from_text
     "astrbot_plugin_shoubanhua",
     "shskjw",
     "支持第三方所有OpenAI绘图格式和原生Google Gemini 终极缝合怪，文生图/图生图插件",
-    "1.8.0",
+    "1.8.3",
     "https://github.com/shkjw/astrbot_plugin_shoubanhua",
 )
 class FigurineProPlugin(Star):
@@ -37,10 +37,16 @@ class FigurineProPlugin(Star):
         await self.data_mgr.initialize()
         if not self.conf.get("generic_api_keys") and not self.conf.get("gemini_api_keys"):
             logger.warning("FigurinePro: 未配置任何 API Key")
-        logger.info("FigurinePro 插件已加载 (极速异步反馈版)")
+        logger.info("FigurinePro 插件已加载 (异步任务+即时反馈版 v1.8.3)")
 
     def is_admin(self, event: AstrMessageEvent) -> bool:
         return event.get_sender_id() in self.context.get_config().get("admins_id", [])
+
+    def _get_bot_id(self, event: AstrMessageEvent) -> str:
+        """获取机器人自身的 QQ/ID，用于过滤"""
+        if hasattr(event, "robot") and event.robot:
+            return str(event.robot.id)
+        return str(self.context.get_self_id()) if hasattr(self.context, "get_self_id") else ""
 
     def _save_config(self):
         try:
@@ -50,7 +56,6 @@ class FigurineProPlugin(Star):
             logger.warning(f"FigurinePro Config Save Failed: {e}")
 
     def _process_prompt_and_preset(self, prompt: str) -> Tuple[str, str]:
-        """处理提示词，返回 (最终提示词, 预设名称)"""
         sorted_keys = sorted(self.data_mgr.prompt_map.keys(), key=len, reverse=True)
         for key in sorted_keys:
             if key in prompt:
@@ -65,25 +70,84 @@ class FigurineProPlugin(Star):
         else:
             return str(self.data_mgr.get_user_count(uid))
 
-    def _send_instant_feedback(self, event: AstrMessageEvent, msg: str):
-        """
-        【核心优化】极速反馈通道
-        使用 create_task + sleep(0) 强制调度
-        确保在进入耗时逻辑（如图片下载、API请求）之前，消息就已经发出去了
-        """
-        async def _do_send():
-            try:
-                # 关键点：强制让出控制权，让 Event Loop 优先处理这个发送任务
-                await asyncio.sleep(0)
-                # 兼容性处理：构建消息链
-                chain = event.chain_result([Plain(msg)])
-                await event.send(chain)
-                logger.info(f"[FigurinePro] 极速反馈已触发: {msg}")
-            except Exception as e:
-                logger.warning(f"[FigurinePro] 反馈发送失败: {e}")
+    async def _check_quota(self, event, uid, gid, cost) -> dict:
+        res = {"allowed": False, "source": None, "msg": ""}
+        if self.is_admin(event) or uid in (self.conf.get("user_whitelist") or []):
+            res["allowed"] = True;
+            res["source"] = "free";
+            return res
+        if gid and gid in (self.conf.get("group_whitelist") or []):
+            res["allowed"] = True;
+            res["source"] = "free";
+            return res
+        if uid in (self.conf.get("user_blacklist") or []): return res
+        if gid and gid in (self.conf.get("group_blacklist") or []): return res
 
-        # 甩出去执行，不阻塞主线程
-        asyncio.create_task(_do_send())
+        enable_u = self.conf.get("enable_user_limit", True)
+        enable_g = self.conf.get("enable_group_limit", False)
+        if not enable_u and not enable_g:
+            res["allowed"] = True;
+            res["source"] = "free";
+            return res
+
+        u_bal = self.data_mgr.get_user_count(uid)
+        if enable_u and u_bal >= cost:
+            res["allowed"] = True;
+            res["source"] = "user";
+            return res
+        if gid and enable_g:
+            g_bal = self.data_mgr.get_group_count(gid)
+            if g_bal >= cost:
+                res["allowed"] = True;
+                res["source"] = "group";
+                return res
+
+        res["msg"] = f"❌ 次数不足 (需{cost}次)。用户剩余:{u_bal}"
+        return res
+
+    # ================= 核心：后台生成逻辑封装 =================
+
+    async def _run_background_task(self, event: AstrMessageEvent, images: List[bytes],
+                                   prompt: str, preset_name: str, deduction: dict, uid: str, gid: str, cost: int):
+        """
+        后台执行生成任务，并在完成后主动发送消息。
+        """
+        try:
+            # 1. 扣费
+            if deduction["source"] == "user":
+                await self.data_mgr.decrease_user_count(uid, cost)
+            elif deduction["source"] == "group":
+                await self.data_mgr.decrease_group_count(gid, cost)
+
+            # 2. 调用 API
+            model = self.conf.get("model", "nano-banana")
+            start_time = datetime.now()
+
+            # 此处不发“开始绘制”消息了，因为前面已经发了“收到请求”
+
+            res = await self.api_mgr.call_api(images, prompt, model, False, self.img_mgr.proxy)
+
+            # 3. 处理结果
+            if isinstance(res, bytes):
+                elapsed = (datetime.now() - start_time).total_seconds()
+                await self.data_mgr.record_usage(uid, gid)
+
+                quota_str = self._get_quota_str(deduction, uid)
+                # 构建成功文案
+                info_text = f"\n✅ 生成成功 ({elapsed:.2f}s) | 预设: {preset_name} | 剩余: {quota_str}"
+                if self.conf.get("show_model_info", False):
+                    info_text += f" | {model}"
+
+                # 4. 主动发送结果 (这是关键，LLM工具流里全靠这个发图)
+                chain = event.chain_result([Image.fromBytes(res), Plain(info_text)])
+                await event.send(chain)
+            else:
+                # 失败反馈
+                await event.send(event.chain_result([Plain(f"❌ 生成失败: {res}")]))
+
+        except Exception as e:
+            logger.error(f"Background task error: {e}")
+            await event.send(event.chain_result([Plain(f"❌ 系统错误: {e}")]))
 
     # ================= LLM 工具调用 (Tool Calling) =================
 
@@ -93,48 +157,27 @@ class FigurineProPlugin(Star):
         Args:
             prompt(string): 图片生成的提示词。
         '''
-        # 1. 立即计算预设并发送反馈 (0延迟)
-        _, preset_name = self._process_prompt_and_preset(prompt)
-        self._send_instant_feedback(event, f"🎨 收到文生图请求，正在生成 [{preset_name}]...")
+        # 1. 计算预设
+        final_prompt, preset_name = self._process_prompt_and_preset(prompt)
 
-        # 2. 检查配额
+        # 2. 【核心修改】立即发送反馈，不等待任何处理
+        await event.send(event.chain_result([Plain(f"🎨 收到文生图请求，正在生成 [{preset_name}]，请稍候...")]))
+
+        # 3. 检查配额
         uid = norm_id(event.get_sender_id())
         gid = norm_id(event.get_group_id())
         cost = 1
-
         deduction = await self._check_quota(event, uid, gid, cost)
         if not deduction["allowed"]:
             return deduction["msg"]
 
-        # 3. 预处理 Prompt
-        final_prompt, preset_name = self._process_prompt_and_preset(prompt)
+        # 4. 启动后台任务 (Fire-and-forget)
+        asyncio.create_task(
+            self._run_background_task(event, [], final_prompt, preset_name, deduction, uid, gid, cost)
+        )
 
-        # 4. 扣除配额
-        if deduction["source"] == "user":
-            await self.data_mgr.decrease_user_count(uid, cost)
-        elif deduction["source"] == "group":
-            await self.data_mgr.decrease_group_count(gid, cost)
-
-        # 5. 调用 API
-        model = self.conf.get("model", "nano-banana")
-        start_time = datetime.now()
-
-        res = await self.api_mgr.call_api([], final_prompt, model, False, self.img_mgr.proxy)
-
-        # 6. 处理结果
-        if isinstance(res, bytes):
-            elapsed = (datetime.now() - start_time).total_seconds()
-            await self.data_mgr.record_usage(uid, gid)
-
-            quota_str = self._get_quota_str(deduction, uid)
-            info = f"\n✅ 生成成功 ({elapsed:.2f}s) | 预设: {preset_name} | 剩余: {quota_str}"
-            if self.conf.get("show_model_info", False):
-                info += f" | {model}"
-
-            await event.send(event.chain_result([Image.fromBytes(res), Plain(info)]))
-            return f"生成成功。耗时: {elapsed:.2f}s"
-        else:
-            return f"❌ 图片生成失败: {res}"
+        # 5. 立刻返回给 LLM，结束对话轮次，避免超时
+        return f"任务已受理，预设：{preset_name}。图片生成中，完成后将自动发送。"
 
     @filter.llm_tool(name="shoubanhua_edit_image")
     async def image_edit_tool(self, event: AstrMessageEvent, prompt: str, use_message_images: bool = True,
@@ -145,60 +188,41 @@ class FigurineProPlugin(Star):
             use_message_images(boolean): 默认 true
             task_types(string): 任务类型
         '''
-        # 1. 立即计算预设并发送反馈 (0延迟)
-        # 这一步现在是完全非阻塞的，工具被调用的瞬间用户就会看到消息
-        _, preset_name = self._process_prompt_and_preset(prompt)
-        self._send_instant_feedback(event, f"🎨 收到图生图请求，正在提取图片并生成 [{preset_name}]...")
+        # 1. 计算预设
+        processed_prompt, preset_name = self._process_prompt_and_preset(prompt)
+        final_prompt = f"(Task Type: {task_types}) {processed_prompt}"
 
-        # 2. 检查配额
+        # 2. 【核心修改】立即发送反馈
+        await event.send(
+            event.chain_result([Plain(f"🎨 收到图生图请求，正在提取图片并生成 [{preset_name}]，请耐心等待...")]))
+
+        # 3. 提取图片 (耗时操作，但此时已发反馈，用户不会觉得卡死)
+        images = []
+        if use_message_images:
+            bot_id = self._get_bot_id(event)
+            images = await self.img_mgr.extract_images_from_event(event, ignore_id=bot_id)
+
+        if not images:
+            # 如果没图，再发一条提示
+            await event.send(event.chain_result([Plain("❌ 未检测到图片，请发送或引用图片。")]))
+            return "失败：未检测到图片。"
+
+        # 4. 检查配额
         uid = norm_id(event.get_sender_id())
         gid = norm_id(event.get_group_id())
         cost = 1
-
         deduction = await self._check_quota(event, uid, gid, cost)
         if not deduction["allowed"]:
             return deduction["msg"]
 
-        # 3. 开始提取图片 (耗时步骤，放在反馈之后)
-        images = []
-        if use_message_images:
-            images = await self.img_mgr.extract_images_from_event(event)
+        # 5. 启动后台任务
+        asyncio.create_task(
+            self._run_background_task(event, images, final_prompt, preset_name, deduction, uid, gid, cost)
+        )
 
-        if not images:
-            return "❌ 调用失败：未检测到图片。请确保您发送或引用了一张图片。"
+        return f"任务已受理，预设：{preset_name}。图片生成中，完成后将自动发送。"
 
-        # 4. 预处理 Prompt
-        processed_prompt, preset_name = self._process_prompt_and_preset(prompt)
-        final_prompt = f"(Task Type: {task_types}) {processed_prompt}"
-
-        # 5. 扣除配额
-        if deduction["source"] == "user":
-            await self.data_mgr.decrease_user_count(uid, cost)
-        elif deduction["source"] == "group":
-            await self.data_mgr.decrease_group_count(gid, cost)
-
-        # 6. 调用 API
-        model = self.conf.get("model", "nano-banana")
-        start_time = datetime.now()
-
-        res = await self.api_mgr.call_api(images, final_prompt, model, False, self.img_mgr.proxy)
-
-        # 7. 处理结果
-        if isinstance(res, bytes):
-            elapsed = (datetime.now() - start_time).total_seconds()
-            await self.data_mgr.record_usage(uid, gid)
-
-            quota_str = self._get_quota_str(deduction, uid)
-            info = f"\n✅ 生成成功 ({elapsed:.2f}s) | 预设: {preset_name} | 剩余: {quota_str}"
-            if self.conf.get("show_model_info", False):
-                info += f" | {model}"
-
-            await event.send(event.chain_result([Image.fromBytes(res), Plain(info)]))
-            return f"编辑完成。耗时: {elapsed:.2f}s"
-        else:
-            return f"❌ 图片生成失败: {res}"
-
-    # ================= 核心功能: 传统指令触发 =================
+    # ================= 传统指令触发 =================
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=5)
     async def on_figurine_request(self, event: AstrMessageEvent, ctx=None):
@@ -255,11 +279,13 @@ class FigurineProPlugin(Star):
             yield event.chain_result([Plain(deduction["msg"])])
             return
 
-        # 极速反馈
+        # 指令模式：立刻反馈
         mode_str = "增强" if is_power else ""
-        self._send_instant_feedback(event, f"🎨 收到{mode_str}请求，正在生成 [{preset_name}]...")
+        yield event.chain_result([Plain(f"🎨 收到{mode_str}请求，正在生成 [{preset_name}]...")])
 
-        images = await self.img_mgr.extract_images_from_event(event)
+        bot_id = self._get_bot_id(event)
+        images = await self.img_mgr.extract_images_from_event(event, ignore_id=bot_id)
+
         if not is_bnn and user_prompt:
             urls = extract_image_urls_from_text(user_prompt)
             for u in urls:
@@ -302,97 +328,40 @@ class FigurineProPlugin(Star):
     async def on_txt2img(self, event: AstrMessageEvent, ctx=None):
         raw = event.message_str.strip()
         cmd_name = "文生图"
-        power_kw = (self.conf.get("power_model_keyword") or "").lower()
-        is_power = False
-
         prompt = raw.replace(cmd_name, "").strip()
-        if power_kw and prompt.lower().startswith(power_kw):
-            is_power = True
-            prompt = prompt[len(power_kw):].strip()
-
-        if not prompt:
-            yield event.chain_result([Plain("请输入描述。")])
-            return
+        if not prompt: yield event.chain_result([Plain("请输入描述。")]); return
 
         uid = norm_id(event.get_sender_id())
-        gid = norm_id(event.get_group_id())
-        cost = self.conf.get("power_model_extra_cost", 1) + 1 if is_power else 1
-
-        deduction = await self._check_quota(event, uid, gid, cost)
-        if not deduction["allowed"]:
-            yield event.chain_result([Plain(deduction["msg"])])
-            return
+        deduction = await self._check_quota(event, uid, event.get_group_id(), 1)
+        if not deduction["allowed"]: yield event.chain_result([Plain(deduction["msg"])]); return
 
         final_prompt, preset_name = self._process_prompt_and_preset(prompt)
-
-        # 极速反馈
-        self._send_instant_feedback(event, f"🎨 收到请求，正在生成 [{preset_name}]...")
+        yield event.chain_result([Plain(f"🎨 收到请求，正在生成 [{preset_name}]...")])
 
         if deduction["source"] == "user":
-            await self.data_mgr.decrease_user_count(uid, cost)
+            await self.data_mgr.decrease_user_count(uid, 1)
         elif deduction["source"] == "group":
-            await self.data_mgr.decrease_group_count(gid, cost)
+            await self.data_mgr.decrease_group_count(event.get_group_id(), 1)
 
-        model = self.conf.get("power_model_id") if is_power else self.conf.get("model", "nano-banana")
-        start_time = datetime.now()
-        res = await self.api_mgr.call_api([], final_prompt, model, is_power, self.img_mgr.proxy)
+        model = self.conf.get("model", "nano-banana")
+        start = datetime.now()
+        res = await self.api_mgr.call_api([], final_prompt, model, False, self.img_mgr.proxy)
 
         if isinstance(res, bytes):
-            elapsed = (datetime.now() - start_time).total_seconds()
-            await self.data_mgr.record_usage(uid, gid)
-
+            elapsed = (datetime.now() - start).total_seconds()
             quota_str = self._get_quota_str(deduction, uid)
             info = f"\n✅ 生成成功 ({elapsed:.2f}s) | 预设: {preset_name} | 剩余: {quota_str}"
-
             yield event.chain_result([Image.fromBytes(res), Plain(info)])
         else:
             yield event.chain_result([Plain(f"❌ {res}")])
 
-    # ================= 辅助方法 =================
-
-    async def _check_quota(self, event, uid, gid, cost) -> dict:
-        res = {"allowed": False, "source": None, "msg": ""}
-        if self.is_admin(event) or uid in (self.conf.get("user_whitelist") or []):
-            res["allowed"] = True;
-            res["source"] = "free";
-            return res
-        if gid and gid in (self.conf.get("group_whitelist") or []):
-            res["allowed"] = True;
-            res["source"] = "free";
-            return res
-
-        if uid in (self.conf.get("user_blacklist") or []): return res
-        if gid and gid in (self.conf.get("group_blacklist") or []): return res
-
-        enable_u = self.conf.get("enable_user_limit", True)
-        enable_g = self.conf.get("enable_group_limit", False)
-        if not enable_u and not enable_g:
-            res["allowed"] = True;
-            res["source"] = "free";
-            return res
-
-        u_bal = self.data_mgr.get_user_count(uid)
-        if enable_u and u_bal >= cost:
-            res["allowed"] = True;
-            res["source"] = "user";
-            return res
-        if gid and enable_g:
-            g_bal = self.data_mgr.get_group_count(gid)
-            if g_bal >= cost:
-                res["allowed"] = True;
-                res["source"] = "group";
-                return res
-
-        res["msg"] = f"❌ 次数不足 (需{cost}次)。用户剩余:{u_bal}"
-        return res
-
+    # 辅助方法
     def _get_help_node(self, event):
         txt = self.conf.get("help_text", "帮助文档未配置")
-        bot_id = "2854196310"
-        if hasattr(event, "robot") and event.robot: bot_id = str(event.robot.id)
+        bot_id = self._get_bot_id(event) or "2854196310"
         return event.chain_result([Nodes(nodes=[Node(name="手办化助手", uin=bot_id, content=[Plain(txt)])])])
 
-    # ================= 完整管理指令 (Admin Commands) =================
+    # 省略 Admin指令，它们和上一版完全一致，请确保不要覆盖掉下面的代码（lm列表, lm添加, 增加次数等）
 
     @filter.command("lm列表", aliases={"lmlist"}, prefix_optional=True)
     async def on_preset_list(self, event: AstrMessageEvent, ctx=None):

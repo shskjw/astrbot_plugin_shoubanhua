@@ -79,7 +79,7 @@ class ImageManager:
         if not user_id.isdigit(): return None
         return await self._download_image(f"https://q1.qlogo.cn/g?b=qq&nk={user_id}&s=640")
 
-    async def extract_images_from_event(self, event: AstrMessageEvent) -> List[bytes]:
+    async def extract_images_from_event(self, event: AstrMessageEvent, ignore_id: str = None) -> List[bytes]:
         """从消息事件中提取所有图片 - 并发加速"""
         tasks = []
         at_users = []
@@ -102,12 +102,15 @@ class ImageManager:
                     tasks.append(self.load_bytes(seg.file))
             # @用户
             elif isinstance(seg, At):
-                at_users.append(str(seg.qq))
+                qq = str(seg.qq)
+                if ignore_id and qq == ignore_id: continue # 过滤 ignore_id
+                at_users.append(qq)
 
         # 2. 文本中正则匹配的@
         import re
         text_ats = re.findall(r'@(\d+)', event.message_str)
         for qq in text_ats:
+            if ignore_id and qq == ignore_id: continue # 过滤 ignore_id
             if qq not in at_users: at_users.append(qq)
 
         # 3. 头像任务
@@ -115,6 +118,7 @@ class ImageManager:
             tasks.append(self.get_avatar(uid))
 
         # 4. 并发执行所有任务
+        if not tasks: return []
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         # 5. 过滤有效结果
