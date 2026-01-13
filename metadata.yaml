@@ -1,6 +1,6 @@
 name: astrbot_plugin_shoubanhua
 desc: 支持第三方所有OpenAI绘图格式和原生Google Gemini 终极缝合怪，文生图/图生图插件
 help:  # 插件的帮助信息
-version: v1.7.6 # 插件版本号。格式：v1.1.1 或者 v1.1
+version: v1.8.0 # 插件版本号。格式：v1.1.1 或者 v1.1
 author: shskjw
 repo: https://github.com/shskjw/astrbot_plugin_shoubanhua

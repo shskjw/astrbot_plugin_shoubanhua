@@ -1,16 +1,14 @@
-# 支持gemini官方api
-征求api请求格式 请提ls  看到了可以考虑融合在一起
-# docker部署输出lm列表的时候全是符号 解决办法 请运行 
-apt update 
-
-apt install -y fonts-dejavu fonts-noto fonts-freefont-ttf
-
-手动部署请什root权限运行（针对linux）
-# 通过第三方柏拉图api调用 Banana的api使用
+# 推荐第三方模型中转站柏拉图
 注册地址 [柏拉图1]( https://api.bltcy.ai/register?aff=dcc39044557)
-# 原先bnn涨价原因
-因为nano-banana涨价到0.08一次毫无性价比，上了自定义模型建议全部换成gemini-2.5-flash-image-preview、gemini-2.5-flash-image。
-测试下来效果是一样的
+# 重构功能
+新增llm函数工具 效果请看图
+**示例:** `llm智能判断`
+
+| <img src="./images/1.png" width="400"> |
+|:----------------------------------------:|
+
+| <img src="./images/2.png" width="400"> |
+|:--------------------------------------:|
 ## 功能特性
 - **多风格转换**：内置十几种指令，如 `#手办化`、`#Q版化`、`#痛车化`、`#鬼图` 等，满足不同场景需求。
 - **自定义生成**：使用 `#bnn <提示词>` 指令，可以完全自定义 Prompt 进行创作。
