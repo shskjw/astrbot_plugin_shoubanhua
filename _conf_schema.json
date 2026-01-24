@@ -304,6 +304,12 @@
         "min": 1,
         "max": 10086
     },
+    "enable_llm_tool": {
+        "description": "【LLM】启用LLM智能判断工具",
+        "type": "bool",
+        "hint": "开启后，LLM可以通过智能判断自动调用手办化插件生成图片。关闭此项可避免与其他LLM插件产生冲突。",
+        "default": true
+    },
     "prompt_list": {
         "description": "提示词预设列表",
         "hint": "格式: 触发词:提示词。建议使用指令 #lm添加 管理。",
