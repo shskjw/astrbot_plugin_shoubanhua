@@ -10,6 +10,7 @@ from astrbot.core import AstrBotConfig
 from astrbot.core.message.components import Image, Plain, Node, Nodes, At
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
 
+
 # 导入模块
 from .data_manager import DataManager
 from .image_manager import ImageManager
@@ -21,7 +22,7 @@ from .utils import norm_id, extract_image_urls_from_text
     "astrbot_plugin_shoubanhua",
     "shskjw",
     "支持第三方所有OpenAI绘图格式和原生Google Gemini 终极缝合怪，文生图/图生图插件",
-    "1.8.1",
+    "1.8.2",
     "https://github.com/shkjw/astrbot_plugin_shoubanhua",
 )
 class FigurineProPlugin(Star):
@@ -72,17 +73,46 @@ class FigurineProPlugin(Star):
 
     async def _check_quota(self, event, uid, gid, cost) -> dict:
         res = {"allowed": False, "source": None, "msg": ""}
-        if self.is_admin(event) or uid in (self.conf.get("user_whitelist") or []):
-            res["allowed"] = True;
-            res["source"] = "free";
+        
+        # 1. 检查用户是否被黑名单
+        if uid in (self.conf.get("user_blacklist") or []):
+            res["msg"] = "❌ 您已被禁用此功能"
             return res
-        if gid and gid in (self.conf.get("group_whitelist") or []):
-            res["allowed"] = True;
-            res["source"] = "free";
+        if gid and gid in (self.conf.get("group_blacklist") or []):
+            res["msg"] = "❌ 该群组已被禁用此功能"
             return res
-        if uid in (self.conf.get("user_blacklist") or []): return res
-        if gid and gid in (self.conf.get("group_blacklist") or []): return res
+        
+        # 2. 管理员始终允许
+        if self.is_admin(event):
+            res["allowed"] = True
+            res["source"] = "free"
+            return res
+        
+        # 3. 检查用户白名单（如果配置了白名单，则只有白名单用户允许）
+        user_whitelist = self.conf.get("user_whitelist") or []
+        if user_whitelist and uid not in user_whitelist:
+            res["msg"] = "❌ 您不在白名单中，无权使用此功能"
+            return res
+        
+        # 4. 如果在用户白名单中，允许使用
+        if user_whitelist and uid in user_whitelist:
+            res["allowed"] = True
+            res["source"] = "free"
+            return res
+        
+        # 5. 检查群聊白名单（如果配置了群白名单，则只有白名单群允许）
+        group_whitelist = self.conf.get("group_whitelist") or []
+        if group_whitelist and gid and gid not in group_whitelist:
+            res["msg"] = "❌ 该群组不在白名单中，无权使用此功能"
+            return res
+        
+        # 6. 如果在群聊白名单中，允许使用
+        if group_whitelist and gid and gid in group_whitelist:
+            res["allowed"] = True
+            res["source"] = "free"
+            return res
 
+        # 7. 检查次数限制
         enable_u = self.conf.get("enable_user_limit", True)
         enable_g = self.conf.get("enable_group_limit", False)
         if not enable_u and not enable_g:
