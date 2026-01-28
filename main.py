@@ -10,7 +10,6 @@ from astrbot.core import AstrBotConfig
 from astrbot.core.message.components import Image, Plain, Node, Nodes, At
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
 
-
 # 导入模块
 from .data_manager import DataManager
 from .image_manager import ImageManager
@@ -22,7 +21,7 @@ from .utils import norm_id, extract_image_urls_from_text
     "astrbot_plugin_shoubanhua",
     "shskjw",
     "支持第三方所有OpenAI绘图格式和原生Google Gemini 终极缝合怪，文生图/图生图插件",
-    "1.8.2",
+    "1.8.3",
     "https://github.com/shkjw/astrbot_plugin_shoubanhua",
 )
 class FigurineProPlugin(Star):
@@ -46,36 +45,34 @@ class FigurineProPlugin(Star):
     def _get_bot_id(self, event: AstrMessageEvent) -> str:
         """获取机器人自身的 QQ/ID，用于过滤"""
         bot_id = None
-        
-        # 方法1: 从 event.robot 获取
-        if hasattr(event, "robot") and event.robot:
-            if hasattr(event.robot, "id"):
-                bot_id = str(event.robot.id)
-            elif hasattr(event.robot, "user_id"):
-                bot_id = str(event.robot.user_id)
-        
-        # 方法2: 从 event 的 self_id 获取
-        if not bot_id and hasattr(event, "self_id") and event.self_id:
-            bot_id = str(event.self_id)
-        
-        # 方法3: 从 context 获取
-        if not bot_id and hasattr(self.context, "get_self_id"):
+
+        # 1. 最优先：从 event.self_id 获取 (AstrBot 标准属性)
+        if hasattr(event, "self_id") and event.self_id:
+            return str(event.self_id)
+
+        # 2. 其次：从 context 获取
+        if hasattr(self.context, "get_self_id"):
             try:
                 sid = self.context.get_self_id()
-                if sid:
-                    bot_id = str(sid)
+                if sid: return str(sid)
             except:
                 pass
-        
-        # 方法4: 从 event.get_self_id() 获取
-        if not bot_id and hasattr(event, "get_self_id"):
+
+        # 3. 再次：从 event.robot 获取 (旧版适配)
+        if hasattr(event, "robot") and event.robot:
+            if hasattr(event.robot, "id") and event.robot.id:
+                return str(event.robot.id)
+            elif hasattr(event.robot, "user_id") and event.robot.user_id:
+                return str(event.robot.user_id)
+
+        # 4. 最后尝试
+        if hasattr(event, "get_self_id"):
             try:
                 sid = event.get_self_id()
-                if sid:
-                    bot_id = str(sid)
+                if sid: return str(sid)
             except:
                 pass
-        
+
         logger.debug(f"FigurinePro: Bot ID resolved as: {bot_id}")
         return bot_id or ""
 
@@ -103,7 +100,7 @@ class FigurineProPlugin(Star):
 
     async def _check_quota(self, event, uid, gid, cost) -> dict:
         res = {"allowed": False, "source": None, "msg": ""}
-        
+
         # 1. 检查用户是否被黑名单
         if uid in (self.conf.get("user_blacklist") or []):
             res["msg"] = "❌ 您已被禁用此功能"
@@ -111,31 +108,31 @@ class FigurineProPlugin(Star):
         if gid and gid in (self.conf.get("group_blacklist") or []):
             res["msg"] = "❌ 该群组已被禁用此功能"
             return res
-        
+
         # 2. 管理员始终允许
         if self.is_admin(event):
             res["allowed"] = True
             res["source"] = "free"
             return res
-        
+
         # 3. 检查用户白名单（如果配置了白名单，则只有白名单用户允许）
         user_whitelist = self.conf.get("user_whitelist") or []
         if user_whitelist and uid not in user_whitelist:
             res["msg"] = "❌ 您不在白名单中，无权使用此功能"
             return res
-        
+
         # 4. 如果在用户白名单中，允许使用
         if user_whitelist and uid in user_whitelist:
             res["allowed"] = True
             res["source"] = "free"
             return res
-        
+
         # 5. 检查群聊白名单（如果配置了群白名单，则只有白名单群允许）
         group_whitelist = self.conf.get("group_whitelist") or []
         if group_whitelist and gid and gid not in group_whitelist:
             res["msg"] = "❌ 该群组不在白名单中，无权使用此功能"
             return res
-        
+
         # 6. 如果在群聊白名单中，允许使用
         if group_whitelist and gid and gid in group_whitelist:
             res["allowed"] = True
@@ -220,7 +217,7 @@ class FigurineProPlugin(Star):
         # 0. 检查 LLM 工具开关
         if not self.conf.get("enable_llm_tool", True):
             return "❌ LLM 工具已禁用，请使用指令模式调用此功能。"
-        
+
         # 1. 计算预设
         final_prompt, preset_name = self._process_prompt_and_preset(prompt)
 
@@ -255,7 +252,7 @@ class FigurineProPlugin(Star):
         # 0. 检查 LLM 工具开关
         if not self.conf.get("enable_llm_tool", True):
             return "❌ LLM 工具已禁用，请使用指令模式调用此功能。"
-        
+
         # 1. 计算预设
         processed_prompt, preset_name = self._process_prompt_and_preset(prompt)
         final_prompt = f"(Task Type: {task_types}) {processed_prompt}"
@@ -352,6 +349,7 @@ class FigurineProPlugin(Star):
         yield event.chain_result([Plain(f"🎨 收到{mode_str}请求，正在生成 [{preset_name}]...")])
 
         bot_id = self._get_bot_id(event)
+        # 传递 bot_id 给 image manager 以过滤
         images = await self.img_mgr.extract_images_from_event(event, ignore_id=bot_id)
 
         if not is_bnn and user_prompt:

@@ -3,6 +3,7 @@ import asyncio
 import aiohttp
 import base64
 import ssl
+import re
 from typing import List, Tuple
 from pathlib import Path
 from PIL import Image as PILImage, ImageFont, ImageDraw
@@ -82,17 +83,15 @@ class ImageManager:
     async def extract_images_from_event(self, event: AstrMessageEvent, ignore_id: str = None) -> List[bytes]:
         """从消息事件中提取所有图片 - 并发加速"""
         tasks = []
-        at_users = []
-        
-        # 规范化 ignore_id，确保是字符串且去除空白
+        at_users = set()  # 使用集合去重
+
+        # 1. 规范化 ignore_id，确保是字符串且去除空白
         if ignore_id:
             ignore_id = str(ignore_id).strip()
-            if not ignore_id:
-                ignore_id = None
-        
+
         logger.debug(f"extract_images_from_event: ignore_id={ignore_id}")
 
-        # 1. 收集所有待下载/读取的任务
+        # 2. 收集所有待下载/读取的任务
         for seg in event.message_obj.message:
             # 回复链
             if isinstance(seg, Reply) and seg.chain:
@@ -113,32 +112,30 @@ class ImageManager:
                 qq = str(seg.qq).strip()
                 # 过滤机器人自身的 ID
                 if ignore_id and qq == ignore_id:
-                    logger.debug(f"Skipping bot avatar (At segment): {qq}")
                     continue
-                at_users.append(qq)
+                at_users.add(qq)
 
-        # 2. 文本中正则匹配的@
-        import re
+        # 3. 文本中正则匹配的@
+        # 有些平台 At 可能表现为纯文本
         text_ats = re.findall(r'@(\d+)', event.message_str)
         for qq in text_ats:
-            qq = qq.strip()
+            qq = str(qq).strip()
             # 过滤机器人自身的 ID
             if ignore_id and qq == ignore_id:
-                logger.debug(f"Skipping bot avatar (text @): {qq}")
                 continue
-            if qq not in at_users:
-                at_users.append(qq)
+            at_users.add(qq)
 
-        # 3. 头像任务
-        logger.debug(f"At users to fetch avatars: {at_users}")
-        for uid in at_users:
-            tasks.append(self.get_avatar(uid))
+        # 4. 头像任务 (去重后)
+        if at_users:
+            logger.debug(f"At users to fetch avatars: {at_users}")
+            for uid in at_users:
+                tasks.append(self.get_avatar(uid))
 
-        # 4. 并发执行所有任务
+        # 5. 并发执行所有任务
         if not tasks: return []
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # 5. 过滤有效结果
+        # 6. 过滤有效结果
         img_bytes = []
         for res in results:
             if isinstance(res, bytes):
