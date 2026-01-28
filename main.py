@@ -45,9 +45,39 @@ class FigurineProPlugin(Star):
 
     def _get_bot_id(self, event: AstrMessageEvent) -> str:
         """获取机器人自身的 QQ/ID，用于过滤"""
+        bot_id = None
+        
+        # 方法1: 从 event.robot 获取
         if hasattr(event, "robot") and event.robot:
-            return str(event.robot.id)
-        return str(self.context.get_self_id()) if hasattr(self.context, "get_self_id") else ""
+            if hasattr(event.robot, "id"):
+                bot_id = str(event.robot.id)
+            elif hasattr(event.robot, "user_id"):
+                bot_id = str(event.robot.user_id)
+        
+        # 方法2: 从 event 的 self_id 获取
+        if not bot_id and hasattr(event, "self_id") and event.self_id:
+            bot_id = str(event.self_id)
+        
+        # 方法3: 从 context 获取
+        if not bot_id and hasattr(self.context, "get_self_id"):
+            try:
+                sid = self.context.get_self_id()
+                if sid:
+                    bot_id = str(sid)
+            except:
+                pass
+        
+        # 方法4: 从 event.get_self_id() 获取
+        if not bot_id and hasattr(event, "get_self_id"):
+            try:
+                sid = event.get_self_id()
+                if sid:
+                    bot_id = str(sid)
+            except:
+                pass
+        
+        logger.debug(f"FigurinePro: Bot ID resolved as: {bot_id}")
+        return bot_id or ""
 
     def _save_config(self):
         try:

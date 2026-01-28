@@ -83,6 +83,14 @@ class ImageManager:
         """从消息事件中提取所有图片 - 并发加速"""
         tasks = []
         at_users = []
+        
+        # 规范化 ignore_id，确保是字符串且去除空白
+        if ignore_id:
+            ignore_id = str(ignore_id).strip()
+            if not ignore_id:
+                ignore_id = None
+        
+        logger.debug(f"extract_images_from_event: ignore_id={ignore_id}")
 
         # 1. 收集所有待下载/读取的任务
         for seg in event.message_obj.message:
@@ -102,18 +110,27 @@ class ImageManager:
                     tasks.append(self.load_bytes(seg.file))
             # @用户
             elif isinstance(seg, At):
-                qq = str(seg.qq)
-                if ignore_id and qq == ignore_id: continue # 过滤 ignore_id
+                qq = str(seg.qq).strip()
+                # 过滤机器人自身的 ID
+                if ignore_id and qq == ignore_id:
+                    logger.debug(f"Skipping bot avatar (At segment): {qq}")
+                    continue
                 at_users.append(qq)
 
         # 2. 文本中正则匹配的@
         import re
         text_ats = re.findall(r'@(\d+)', event.message_str)
         for qq in text_ats:
-            if ignore_id and qq == ignore_id: continue # 过滤 ignore_id
-            if qq not in at_users: at_users.append(qq)
+            qq = qq.strip()
+            # 过滤机器人自身的 ID
+            if ignore_id and qq == ignore_id:
+                logger.debug(f"Skipping bot avatar (text @): {qq}")
+                continue
+            if qq not in at_users:
+                at_users.append(qq)
 
         # 3. 头像任务
+        logger.debug(f"At users to fetch avatars: {at_users}")
         for uid in at_users:
             tasks.append(self.get_avatar(uid))
 
