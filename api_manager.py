@@ -224,7 +224,7 @@ class ApiManager:
 
                     img_url = self.extract_image_url(res_data)
                     if not img_url:
-                        # Gemini 特殊错误诊断
+                        # Gemini 特殊错误诊断 (原生 API)
                         if "candidates" in res_data and res_data["candidates"]:
                             cand = res_data["candidates"][0]
                             finish_reason = cand.get("finishReason", "UNKNOWN")
@@ -237,7 +237,25 @@ class ApiManager:
                             content = cand.get("content") or {}
                             if not content.get("parts"):
                                 return f"模型未生成任何内容 (finishReason={finish_reason})。可能是由于Prompt被拒绝响应。"
-                                
+                        
+                        # OpenAI 格式错误诊断 (兼容 API)
+                        if "choices" in res_data and isinstance(res_data["choices"], list) and len(res_data["choices"]) > 0:
+                            choice = res_data["choices"][0]
+                            finish_reason = choice.get("finish_reason", "UNKNOWN")
+                            msg = choice.get("message", {})
+                            content = msg.get("content")
+                            
+                            # 1. content 为 None
+                            if content is None:
+                                refusal = msg.get("refusal")
+                                if refusal:
+                                    return f"生成请求被拒绝: {refusal}"
+                                return f"API 返回内容为空 (content=None)。finish_reason: {finish_reason}。可能是模型拒绝响应或中转转换异常。"
+                            
+                            # 2. content 为空字符串
+                            if isinstance(content, str) and not content.strip():
+                                return f"API 返回内容为空字符串。finish_reason: {finish_reason}。"
+
                         return f"API返回成功但未找到图片数据: {str(res_data)[:200]}..."
 
                     # 如果是 Base64 直接返回 Bytes
