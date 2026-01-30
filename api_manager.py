@@ -77,10 +77,16 @@ class ApiManager:
                             urls = re.findall(r"(https?://[^\s<>\"'()\[\]]+)", func_args)
                             if urls: return urls[0].strip()
 
+                        # 尝试2: 查找 base64
+                        if "base64" in func_args:
+                            b64_match = re.search(r'(data:image\/[a-zA-Z]+;base64,[a-zA-Z0-9+/=]+)', func_args)
+                            if b64_match:
+                                return b64_match.group(1)
+
                         try:
                             args = json.loads(func_args)
                             # 常见的参数名: url, image_url, images, file_url
-                            for k in ["url", "image_url", "file_url", "link"]:
+                            for k in ["url", "image_url", "file_url", "link", "b64_json", "image", "data", "image_data"]:
                                 if k in args: return args[k]
                         except:
                             pass
@@ -117,8 +123,10 @@ class ApiManager:
                 # group(1) 是 url
                 md_match = re.search(r'!\[.*?\]\((.*?)\)', content)
                 if md_match:
-                    url_part = md_match.group(1)
-                    return url_part.strip().strip("'\"")
+                    url_part = md_match.group(1).strip()
+                    # 去除可能存在的 <> 包裹 (e.g. ![img](<url>))
+                    url_part = url_part.lstrip("<").rstrip(">")
+                    return url_part.strip("'\"")
 
                 # 2. 尝试匹配纯 Base64 标记 (data:image/...)
                 # 这种格式比较明显，优先级高
@@ -371,7 +379,14 @@ class ApiManager:
                                     return "❌ 生成被拦截: 触发了安全过滤 (content_filter)。建议修改 Prompt 或重试。"
                                 return f"API 返回内容为空字符串。finish_reason: {finish_reason}。"
 
-                        return f"API返回成功但未找到图片数据: {str(res_data)[:200]}..."
+                        # 尝试提取文本内容作为错误信息提示
+                        diag_msg = "未找到图片数据"
+                        if "choices" in res_data and res_data["choices"]:
+                             c0 = res_data["choices"][0]
+                             if c0.get("message", {}).get("content"):
+                                 diag_msg = f"API返回了文本而非图片: {c0['message']['content'][:200]}"
+                        
+                        return f"API请求成功但{diag_msg}。Raw: {str(res_data)[:200]}..."
 
                     # 如果是 Base64 直接返回 Bytes
                     if img_url.startswith("data:"):
