@@ -235,8 +235,12 @@ class ApiManager:
                             
                             # 2. 正常结束但无内容
                             content = cand.get("content") or {}
-                            if not content.get("parts"):
-                                return f"模型未生成任何内容 (finishReason={finish_reason})。可能是由于Prompt被拒绝响应。"
+                            parts = content.get("parts")
+                            if not parts:
+                                # 尝试打印整个 candidate 以便排查
+                                cand_str = json.dumps(cand, ensure_ascii=False)
+                                logger.warning(f"Gemini API returned empty parts: {cand_str}")
+                                return f"模型响应为空 (finishReason={finish_reason})。请确认使用的模型 ({model}) 是否支持生图，或者 Prompt 是否触发了隐性过滤。\nRaw: {cand_str[:100]}..."
                         
                         # OpenAI 格式错误诊断 (兼容 API)
                         if "choices" in res_data and isinstance(res_data["choices"], list) and len(res_data["choices"]) > 0:
