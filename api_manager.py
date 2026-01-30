@@ -243,7 +243,11 @@ class ApiManager:
                 })
             
             msgs = [{"role": "user", "content": content_list}]
-            payload = {"model": model, "messages": msgs, "stream": False}
+            
+            # [性能优化] 显式设置 max_tokens
+            # 如果不设置，某些中转接口可能会等待或者分配过大的 Tokens 空间，增加延迟
+            pl = {"model": model, "messages": msgs, "stream": False, "max_tokens": 4096}
+            payload.update(pl)
 
             # 针对 Gemini 系模型的 OpenAI 兼容层特殊处理
             # 参考 bananic_ninjutsu: 如果模型名包含 pro/image/banana，显式添加 modalities

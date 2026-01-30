@@ -38,18 +38,29 @@ class ImageManager:
         return None
 
     def _extract_first_frame_sync(self, raw: bytes) -> bytes:
-        """(同步) 提取第一帧并转PNG，CPU密集型任务"""
+        """(同步) 提取第一帧、转PNG并压缩"""
         try:
             with PILImage.open(io.BytesIO(raw)) as img:
                 # 统一转换为 RGBA PNG，解决很多兼容性问题
                 if getattr(img, "is_animated", False):
                     img.seek(0)
                 img_conv = img.convert("RGBA")
+                
+                # [新增] 限制最大边长为 1568 (Gemini/OpenAI Pro Vision 推荐值)
+                # 超过此尺寸只会增加 Tokens 消耗和延迟，对生成质量帮助不大
+                max_side = 1568
+                w, h = img_conv.size
+                if w > max_side or h > max_side:
+                    ratio = min(max_side / w, max_side / h)
+                    new_size = (int(w * ratio), int(h * ratio))
+                    img_conv = img_conv.resize(new_size, PILImage.Resampling.LANCZOS)
+                
                 out = io.BytesIO()
-                img_conv.save(out, format="PNG")
+                # 使用 PNG 压缩优化
+                img_conv.save(out, format="PNG", optimize=True)
                 return out.getvalue()
         except Exception as e:
-            logger.warning(f"Image conversion failed: {e}")
+            logger.warning(f"Image conversion/resize failed: {e}")
             return raw
 
     async def load_bytes(self, src: str) -> bytes | None:
