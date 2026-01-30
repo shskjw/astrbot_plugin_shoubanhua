@@ -243,6 +243,13 @@ class ApiManager:
             if "gemini" in lower_model or "pro" in lower_model or "image" in lower_model:
                  # 无论何种模式，只要模型名看起来像 Gemini，就尝试注入 modalities
                  payload["modalities"] = ["image", "text"]
+                 
+                 # 尝试强制注入 safetySettings (很多中转支持透传此参数)
+                 # 这能有效防止 finish_reason: content_filter
+                 payload["safetySettings"] = [{"category": c, "threshold": "BLOCK_NONE"} for c in
+                                   ["HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH",
+                                    "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT",
+                                    "HARM_CATEGORY_CIVIC_INTEGRITY"]]
         
         # 4. 发送请求
         try:
@@ -267,7 +274,56 @@ class ApiManager:
                     try:
                         res_data = json.loads(resp_text)
                     except json.JSONDecodeError:
-                        return f"数据解析失败: 返回内容不是 JSON. 内容: {resp_text[:100]}..."
+                        # 兼容：处理被强制流式返回的情况 (SSE format)
+                        if "data: " in resp_text:
+                            full_content = ""
+                            tool_calls_buffer = {} # {index: "arguments"}
+                            
+                            lines = resp_text.splitlines()
+                            valid_stream = False
+                            
+                            for line in lines:
+                                line = line.strip()
+                                if line.startswith("data: ") and line != "data: [DONE]":
+                                    try:
+                                        chunk = json.loads(line[6:])
+                                        valid_stream = True
+                                        if "choices" in chunk and chunk["choices"]:
+                                            delta = chunk["choices"][0].get("delta", {})
+                                            
+                                            # 1. 拼接 content
+                                            if "content" in delta and delta["content"]:
+                                                full_content += delta["content"]
+                                            
+                                            # 2. 拼接 tool_calls arguments
+                                            if "tool_calls" in delta and delta["tool_calls"]:
+                                                for tc in delta["tool_calls"]:
+                                                    idx = tc.get("index", 0)
+                                                    if idx not in tool_calls_buffer:
+                                                        tool_calls_buffer[idx] = ""
+                                                    
+                                                    if "function" in tc and "arguments" in tc["function"]:
+                                                        tool_calls_buffer[idx] += tc["function"]["arguments"]
+                                    except:
+                                        pass
+                            
+                            if valid_stream:
+                                # 重构为非流式结构以便后续处理
+                                msg_obj = {"content": full_content, "role": "assistant"}
+                                
+                                # 还原 tool_calls
+                                if tool_calls_buffer:
+                                    msg_obj["tool_calls"] = []
+                                    for idx in sorted(tool_calls_buffer.keys()):
+                                        msg_obj["tool_calls"].append({
+                                            "function": {"arguments": tool_calls_buffer[idx]}
+                                        })
+                                
+                                res_data = {"choices": [{"message": msg_obj, "finish_reason": "stop"}]}
+                            else:
+                                 return f"数据解析失败: 看起来是流式数据但无法解析. 内容: {resp_text[:100]}..."
+                        else:
+                            return f"数据解析失败: 返回内容不是 JSON. 内容: {resp_text[:100]}..."
 
                     if "error" in res_data:
                         return json.dumps(res_data["error"], ensure_ascii=False)
@@ -311,6 +367,8 @@ class ApiManager:
                             
                             # 2. content 为空字符串
                             if isinstance(content, str) and not content.strip():
+                                if finish_reason == "content_filter":
+                                    return "❌ 生成被拦截: 触发了安全过滤 (content_filter)。建议修改 Prompt 或重试。"
                                 return f"API 返回内容为空字符串。finish_reason: {finish_reason}。"
 
                         return f"API返回成功但未找到图片数据: {str(res_data)[:200]}..."

@@ -21,7 +21,7 @@ from .utils import norm_id, extract_image_urls_from_text
     "astrbot_plugin_shoubanhua",
     "shskjw",
     "支持第三方所有OpenAI绘图格式和原生Google Gemini 终极缝合怪，文生图/图生图插件",
-    "1.8.4",
+    "1.8.5",
     "https://github.com/shkjw/astrbot_plugin_shoubanhua",
 )
 class FigurineProPlugin(Star):
@@ -313,7 +313,10 @@ class FigurineProPlugin(Star):
 
         if is_bnn:
             user_prompt = parts[1] if len(parts) > 1 else ""
-            user_prompt, preset_name = self._process_prompt_and_preset(user_prompt)
+            
+            # [修改] bnn 模式下不再自动匹配预设，改为纯自定义模式
+            # user_prompt, preset_name = self._process_prompt_and_preset(user_prompt)
+            preset_name = "自定义"
 
             # 新增：检测强力模式关键词
             if power_kw and power_kw in user_prompt.lower():
@@ -453,20 +456,9 @@ class FigurineProPlugin(Star):
         k, v = msg.split(":", 1)
         k, v = k.strip(), v.strip()
         
-        # 强制转换为 list 并过滤非字符串
-        raw_list = self.conf.get("prompt_list") or []
-        plist = [str(p) for p in raw_list if isinstance(p, str) and not p.startswith(k + ":")]
+        # 使用 DataManager 进行持久化保存
+        await self.data_mgr.add_user_prompt(k, v)
         
-        plist.append(f"{k}:{v}")
-        self.conf["prompt_list"] = plist
-        
-        try:
-            self.conf.save()
-        except Exception as e:
-            logger.error(f"Config save failed: {e}")
-            yield event.chain_result([Plain(f"❌ 保存失败: {e}")]); return
-            
-        self.data_mgr.reload_prompts()
         yield event.chain_result([Plain(f"✅ 已添加预设: {k}")])
 
     @filter.command("lm查看", aliases={"lmv", "lm预览"}, prefix_optional=True)

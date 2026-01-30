@@ -18,6 +18,7 @@ class DataManager:
         self.user_checkin_file = self.data_dir / "user_checkin.json"
         self.daily_stats_file = self.data_dir / "daily_stats.json"
         self.preset_images_file = self.data_dir / "preset_images.json"
+        self.user_prompts_file = self.data_dir / "user_prompts.json" # 新增：用户自定义预设文件
         self.preset_images_dir = self.data_dir / "preset_images"
 
         if not self.preset_images_dir.exists():
@@ -28,12 +29,14 @@ class DataManager:
         self.user_checkin_data: Dict[str, str] = {}
         self.daily_stats: Dict[str, Any] = {}
         self.preset_images: Dict[str, str] = {}
+        self.user_prompts: Dict[str, str] = {} # 新增
         self.prompt_map: Dict[str, str] = {}
 
     async def initialize(self):
         await self._load_json(self.user_counts_file, "user_counts")
         await self._load_json(self.group_counts_file, "group_counts")
         await self._load_json(self.user_checkin_file, "user_checkin_data")
+        await self._load_json(self.user_prompts_file, "user_prompts") # 新增
 
         if not self.daily_stats_file.exists():
             self.daily_stats = {"date": "", "users": {}, "groups": {}}
@@ -82,16 +85,26 @@ class DataManager:
                 elif isinstance(v, str):
                     self.prompt_map[k] = v
 
-        # Prompt List
+        # Prompt List (Config)
         prompt_list = self.config.get("prompt_list", [])
         if isinstance(prompt_list, list):
             for item in prompt_list:
                 if ":" in item:
                     k, v = item.split(":", 1)
                     self.prompt_map[k.strip()] = v.strip()
+        
+        # User Prompts (Persistence) - 优先级最高，覆盖前面的
+        for k, v in self.user_prompts.items():
+            self.prompt_map[k] = v
 
     def get_prompt(self, key: str) -> Optional[str]:
         return self.prompt_map.get(key)
+        
+    async def add_user_prompt(self, key: str, prompt: str):
+        """添加或更新用户预设，并持久化保存"""
+        self.user_prompts[key] = prompt
+        await self._save_json(self.user_prompts_file, self.user_prompts)
+        self.reload_prompts()
 
     # --- 积分相关 ---
     def get_user_count(self, uid: str) -> int:
