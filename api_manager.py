@@ -59,7 +59,13 @@ class ApiManager:
                 if "images" in message and isinstance(message["images"], list) and len(message["images"]) > 0:
                     img = message["images"][0]
                     if isinstance(img, str): return img # 可能是 URL
-                    if isinstance(img, dict) and "url" in img: return img["url"]
+                    if isinstance(img, dict):
+                        if "url" in img: return img["url"]
+                        # 修复: 兼容 {"type": "image_url", "image_url": {"url": "..."}} 结构
+                        if "image_url" in img:
+                             if isinstance(img["image_url"], str): return img["image_url"]
+                             if isinstance(img["image_url"], dict) and "url" in img["image_url"]:
+                                 return img["image_url"]["url"]
 
                 # 优先 2: 检查 tool_calls (Function Calling 格式)
                 if "tool_calls" in message and isinstance(message["tool_calls"], list):
