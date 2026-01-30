@@ -314,6 +314,11 @@ class FigurineProPlugin(Star):
         if is_bnn:
             user_prompt = parts[1] if len(parts) > 1 else ""
             user_prompt, preset_name = self._process_prompt_and_preset(user_prompt)
+
+            # 新增：检测强力模式关键词
+            if power_kw and power_kw in user_prompt.lower():
+                is_power = True
+                user_prompt = user_prompt.replace(power_kw, "", 1).strip()
         else:
             preset_prompt = self.data_mgr.get_prompt(base_cmd)
             if base_cmd == "手办化帮助":
@@ -444,14 +449,25 @@ class FigurineProPlugin(Star):
         if not self.is_admin(event): return
         msg = event.message_str.replace("lm添加", "").replace("lma", "").strip()
         if ":" not in msg: yield event.chain_result([Plain("格式: 词:提示词")]); return
+        
         k, v = msg.split(":", 1)
-        plist = self.conf.get("prompt_list", [])
-        plist = [p for p in plist if not p.startswith(k.strip() + ":")]
-        plist.append(f"{k.strip()}:{v.strip()}")
+        k, v = k.strip(), v.strip()
+        
+        # 强制转换为 list 并过滤非字符串
+        raw_list = self.conf.get("prompt_list") or []
+        plist = [str(p) for p in raw_list if isinstance(p, str) and not p.startswith(k + ":")]
+        
+        plist.append(f"{k}:{v}")
         self.conf["prompt_list"] = plist
-        self._save_config()
+        
+        try:
+            self.conf.save()
+        except Exception as e:
+            logger.error(f"Config save failed: {e}")
+            yield event.chain_result([Plain(f"❌ 保存失败: {e}")]); return
+            
         self.data_mgr.reload_prompts()
-        yield event.chain_result([Plain(f"✅ 已添加预设: {k.strip()}")])
+        yield event.chain_result([Plain(f"✅ 已添加预设: {k}")])
 
     @filter.command("lm查看", aliases={"lmv", "lm预览"}, prefix_optional=True)
     async def on_view_preset(self, event: AstrMessageEvent, ctx=None):

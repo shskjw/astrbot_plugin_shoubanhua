@@ -39,32 +39,69 @@ class ApiManager:
     def extract_image_url(self, data: Dict) -> str | None:
         """解析各种奇怪的 API 返回格式"""
         try:
-            # 1. Generic OpenAI Image
-            if "data" in data and isinstance(data["data"], list):
-                if "b64_json" in data["data"][0]: return f"data:image/png;base64,{data['data'][0]['b64_json']}"
-                if "url" in data["data"][0]: return data["data"][0]["url"]
+            # ================== 1. OpenAI DALL-E Standard ==================
+            # 格式: {"data": [{"url": "..."}, {"b64_json": "..."}]}
+            if "data" in data and isinstance(data["data"], list) and len(data["data"]) > 0:
+                item = data["data"][0]
+                if "b64_json" in item:
+                    return f"data:image/png;base64,{item['b64_json']}"
+                if "url" in item:
+                    return item["url"]
 
-            # 2. Chat Completion content
-            if "choices" in data:
-                content = data["choices"][0]["message"]["content"]
-                # Markdown Image
-                if match := re.search(r'(data:image\/[a-zA-Z]+;base64,[a-zA-Z0-9+/=]+)', content):
-                    return match.group(1)
-                # HTTP URL
-                if match := re.search(r'https?://[^\s<>")\]]+', content):
-                    return match.group(0).rstrip(")>,'\"")
+            # ================== 2. OpenAI Chat Completion ==================
+            # 格式: {"choices": [{"message": {"content": "..."}}]}
+            content = None
+            if "choices" in data and isinstance(data["choices"], list) and len(data["choices"]) > 0:
+                choice = data["choices"][0]
+                if "message" in choice and "content" in choice["message"]:
+                    content = choice["message"]["content"]
+                elif "text" in choice: # Legacy completion
+                    content = choice["text"]
 
-            # 3. Gemini Official
-            if "candidates" in data:
-                part = data["candidates"][0]["content"]["parts"][0]
-                if "inlineData" in part:
-                    return f"data:{part['inlineData']['mimeType']};base64,{part['inlineData']['data']}"
-                # Sometimes raw text contains url? (rare for gemini, but possible)
-                if "text" in part:
-                    if match := re.search(r'https?://[^\s<>")\]]+', part["text"]):
-                        return match.group(0).rstrip(")>,'\"")
-        except:
-            pass
+            # ================== 3. Google Gemini Official ==================
+            # 格式: {"candidates": [{"content": {"parts": [{"inlineData": ...}, {"text": ...}]}}]}
+            if "candidates" in data and isinstance(data["candidates"], list) and len(data["candidates"]) > 0:
+                candidate = data["candidates"][0]
+                if "content" in candidate and "parts" in candidate["content"]:
+                    parts = candidate["content"]["parts"]
+                    if parts and isinstance(parts, list):
+                        # 优先找 inlineData
+                        for part in parts:
+                            if "inlineData" in part:
+                                mime = part["inlineData"].get("mimeType", "image/png")
+                                d = part["inlineData"].get("data", "")
+                                return f"data:{mime};base64,{d}"
+                        
+                        # 其次找 text 里的链接
+                        texts = [p.get("text", "") for p in parts if "text" in p]
+                        content = "\n".join(texts)
+
+            # ================== Common Content Extraction ==================
+            # 如果从 ChatCompletion 或 Gemini Text 中提取到了文本内容，尝试解析 URL 或 Base64
+            if content:
+                # 1. 尝试匹配 Markdown 图片语法 ![...](url) - 这种更精确
+                # 匹配 ![description](http...) 或 ![description](data...)
+                # group(1) 是 url
+                md_match = re.search(r'!\[.*?\]\((.*?)\)', content)
+                if md_match:
+                    url_part = md_match.group(1)
+                    return url_part.strip().strip("'\"")
+
+                # 2. 尝试匹配纯 Base64 标记 (data:image/...)
+                # 这种格式比较明显，优先级高
+                b64_match = re.search(r'(data:image\/[a-zA-Z]+;base64,[a-zA-Z0-9+/=]+)', content)
+                if b64_match:
+                    return b64_match.group(1)
+
+                # 3. 尝试匹配 HTTP/HTTPS URL
+                # 这是一个比较宽泛的匹配
+                url_match = re.search(r'(https?://[^\s<>")\]]+)', content)
+                if url_match:
+                    # 去掉末尾可能的标点
+                    return url_match.group(1).rstrip(")>,'\".")
+
+        except Exception as e:
+            logger.error(f"Error parsing API response: {e}")
         return None
 
     async def call_api(self, images: List[bytes], prompt: str,
@@ -187,7 +224,21 @@ class ApiManager:
 
                     img_url = self.extract_image_url(res_data)
                     if not img_url:
-                        return f"API返回成功但未找到图片数据: {str(res_data)[:100]}..."
+                        # Gemini 特殊错误诊断
+                        if "candidates" in res_data and res_data["candidates"]:
+                            cand = res_data["candidates"][0]
+                            finish_reason = cand.get("finishReason", "UNKNOWN")
+                            
+                            # 1. 非正常结束
+                            if finish_reason not in ["STOP", "MAX_TOKENS"]:
+                                return f"生成被终止，原因: {finish_reason} (通常是安全过滤导致)"
+                            
+                            # 2. 正常结束但无内容
+                            content = cand.get("content") or {}
+                            if not content.get("parts"):
+                                return f"模型未生成任何内容 (finishReason={finish_reason})。可能是由于Prompt被拒绝响应。"
+                                
+                        return f"API返回成功但未找到图片数据: {str(res_data)[:200]}..."
 
                     # 如果是 Base64 直接返回 Bytes
                     if img_url.startswith("data:"):
@@ -197,6 +248,16 @@ class ApiManager:
                     async with session.get(img_url, proxy=proxy) as img_resp:
                         return await img_resp.read()
 
+        except asyncio.TimeoutError:
+            logger.error(f"API Call Timeout after {timeout_val}s")
+            return f"请求超时 ({timeout_val}s)，请稍后再试或检查网络。"
+            
         except Exception as e:
-            logger.error(f"API Call Error: {e}")
-            return f"系统错误: {e}"
+            import traceback
+            logger.error(f"API Call Error: {traceback.format_exc()}")
+            
+            err_msg = str(e)
+            if not err_msg:
+                err_msg = type(e).__name__
+            
+            return f"系统错误: {err_msg}"
