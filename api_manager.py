@@ -53,8 +53,28 @@ class ApiManager:
             content = None
             if "choices" in data and isinstance(data["choices"], list) and len(data["choices"]) > 0:
                 choice = data["choices"][0]
-                if "message" in choice and "content" in choice["message"]:
-                    content = choice["message"]["content"]
+                message = choice.get("message", {})
+                
+                # 优先 1: 检查非标准 "images" 字段 (某些 OneAPI/中转站实现)
+                if "images" in message and isinstance(message["images"], list) and len(message["images"]) > 0:
+                    img = message["images"][0]
+                    if isinstance(img, str): return img # 可能是 URL
+                    if isinstance(img, dict) and "url" in img: return img["url"]
+
+                # 优先 2: 检查 tool_calls (Function Calling 格式)
+                if "tool_calls" in message and isinstance(message["tool_calls"], list):
+                    for tool in message["tool_calls"]:
+                        try:
+                            args = json.loads(tool["function"]["arguments"])
+                            # 常见的参数名: url, image_url, images, file_url
+                            for k in ["url", "image_url", "file_url", "link"]:
+                                if k in args: return args[k]
+                        except:
+                            pass
+
+                # 优先 3: 标准 content
+                if "content" in message:
+                    content = message["content"]
                 elif "text" in choice: # Legacy completion
                     content = choice["text"]
 
@@ -104,9 +124,22 @@ class ApiManager:
             logger.error(f"Error parsing API response: {e}")
         return None
 
+    def get_mime_type(self, data: bytes) -> str:
+        """简单的 MIME 类型检测"""
+        if data.startswith(b'\x89PNG\r\n\x1a\n'):
+            return 'image/png'
+        elif data.startswith(b'\xff\xd8'):
+            return 'image/jpeg'
+        elif data.startswith(b'GIF87a') or data.startswith(b'GIF89a'):
+            return 'image/gif'
+        elif data.startswith(b'RIFF') and data[8:12] == b'WEBP':
+            return 'image/webp'
+        return 'image/png' # 默认
+
     async def call_api(self, images: List[bytes], prompt: str,
                        model: str, use_power: bool, proxy: str = None) -> bytes | str:
         """核心生成逻辑"""
+
         mode = self.config.get("api_mode", "generic")
 
         # 1. 确定 URL
@@ -160,15 +193,20 @@ class ApiManager:
 
             parts = [{"text": final_prompt}]
             for img in images:
-                # Gemini 官方协议不需要 data:image/png;base64 前缀，只需要纯 base64 字符串
-                parts.append({"inlineData": {"mimeType": "image/png", "data": base64.b64encode(img).decode()}})
+                mime = self.get_mime_type(img)
+                parts.append({"inlineData": {"mimeType": mime, "data": base64.b64encode(img).decode()}})
 
             payload = {
                 "contents": [{"parts": parts}],
-                "generationConfig": {"maxOutputTokens": 4096},
+                "generationConfig": {
+                    "maxOutputTokens": 4096,
+                    "responseModalities": ["TEXT", "IMAGE"],
+                    # "aspectRatio": "1:1" # Gemini 可能需要显式比例，暂保持默认
+                },
                 "safetySettings": [{"category": c, "threshold": "BLOCK_NONE"} for c in
                                    ["HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH",
-                                    "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT"]]
+                                    "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT",
+                                    "HARM_CATEGORY_CIVIC_INTEGRITY"]] # 参考: 增加 CIVIC_INTEGRITY
             }
         else:
             # OpenAI 构造
@@ -179,12 +217,11 @@ class ApiManager:
                 u_content = [{"type": "text", "text": final_prompt}]
                 for img in images:
                     b64 = base64.b64encode(img).decode()
-                    # OpenAI 格式通常需要 data URL scheme
-                    # 增加 detail: high
+                    mime = self.get_mime_type(img)
                     u_content.append({
                         "type": "image_url",
                         "image_url": {
-                            "url": f"data:image/png;base64,{b64}",
+                            "url": f"data:{mime};base64,{b64}",
                             "detail": "high"
                         }
                     })
