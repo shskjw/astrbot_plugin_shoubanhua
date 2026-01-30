@@ -64,8 +64,15 @@ class ApiManager:
                 # 优先 2: 检查 tool_calls (Function Calling 格式)
                 if "tool_calls" in message and isinstance(message["tool_calls"], list):
                     for tool in message["tool_calls"]:
+                        # 尝试1: 直接解析 arguments 里的 url/https
+                        func_args = tool.get("function", {}).get("arguments", "")
+                        if "http" in func_args:
+                            import re
+                            urls = re.findall(r"(https?://[^\s<>\"'()\[\]]+)", func_args)
+                            if urls: return urls[0].strip()
+
                         try:
-                            args = json.loads(tool["function"]["arguments"])
+                            args = json.loads(func_args)
                             # 常见的参数名: url, image_url, images, file_url
                             for k in ["url", "image_url", "file_url", "link"]:
                                 if k in args: return args[k]
@@ -211,26 +218,26 @@ class ApiManager:
         else:
             # OpenAI 构造
             headers["Authorization"] = f"Bearer {key}"
-            msgs = [{"role": "system", "content": "You are an AI artist. Output image only."}]
-
-            if images:
-                u_content = [{"type": "text", "text": final_prompt}]
-                for img in images:
-                    b64 = base64.b64encode(img).decode()
-                    mime = self.get_mime_type(img)
-                    u_content.append({
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{mime};base64,{b64}",
-                            "detail": "high"
-                        }
-                    })
-                msgs.append({"role": "user", "content": u_content})
-            else:
-                msgs.append({"role": "user", "content": final_prompt})
-
+            
+            content_list = [{"type": "text", "text": final_prompt}]
+            for img in images:
+                b64 = base64.b64encode(img).decode()
+                mime = self.get_mime_type(img)
+                content_list.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{b64}"}
+                })
+            
+            msgs = [{"role": "user", "content": content_list}]
             payload = {"model": model, "messages": msgs, "stream": False}
 
+            # 针对 Gemini 系模型的 OpenAI 兼容层特殊处理
+            # 参考 bananic_ninjutsu: 如果模型名包含 pro/image/banana，显式添加 modalities
+            lower_model = model.lower()
+            if "gemini" in lower_model or "pro" in lower_model or "image" in lower_model:
+                 # 无论何种模式，只要模型名看起来像 Gemini，就尝试注入 modalities
+                 payload["modalities"] = ["image", "text"]
+        
         # 4. 发送请求
         try:
             timeout_val = self.config.get("timeout", 120)
@@ -289,9 +296,12 @@ class ApiManager:
                             # 1. content 为 None
                             if content is None:
                                 refusal = msg.get("refusal")
-                                if refusal:
-                                    return f"生成请求被拒绝: {refusal}"
-                                return f"API 返回内容为空 (content=None)。finish_reason: {finish_reason}。可能是模型拒绝响应或中转转换异常。"
+                                if refusal: return f"生成请求被拒绝: {refusal}"
+                                
+                                # 将 choice 打印出来排查
+                                choice_str = json.dumps(choice, ensure_ascii=False)
+                                logger.warning(f"OpenAI API content is None: {choice_str}")
+                                return f"API 返回内容为空。finish_reason: {finish_reason}。\nDEBUG: {choice_str[:200]}..."
                             
                             # 2. content 为空字符串
                             if isinstance(content, str) and not content.strip():
