@@ -13,6 +13,13 @@ class ApiManager:
         self.key_lock = asyncio.Lock()
         self.generic_idx = 0
         self.gemini_idx = 0
+        self._session = None # 保持 Session 持久化，复用 TCP/SSL 连接
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            # 不在 Session 级别设置 Timeout，改在请求级别设置
+            self._session = aiohttp.ClientSession()
+        return self._session
 
     async def get_key(self, mode: str, is_power: bool) -> str | None:
         """获取轮询 Key"""
@@ -267,11 +274,14 @@ class ApiManager:
         try:
             timeout_val = self.config.get("timeout", 120)
             timeout = aiohttp.ClientTimeout(total=timeout_val)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(url, json=payload, headers=headers, proxy=proxy) as resp:
-                    resp_text = await resp.text()
+            
+            # 使用持久化 Session，避免重复的 TCP/SSL 握手开销
+            session = await self._get_session()
+            
+            async with session.post(url, json=payload, headers=headers, proxy=proxy, timeout=timeout) as resp:
+                resp_text = await resp.text()
 
-                    if resp.status != 200:
+                if resp.status != 200:
                         try:
                             err_json = json.loads(resp_text)
                             if "error" in err_json:

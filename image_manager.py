@@ -56,8 +56,8 @@ class ImageManager:
                     img_conv = img_conv.resize(new_size, PILImage.Resampling.LANCZOS)
                 
                 out = io.BytesIO()
-                # 使用 PNG 压缩优化
-                img_conv.save(out, format="PNG", optimize=True)
+                # 使用 PNG 压缩优化 (optimize=True 比较耗时，为了速度改为 False，仅依靠Resize减小体积)
+                img_conv.save(out, format="PNG")
                 return out.getvalue()
         except Exception as e:
             logger.warning(f"Image conversion/resize failed: {e}")
