@@ -294,6 +294,8 @@ class ApiManager:
                         pass
                     if "<html" in resp_text.lower():
                         return f"HTTP {resp.status}: 服务端返回了网页而非数据，请检查URL配置。"
+                    
+                    # Return error if status != 200
                     return f"HTTP {resp.status}: {resp_text[:200]}"
 
                 try:
