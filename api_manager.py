@@ -80,7 +80,6 @@ class ApiManager:
                         # 尝试1: 直接解析 arguments 里的 url/https
                         func_args = tool.get("function", {}).get("arguments", "")
                         if "http" in func_args:
-                            import re
                             urls = re.findall(r"(https?://[^\s<>\"'()\[\]]+)", func_args)
                             if urls: return urls[0].strip()
 
