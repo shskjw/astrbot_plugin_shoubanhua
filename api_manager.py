@@ -263,15 +263,15 @@ class ApiManager:
             # 参考 bananic_ninjutsu: 如果模型名包含 pro/image/banana，显式添加 modalities
             lower_model = model.lower()
             if "gemini" in lower_model or "pro" in lower_model or "image" in lower_model:
-                 # 无论何种模式，只要模型名看起来像 Gemini，就尝试注入 modalities
-                 payload["modalities"] = ["image", "text"]
-                 
-                 # 尝试强制注入 safetySettings (很多中转支持透传此参数)
-                 # 这能有效防止 finish_reason: content_filter
-                 payload["safetySettings"] = [{"category": c, "threshold": "BLOCK_NONE"} for c in
-                                   ["HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH",
-                                    "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT",
-                                    "HARM_CATEGORY_CIVIC_INTEGRITY"]]
+                # 无论何种模式，只要模型名看起来像 Gemini，就尝试注入 modalities
+                payload["modalities"] = ["image", "text"]
+
+                # 尝试强制注入 safetySettings (很多中转支持透传此参数)
+                # 这能有效防止 finish_reason: content_filter
+                payload["safetySettings"] = [{"category": c, "threshold": "BLOCK_NONE"} for c in
+                                             ["HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH",
+                                              "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT",
+                                              "HARM_CATEGORY_CIVIC_INTEGRITY"]]
         
         # 4. 发送请求
         try:
