@@ -128,18 +128,21 @@ class ApiManager:
                 # 1. 尝试匹配 Markdown 图片语法 ![...](url) - 这种更精确
                 # 匹配 ![description](http...) 或 ![description](data...)
                 # group(1) 是 url
-                md_match = re.search(r'!\[.*?\]\((.*?)\)', content)
+                # [Fix] 使用 re.DOTALL 匹配可能包含换行的 Base64 (Gemini 常见)
+                md_match = re.search(r'!\[.*?\]\((.*?)\)', content, re.DOTALL)
                 if md_match:
                     url_part = md_match.group(1).strip()
                     # 去除可能存在的 <> 包裹 (e.g. ![img](<url>))
                     url_part = url_part.lstrip("<").rstrip(">")
-                    return url_part.strip("'\"")
+                    # [Fix] 清理 Base64 中的换行符和空格
+                    return url_part.strip("'\"").replace("\n", "").replace("\r", "").replace(" ", "")
 
                 # 2. 尝试匹配纯 Base64 标记 (data:image/...)
                 # 这种格式比较明显，优先级高
-                b64_match = re.search(r'(data:image\/[a-zA-Z]+;base64,[a-zA-Z0-9+/=]+)', content)
+                # [Fix] 允许 Base64 中间有空格/换行
+                b64_match = re.search(r'(data:image\/[a-zA-Z]+;base64,[a-zA-Z0-9+/=\s]+)', content)
                 if b64_match:
-                    return b64_match.group(1)
+                    return b64_match.group(1).replace("\n", "").replace("\r", "").replace(" ", "")
 
                 # 3. 尝试匹配 HTTP/HTTPS URL
                 # 这是一个比较宽泛的匹配
