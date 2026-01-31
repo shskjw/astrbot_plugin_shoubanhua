@@ -282,20 +282,20 @@ class ApiManager:
                 resp_text = await resp.text()
 
                 if resp.status != 200:
-                        try:
-                            err_json = json.loads(resp_text)
-                            if "error" in err_json:
-                                err_msg = json.dumps(err_json['error'], ensure_ascii=False)
-                                return f"API Error {resp.status}: {err_msg}"
-                        except:
-                            pass
-                        if "<html" in resp_text.lower():
-                            return f"HTTP {resp.status}: 服务端返回了网页而非数据，请检查URL配置。"
-                        return f"HTTP {resp.status}: {resp_text[:200]}"
-
                     try:
-                        res_data = json.loads(resp_text)
-                    except json.JSONDecodeError:
+                        err_json = json.loads(resp_text)
+                        if "error" in err_json:
+                            err_msg = json.dumps(err_json['error'], ensure_ascii=False)
+                            return f"API Error {resp.status}: {err_msg}"
+                    except:
+                        pass
+                    if "<html" in resp_text.lower():
+                        return f"HTTP {resp.status}: 服务端返回了网页而非数据，请检查URL配置。"
+                    return f"HTTP {resp.status}: {resp_text[:200]}"
+
+                try:
+                    res_data = json.loads(resp_text)
+                except json.JSONDecodeError:
                         # 兼容：处理被强制流式返回的情况 (SSE format)
                         if "data: " in resp_text:
                             full_content = ""
@@ -347,68 +347,68 @@ class ApiManager:
                         else:
                             return f"数据解析失败: 返回内容不是 JSON. 内容: {resp_text[:100]}..."
 
-                    if "error" in res_data:
-                        return json.dumps(res_data["error"], ensure_ascii=False)
+                if "error" in res_data:
+                    return json.dumps(res_data["error"], ensure_ascii=False)
 
-                    img_url = self.extract_image_url(res_data)
-                    if not img_url:
-                        # Gemini 特殊错误诊断 (原生 API)
-                        if "candidates" in res_data and res_data["candidates"]:
-                            cand = res_data["candidates"][0]
-                            finish_reason = cand.get("finishReason", "UNKNOWN")
-                            
-                            # 1. 非正常结束
-                            if finish_reason not in ["STOP", "MAX_TOKENS"]:
-                                return f"生成被终止，原因: {finish_reason} (通常是安全过滤导致)"
-                            
-                            # 2. 正常结束但无内容
-                            content = cand.get("content") or {}
-                            parts = content.get("parts")
-                            if not parts:
-                                # 尝试打印整个 candidate 以便排查
-                                cand_str = json.dumps(cand, ensure_ascii=False)
-                                logger.warning(f"Gemini API returned empty parts: {cand_str}")
-                                return f"模型响应为空 (finishReason={finish_reason})。请确认使用的模型 ({model}) 是否支持生图，或者 Prompt 是否触发了隐性过滤。\nRaw: {cand_str[:100]}..."
+                img_url = self.extract_image_url(res_data)
+                if not img_url:
+                    # Gemini 特殊错误诊断 (原生 API)
+                    if "candidates" in res_data and res_data["candidates"]:
+                        cand = res_data["candidates"][0]
+                        finish_reason = cand.get("finishReason", "UNKNOWN")
                         
-                        # OpenAI 格式错误诊断 (兼容 API)
-                        if "choices" in res_data and isinstance(res_data["choices"], list) and len(res_data["choices"]) > 0:
-                            choice = res_data["choices"][0]
-                            finish_reason = choice.get("finish_reason", "UNKNOWN")
-                            msg = choice.get("message", {})
-                            content = msg.get("content")
-                            
-                            # 1. content 为 None
-                            if content is None:
-                                refusal = msg.get("refusal")
-                                if refusal: return f"生成请求被拒绝: {refusal}"
-                                
-                                # 将 choice 打印出来排查
-                                choice_str = json.dumps(choice, ensure_ascii=False)
-                                logger.warning(f"OpenAI API content is None: {choice_str}")
-                                return f"API 返回内容为空。finish_reason: {finish_reason}。\nDEBUG: {choice_str[:200]}..."
-                            
-                            # 2. content 为空字符串
-                            if isinstance(content, str) and not content.strip():
-                                if finish_reason == "content_filter":
-                                    return "❌ 生成被拦截: 触发了安全过滤 (content_filter)。建议修改 Prompt 或重试。"
-                                return f"API 返回内容为空字符串。finish_reason: {finish_reason}。"
-
-                        # 尝试提取文本内容作为错误信息提示
-                        diag_msg = "未找到图片数据"
-                        if "choices" in res_data and res_data["choices"]:
-                             c0 = res_data["choices"][0]
-                             if c0.get("message", {}).get("content"):
-                                 diag_msg = f"API返回了文本而非图片: {c0['message']['content'][:200]}"
+                        # 1. 非正常结束
+                        if finish_reason not in ["STOP", "MAX_TOKENS"]:
+                            return f"生成被终止，原因: {finish_reason} (通常是安全过滤导致)"
                         
-                        return f"API请求成功但{diag_msg}。Raw: {str(res_data)[:200]}..."
+                        # 2. 正常结束但无内容
+                        content = cand.get("content") or {}
+                        parts = content.get("parts")
+                        if not parts:
+                            # 尝试打印整个 candidate 以便排查
+                            cand_str = json.dumps(cand, ensure_ascii=False)
+                            logger.warning(f"Gemini API returned empty parts: {cand_str}")
+                            return f"模型响应为空 (finishReason={finish_reason})。请确认使用的模型 ({model}) 是否支持生图，或者 Prompt 是否触发了隐性过滤。\nRaw: {cand_str[:100]}..."
+                    
+                    # OpenAI 格式错误诊断 (兼容 API)
+                    if "choices" in res_data and isinstance(res_data["choices"], list) and len(res_data["choices"]) > 0:
+                        choice = res_data["choices"][0]
+                        finish_reason = choice.get("finish_reason", "UNKNOWN")
+                        msg = choice.get("message", {})
+                        content = msg.get("content")
+                        
+                        # 1. content 为 None
+                        if content is None:
+                            refusal = msg.get("refusal")
+                            if refusal: return f"生成请求被拒绝: {refusal}"
+                            
+                            # 将 choice 打印出来排查
+                            choice_str = json.dumps(choice, ensure_ascii=False)
+                            logger.warning(f"OpenAI API content is None: {choice_str}")
+                            return f"API 返回内容为空。finish_reason: {finish_reason}。\nDEBUG: {choice_str[:200]}..."
+                        
+                        # 2. content 为空字符串
+                        if isinstance(content, str) and not content.strip():
+                            if finish_reason == "content_filter":
+                                return "❌ 生成被拦截: 触发了安全过滤 (content_filter)。建议修改 Prompt 或重试。"
+                            return f"API 返回内容为空字符串。finish_reason: {finish_reason}。"
 
-                    # 如果是 Base64 直接返回 Bytes
-                    if img_url.startswith("data:"):
-                        return base64.b64decode(img_url.split(",")[-1])
+                    # 尝试提取文本内容作为错误信息提示
+                    diag_msg = "未找到图片数据"
+                    if "choices" in res_data and res_data["choices"]:
+                            c0 = res_data["choices"][0]
+                            if c0.get("message", {}).get("content"):
+                                diag_msg = f"API返回了文本而非图片: {c0['message']['content'][:200]}"
+                    
+                    return f"API请求成功但{diag_msg}。Raw: {str(res_data)[:200]}..."
 
-                    # 如果是 URL，需要再次下载
-                    async with session.get(img_url, proxy=proxy) as img_resp:
-                        return await img_resp.read()
+                # 如果是 Base64 直接返回 Bytes
+                if img_url.startswith("data:"):
+                    return base64.b64decode(img_url.split(",")[-1])
+
+                # 如果是 URL，需要再次下载
+                async with session.get(img_url, proxy=proxy) as img_resp:
+                    return await img_resp.read()
 
         except asyncio.TimeoutError:
             logger.error(f"API Call Timeout after {timeout_val}s")
