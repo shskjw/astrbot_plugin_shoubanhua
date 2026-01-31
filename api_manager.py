@@ -125,24 +125,29 @@ class ApiManager:
             # ================== Common Content Extraction ==================
             # 如果从 ChatCompletion 或 Gemini Text 中提取到了文本内容，尝试解析 URL 或 Base64
             if content:
+                # 0. 尝试提取其中包含的 data URI (最宽泛的匹配策略)
+                # 能够匹配 markdown 内部、纯文本、或者被截断的内容
+                # [Fix] 增强正则兼容性: 允许 urlsafe base64 (-_), 允许 mime type 包含特殊字符
+                b64_match = re.search(r'(data:image\/[\w\-\+\.]+(?:;base64)?,[\w\-\+\/=\s]+)', content)
+                if b64_match:
+                    found_b64 = b64_match.group(1).replace("\n", "").replace("\r", "").replace(" ", "")
+                    # 简单的有效性检查 (Base64 长度通常较长)
+                    if len(found_b64) > 100:
+                        return found_b64
+
                 # 1. 尝试匹配 Markdown 图片语法 ![...](url) - 这种更精确
-                # 匹配 ![description](http...) 或 ![description](data...)
-                # group(1) 是 url
-                # [Fix] 使用 re.DOTALL 匹配可能包含换行的 Base64 (Gemini 常见)
+                # 匹配 ![description](http...)
                 md_match = re.search(r'!\[.*?\]\((.*?)\)', content, re.DOTALL)
                 if md_match:
                     url_part = md_match.group(1).strip()
                     # 去除可能存在的 <> 包裹 (e.g. ![img](<url>))
                     url_part = url_part.lstrip("<").rstrip(">")
-                    # [Fix] 清理 Base64 中的换行符和空格
-                    return url_part.strip("'\"").replace("\n", "").replace("\r", "").replace(" ", "")
+                    # [Fix] 清理 URL
+                    url_part = url_part.strip("'\"").replace("\n", "").replace("\r", "").replace(" ", "")
+                    if "data:image" not in url_part and len(url_part) > 5:
+                         return url_part
 
-                # 2. 尝试匹配纯 Base64 标记 (data:image/...)
-                # 这种格式比较明显，优先级高
-                # [Fix] 允许 Base64 中间有空格/换行
-                b64_match = re.search(r'(data:image\/[a-zA-Z]+;base64,[a-zA-Z0-9+/=\s]+)', content)
-                if b64_match:
-                    return b64_match.group(1).replace("\n", "").replace("\r", "").replace(" ", "")
+                # 2. (Legacy B64 Match Removed - replaced by step 0)
 
                 # 3. 尝试匹配 HTTP/HTTPS URL
                 # 这是一个比较宽泛的匹配
