@@ -21,7 +21,7 @@ from .utils import norm_id, extract_image_urls_from_text
     "astrbot_plugin_shoubanhua",
     "shskjw",
     "支持第三方所有OpenAI绘图格式和原生Google Gemini 终极缝合怪，文生图/图生图插件",
-    "1.8.6",
+    "1.8.7",
     "https://github.com/shkjw/astrbot_plugin_shoubanhua",
 )
 class FigurineProPlugin(Star):
@@ -78,8 +78,16 @@ class FigurineProPlugin(Star):
 
     def _save_config(self):
         try:
+            # 优先使用 AstrBotConfig 自带的 save
             if hasattr(self.conf, "save") and callable(self.conf.save):
                 self.conf.save()
+            # 尝试使用 Context 的 save_config (如果有)
+            elif hasattr(self.context, "save_config"):
+                self.context.save_config(self.conf)
+            else:
+                # 如果上述都失败，尝试写入 config.json (如果能定位到)
+                # 但由于路径不确定，这里只能记录警告
+                logger.warning("FigurinePro: No valid save method found for config.")
         except Exception as e:
             logger.warning(f"FigurinePro Config Save Failed: {e}")
 
@@ -265,7 +273,8 @@ class FigurineProPlugin(Star):
         images = []
         if use_message_images:
             bot_id = self._get_bot_id(event)
-            images = await self.img_mgr.extract_images_from_event(event, ignore_id=bot_id)
+            # [Fix] 传入 context 以便支持 message_id 获取引用图片
+            images = await self.img_mgr.extract_images_from_event(event, ignore_id=bot_id, context=self.context)
 
         if not images:
             # 如果没图，再发一条提示
@@ -357,8 +366,8 @@ class FigurineProPlugin(Star):
         yield event.chain_result([Plain(f"🎨 收到{mode_str}请求，正在生成 [{preset_name}]...")])
 
         bot_id = self._get_bot_id(event)
-        # 传递 bot_id 给 image manager 以过滤
-        images = await self.img_mgr.extract_images_from_event(event, ignore_id=bot_id)
+        # 传递 bot_id 给 image manager 以过滤，并传入 context 支持 message_id
+        images = await self.img_mgr.extract_images_from_event(event, ignore_id=bot_id, context=self.context)
 
         if not is_bnn and user_prompt:
             urls = extract_image_urls_from_text(user_prompt)

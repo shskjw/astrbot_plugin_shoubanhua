@@ -91,7 +91,7 @@ class ImageManager:
         if not user_id.isdigit(): return None
         return await self._download_image(f"https://q1.qlogo.cn/g?b=qq&nk={user_id}&s=640")
 
-    async def extract_images_from_event(self, event: AstrMessageEvent, ignore_id: str = None) -> List[bytes]:
+    async def extract_images_from_event(self, event: AstrMessageEvent, ignore_id: str = None, context=None) -> List[bytes]:
         """从消息事件中提取所有图片 - 并发加速"""
         tasks = []
         at_users = set()  # 使用集合去重
@@ -105,13 +105,46 @@ class ImageManager:
         # 2. 收集所有待下载/读取的任务
         for seg in event.message_obj.message:
             # 回复链
-            if isinstance(seg, Reply) and seg.chain:
-                for s_chain in seg.chain:
-                    if isinstance(s_chain, Image):
-                        if s_chain.url:
-                            tasks.append(self.load_bytes(s_chain.url))
-                        elif s_chain.file:
-                            tasks.append(self.load_bytes(s_chain.file))
+            if isinstance(seg, Reply):
+                # 优先尝试使用 chain (AstrBot 可能会自动填充)
+                found_in_chain = False
+                if seg.chain:
+                    for s_chain in seg.chain:
+                        if isinstance(s_chain, Image):
+                            found_in_chain = True
+                            if s_chain.url:
+                                tasks.append(self.load_bytes(s_chain.url))
+                            elif s_chain.file:
+                                tasks.append(self.load_bytes(s_chain.file))
+                
+                # 如果 chain 中没有图片，且有 context 和 message_id，尝试主动获取消息
+                if not found_in_chain and context and hasattr(seg, "id") and seg.id:
+                    try:
+                        logger.debug(f"Reply chain empty/no-image, fetching message_id: {seg.id}")
+                        # 尝试获取原消息
+                        bot = context.get_bot()
+                        if bot:
+                            # 这是一个异步调用，获取历史消息
+                            target_msg = await bot.get_message(seg.id)
+                            if target_msg:
+                                # target_msg 可能是 AstrMessageEvent 或 组件列表
+                                components = []
+                                if hasattr(target_msg, "message_obj") and hasattr(target_msg.message_obj, "message"):
+                                    components = target_msg.message_obj.message
+                                elif isinstance(target_msg, list):
+                                    components = target_msg
+                                elif hasattr(target_msg, "message"):
+                                    components = target_msg.message
+                                
+                                for comp in components:
+                                    if isinstance(comp, Image):
+                                        if comp.url:
+                                            tasks.append(self.load_bytes(comp.url))
+                                        elif comp.file:
+                                            tasks.append(self.load_bytes(comp.file))
+                    except Exception as e:
+                        logger.warning(f"Failed to fetch reply message {seg.id}: {e}")
+
             # 当前消息图片
             elif isinstance(seg, Image):
                 if seg.url:

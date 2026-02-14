@@ -21,6 +21,10 @@ class DataManager:
         self.user_prompts_file = self.data_dir / "user_prompts.json" # 新增：用户自定义预设文件
         self.preset_images_dir = self.data_dir / "preset_images"
 
+        # [Fix] 确保数据目录存在
+        if not self.data_dir.exists():
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+
         if not self.preset_images_dir.exists():
             self.preset_images_dir.mkdir(parents=True, exist_ok=True)
 
