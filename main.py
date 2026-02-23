@@ -859,10 +859,23 @@ class FigurineProPlugin(Star):
         k, v = msg.split(":", 1)
         k, v = k.strip(), v.strip()
         
+        if not k or not v:
+            yield event.chain_result([Plain("❌ 触发词和提示词都不能为空")])
+            return
+        
         # 使用 DataManager 进行持久化保存
         await self.data_mgr.add_user_prompt(k, v)
         
-        yield event.chain_result([Plain(f"✅ 已添加预设: {k}")])
+        # 同时更新到配置文件的 prompt_list 中，确保双重持久化
+        prompt_list = self.conf.get("prompt_list", [])
+        # 移除已存在的同名预设
+        prompt_list = [item for item in prompt_list if not item.startswith(f"{k}:")]
+        # 添加新预设
+        prompt_list.append(f"{k}:{v}")
+        self.conf["prompt_list"] = prompt_list
+        self._save_config()
+        
+        yield event.chain_result([Plain(f"✅ 已添加预设: {k}\n💾 已同步保存到配置文件")])
 
     @filter.command("lm查看", aliases={"lmv", "lm预览"}, prefix_optional=True)
     async def on_view_preset(self, event: AstrMessageEvent, ctx=None):
