@@ -124,13 +124,13 @@ class FigurineProPlugin(Star):
         self._rebellious_mode = config.get("enable_rebellious_mode", True)
         self._rebellious_probability = config.get("rebellious_probability", 0.3)
         
-        # LLM工具调用冷却时间
-        self._llm_cooldown_seconds = config.get("llm_cooldown_seconds", 60)
-        self._user_last_llm_call: Dict[str, datetime] = {}  # 用户ID -> 上次调用时间
+        # 图片生成冷却时间（只针对图片生成，不影响正常聊天）
+        self._image_cooldown_seconds = config.get("llm_cooldown_seconds", 60)
+        self._user_last_image_gen: Dict[str, datetime] = {}  # 用户ID -> 上次图片生成时间
 
-    def _check_llm_cooldown(self, uid: str) -> Tuple[bool, int]:
+    def _check_image_cooldown(self, uid: str) -> Tuple[bool, int]:
         """
-        检查用户是否在LLM工具调用冷却中
+        检查用户是否在图片生成冷却中
         
         Args:
             uid: 用户ID
@@ -138,23 +138,50 @@ class FigurineProPlugin(Star):
         Returns:
             (是否在冷却中, 剩余冷却秒数)
         """
-        if self._llm_cooldown_seconds <= 0:
+        if self._image_cooldown_seconds <= 0:
             return False, 0
         
-        last_call = self._user_last_llm_call.get(uid)
-        if not last_call:
+        last_gen = self._user_last_image_gen.get(uid)
+        if not last_gen:
             return False, 0
         
-        elapsed = (datetime.now() - last_call).total_seconds()
-        remaining = self._llm_cooldown_seconds - elapsed
+        elapsed = (datetime.now() - last_gen).total_seconds()
+        remaining = self._image_cooldown_seconds - elapsed
         
         if remaining > 0:
             return True, int(remaining)
         return False, 0
 
-    def _update_llm_cooldown(self, uid: str):
-        """更新用户的LLM工具调用时间"""
-        self._user_last_llm_call[uid] = datetime.now()
+    def _update_image_cooldown(self, uid: str):
+        """更新用户的图片生成时间"""
+        self._user_last_image_gen[uid] = datetime.now()
+
+    def _get_cooldown_excuse(self, remaining: int) -> str:
+        """
+        生成冷却期间的拒绝借口
+        
+        Args:
+            remaining: 剩余冷却秒数
+            
+        Returns:
+            拒绝理由文本
+        """
+        import random
+        
+        excuses = [
+            f"刚才画累了，让我休息一下嘛~ 再等{remaining}秒就好",
+            f"手还酸着呢，{remaining}秒后再来找我吧",
+            f"创作需要灵感，给我{remaining}秒酝酿一下",
+            f"别催别催，{remaining}秒后我就恢复状态了",
+            f"画笔还没干呢，等{remaining}秒再说",
+            f"让我喘口气，{remaining}秒后继续",
+            f"刚刚太拼了，休息{remaining}秒再画",
+            f"灵感正在充能中...还需要{remaining}秒",
+            f"我也是需要休息的好吧，{remaining}秒后再来",
+            f"稍等一下啦，{remaining}秒后就能继续了",
+        ]
+        
+        return random.choice(excuses)
 
     def _check_rebellious_trigger(self, message: str) -> Tuple[bool, str]:
         """
@@ -546,11 +573,13 @@ class FigurineProPlugin(Star):
         if not self.conf.get("enable_llm_tool", True):
             return "❌ LLM 工具已禁用，请使用指令模式调用此功能。"
 
-        # 0.1 检查冷却时间
+        # 0.1 检查图片生成冷却时间
         uid = norm_id(event.get_sender_id())
-        in_cooldown, remaining = self._check_llm_cooldown(uid)
+        in_cooldown, remaining = self._check_image_cooldown(uid)
         if in_cooldown:
-            return f"⏳ 冷却中，请等待 {remaining} 秒后再试。"
+            # 返回借口让LLM用自然语言拒绝
+            excuse = self._get_cooldown_excuse(remaining)
+            return f"【冷却中】{excuse}\n\n请用自然的方式告诉用户现在不方便生成图片，可以稍后再试。不要直接说'冷却'这个词。"
 
         # 1. 计算预设和追加规则
         final_prompt, preset_name, extra_rules = self._process_prompt_and_preset(prompt)
@@ -564,15 +593,14 @@ class FigurineProPlugin(Star):
             await event.send(event.chain_result([Plain(feedback)]))
 
         # 3. 检查配额
-        uid = norm_id(event.get_sender_id())
         gid = norm_id(event.get_group_id())
         cost = 1
         deduction = await self._check_quota(event, uid, gid, cost)
         if not deduction["allowed"]:
             return deduction["msg"]
 
-        # 4. 更新冷却时间
-        self._update_llm_cooldown(uid)
+        # 4. 更新图片生成冷却时间
+        self._update_image_cooldown(uid)
 
         # 5. 启动后台任务（使用文生图专用模型）
         asyncio.create_task(
@@ -614,11 +642,13 @@ class FigurineProPlugin(Star):
         if not self.conf.get("enable_llm_tool", True):
             return "❌ LLM 工具已禁用，请使用指令模式调用此功能。"
 
-        # 0.1 检查冷却时间
+        # 0.1 检查图片生成冷却时间
         uid = norm_id(event.get_sender_id())
-        in_cooldown, remaining = self._check_llm_cooldown(uid)
+        in_cooldown, remaining = self._check_image_cooldown(uid)
         if in_cooldown:
-            return f"⏳ 冷却中，请等待 {remaining} 秒后再试。"
+            # 返回借口让LLM用自然语言拒绝
+            excuse = self._get_cooldown_excuse(remaining)
+            return f"【冷却中】{excuse}\n\n请用自然的方式告诉用户现在不方便处理图片，可以稍后再试。不要直接说'冷却'这个词。"
 
         # 1. 计算预设和追加规则
         processed_prompt, preset_name, extra_rules = self._process_prompt_and_preset(prompt)
@@ -649,8 +679,8 @@ class FigurineProPlugin(Star):
         if not deduction["allowed"]:
             return deduction["msg"]
 
-        # 5. 更新冷却时间
-        self._update_llm_cooldown(uid)
+        # 5. 更新图片生成冷却时间
+        self._update_image_cooldown(uid)
 
         # 6. 启动后台任务
         asyncio.create_task(
@@ -1140,11 +1170,13 @@ class FigurineProPlugin(Star):
         if not self.conf.get("enable_llm_tool", True):
             return "❌ LLM 工具已禁用，请使用指令模式调用此功能。"
         
-        # 0.1 检查冷却时间
+        # 0.1 检查图片生成冷却时间
         uid = norm_id(event.get_sender_id())
-        in_cooldown, remaining = self._check_llm_cooldown(uid)
+        in_cooldown, remaining = self._check_image_cooldown(uid)
         if in_cooldown:
-            return f"⏳ 冷却中，请等待 {remaining} 秒后再试。"
+            # 返回借口让LLM用自然语言拒绝
+            excuse = self._get_cooldown_excuse(remaining)
+            return f"【冷却中】{excuse}\n\n请用自然的方式告诉用户现在不方便生成图片，可以稍后再试。不要直接说'冷却'这个词。"
         
         # 1. 获取上下文
         session_id = event.unified_msg_origin
@@ -1198,7 +1230,7 @@ class FigurineProPlugin(Star):
                 return deduction["msg"]
             
             # 更新冷却时间
-            self._update_llm_cooldown(uid)
+            self._update_image_cooldown(uid)
             
             asyncio.create_task(
                 self._run_background_task(event, [], final_prompt, preset_name, deduction, uid, gid, 1, extra_rules)
@@ -1242,7 +1274,7 @@ class FigurineProPlugin(Star):
                 return deduction["msg"]
             
             # 更新冷却时间
-            self._update_llm_cooldown(uid)
+            self._update_image_cooldown(uid)
             
             asyncio.create_task(
                 self._run_background_task(event, images, processed_prompt, preset_name, deduction, uid, gid, 1, extra_rules)
@@ -1648,11 +1680,13 @@ class FigurineProPlugin(Star):
         if not self.conf.get("enable_llm_tool", True):
             return "❌ LLM 工具已禁用，请使用指令模式调用此功能。"
         
-        # 0.1 检查冷却时间
+        # 0.1 检查图片生成冷却时间
         uid = norm_id(event.get_sender_id())
-        in_cooldown, remaining = self._check_llm_cooldown(uid)
+        in_cooldown, remaining = self._check_image_cooldown(uid)
         if in_cooldown:
-            return f"⏳ 冷却中，请等待 {remaining} 秒后再试。"
+            # 返回借口让LLM用自然语言拒绝
+            excuse = self._get_cooldown_excuse(remaining)
+            return f"【冷却中】{excuse}\n\n请用自然的方式告诉用户现在不方便处理图片，可以稍后再试。不要直接说'冷却'这个词。"
         
         # 1. 获取上下文中的图片
         session_id = event.unified_msg_origin
@@ -1690,7 +1724,7 @@ class FigurineProPlugin(Star):
             return f"❌ 次数不足。批量处理 {total_images} 张图片需要 {total_cost} 次。{deduction['msg']}"
         
         # 4.1 更新冷却时间
-        self._update_llm_cooldown(uid)
+        self._update_image_cooldown(uid)
         
         # 5. 发送开始提示
         feedback = f"📦 批量处理任务开始\n"
@@ -1819,11 +1853,13 @@ class FigurineProPlugin(Star):
         if not self.conf.get("enable_llm_tool", True):
             return "❌ LLM 工具已禁用，请使用指令模式调用此功能。"
         
-        # 0.1 检查冷却时间
+        # 0.1 检查图片生成冷却时间
         uid = norm_id(event.get_sender_id())
-        in_cooldown, remaining = self._check_llm_cooldown(uid)
+        in_cooldown, remaining = self._check_image_cooldown(uid)
         if in_cooldown:
-            return f"⏳ 冷却中，请等待 {remaining} 秒后再试。"
+            # 返回借口让LLM用自然语言拒绝
+            excuse = self._get_cooldown_excuse(remaining)
+            return f"【冷却中】{excuse}\n\n请用自然的方式告诉用户现在不方便处理图片，可以稍后再试。不要直接说'冷却'这个词。"
         
         # 限制并发数
         concurrency = max(1, min(concurrency, 5))
@@ -1864,7 +1900,7 @@ class FigurineProPlugin(Star):
             return f"❌ 次数不足。批量处理 {total_images} 张图片需要 {total_cost} 次。{deduction['msg']}"
         
         # 4.1 更新冷却时间
-        self._update_llm_cooldown(uid)
+        self._update_image_cooldown(uid)
         
         # 5. 发送开始提示
         feedback = f"🚀 并发批量处理任务开始\n"
@@ -2015,11 +2051,13 @@ class FigurineProPlugin(Star):
         if not self.conf.get("enable_llm_tool", True):
             return "❌ LLM 工具已禁用，请使用指令模式调用此功能。"
         
-        # 0.1 检查冷却时间
+        # 0.1 检查图片生成冷却时间
         uid = norm_id(event.get_sender_id())
-        in_cooldown, remaining = self._check_llm_cooldown(uid)
+        in_cooldown, remaining = self._check_image_cooldown(uid)
         if in_cooldown:
-            return f"⏳ 冷却中，请等待 {remaining} 秒后再试。"
+            # 返回借口让LLM用自然语言拒绝
+            excuse = self._get_cooldown_excuse(remaining)
+            return f"【冷却中】{excuse}\n\n请用自然的方式告诉用户现在不方便拍照，可以稍后再试。不要直接说'冷却'这个词。"
         
         # 1. 加载人设参考图
         ref_images = await self._load_persona_ref_images()
@@ -2060,7 +2098,7 @@ class FigurineProPlugin(Star):
             return deduction["msg"]
         
         # 7. 更新冷却时间
-        self._update_llm_cooldown(uid)
+        self._update_image_cooldown(uid)
         
         # 8. 启动后台任务
         asyncio.create_task(
