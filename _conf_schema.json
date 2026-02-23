@@ -71,6 +71,12 @@
         "hint": "当前默认使用的模型ID（需在模型列表中存在）。可通过 #切换模型 指令修改。",
         "default": "nano-banana"
     },
+    "text_to_image_model": {
+        "description": "【通用】文生图专用模型",
+        "type": "string",
+        "hint": "文生图功能使用的模型ID。留空则使用默认模型。",
+        "default": ""
+    },
     "image_resolution": {
         "description": "【画质】图像分辨率",
         "type": "string",
@@ -305,10 +311,132 @@
         "max": 10086
     },
     "enable_llm_tool": {
-        "description": "【LLM】启用LLM智能判断工具",
+      "description": "【LLM】启用LLM工具调用",
+      "type": "bool",
+      "hint": "是否允许LLM通过工具调用触发图片生成",
+      "default": true
+    },
+    "llm_show_progress": {
+      "description": "【LLM】调用显示进度",
+      "type": "bool",
+      "hint": "LLM工具调用时是否发送生成状态提示（如'正在生成...'），关闭后直接发送结果图片",
+      "default": true
+    },
+    "llm_cooldown_seconds": {
+      "description": "【LLM】工具调用冷却时间(秒)",
+      "type": "int",
+      "hint": "LLM工具调用后的冷却时间，防止用户无节制刷图。设为0则不限制。",
+      "default": 60
+    },
+    "enable_llm_auto_detect": {
+        "description": "【LLM】启用智能判断",
         "type": "bool",
-        "hint": "开启后，LLM可以通过智能判断自动调用手办化插件生成图片。关闭此项可避免与其他LLM插件产生冲突。",
+        "hint": "开启后，LLM结合上下文自动判断是文生图还是图生图。",
+        "default": false
+    },
+    "context_rounds": {
+        "description": "【LLM】上下文轮数",
+        "type": "int",
+        "hint": "智能判断时获取的聊天记录轮数。",
+        "default": 20
+    },
+    "auto_detect_confidence": {
+        "description": "【LLM】智能判断置信度阈值",
+        "type": "float",
+        "hint": "低于此值时会提示用户明确指定任务类型。建议设置0.7-0.9，值越高越严格，可减少误触发。",
+        "default": 0.8
+    },
+    "context_max_messages": {
+        "description": "【上下文】每会话最大消息数",
+        "type": "int",
+        "hint": "每个会话保存的最大消息数量。",
+        "default": 50
+    },
+    "context_max_sessions": {
+        "description": "【上下文】最大会话数",
+        "type": "int",
+        "hint": "同时保存的最大会话数量。",
+        "default": 100
+    },
+    "batch_max_images": {
+        "description": "【批量】批量处理最大图片数",
+        "type": "int",
+        "hint": "批量处理时最多处理的图片数量。",
+        "default": 10
+    },
+    "batch_concurrency": {
+        "description": "【批量】批量处理并发数",
+        "type": "int",
+        "hint": "并发批量处理时同时处理的图片数量。",
+        "default": 3
+    },
+    "enable_preset_ref_images": {
+        "description": "【预设】启用预设参考图",
+        "type": "bool",
+        "hint": "开启后，触发预设时会自动加载该预设的参考图一起发送给API，可以提高生成效果的一致性。",
         "default": true
+    },
+    "enable_persona_mode": {
+        "description": "【人设】启用人设模式",
+        "type": "bool",
+        "hint": "开启后，Bot可以基于预设的人物参考图生成场景图片。",
+        "default": false
+    },
+    "persona_name": {
+        "description": "【人设】人设名称",
+        "type": "string",
+        "hint": "Bot的人设角色名称。",
+        "default": "小助手"
+    },
+    "persona_description": {
+        "description": "【人设】人设描述",
+        "type": "text",
+        "hint": "详细描述Bot的外貌特征、穿着风格等。",
+        "default": "一个可爱的二次元女孩"
+    },
+    "persona_trigger_keywords": {
+        "description": "【人设】触发关键词",
+        "type": "list",
+        "hint": "触发人设拍照的关键词列表。",
+        "items": {
+            "type": "string",
+            "description": "关键词"
+        },
+        "default": ["拍照", "自拍", "看看你"]
+    },
+    "persona_scene_prompts": {
+        "description": "【人设】场景提示词映射",
+        "type": "list",
+        "hint": "格式：场景关键词:提示词。用于匹配不同场景。",
+        "items": {
+            "type": "string",
+            "description": "场景:提示词"
+        },
+        "default": ["咖啡店:在咖啡店里悠闲地喝咖啡", "家里:在房间里的日常生活场景", "公园:在公园里散步或休息", "学校:在校园里的日常"]
+    },
+    "persona_default_prompt": {
+        "description": "【人设】默认场景提示词",
+        "type": "string",
+        "hint": "未匹配到场景时使用的默认提示词。",
+        "default": "一张日常生活照片，自然的姿态和表情"
+    },
+    "persona_photo_style": {
+        "description": "【人设】照片风格",
+        "type": "string",
+        "hint": "人设照片的整体风格描述。",
+        "default": "日常生活风格，自然光线，真实感"
+    },
+    "enable_rebellious_mode": {
+        "description": "【叛逆】启用叛逆模式",
+        "type": "bool",
+        "hint": "开启后，LLM工具调用时会随机返回叛逆提示，让Bot可以用傲娇/调侃/吐槽的语气回复用户。",
+        "default": true
+    },
+    "rebellious_probability": {
+        "description": "【叛逆】叛逆触发概率",
+        "type": "float",
+        "hint": "没有触发关键词时，随机触发叛逆模式的概率（0-1之间）。设为0则只有触发关键词才会叛逆，设为1则每次都叛逆。",
+        "default": 0.3
     },
     "prompt_list": {
         "description": "提示词预设列表",

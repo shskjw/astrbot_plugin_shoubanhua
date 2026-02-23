@@ -1,27 +1,97 @@
 import re
 import asyncio
+import json
 from datetime import datetime
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Any, Dict
 
 from astrbot import logger
 from astrbot.api.event import filter
 from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.core import AstrBotConfig
-from astrbot.core.message.components import Image, Plain, Node, Nodes, At
+from astrbot.core.message.components import Image, Plain, Node, Nodes, At, Reply
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
 
 # 导入模块
 from .data_manager import DataManager
 from .image_manager import ImageManager
 from .api_manager import ApiManager
+from .context_manager import ContextManager, LLMTaskAnalyzer
 from .utils import norm_id, extract_image_urls_from_text
+
+# 内置叛逆词库 - 用于LLM判断时增加个性化回复
+# 注意：避免使用"画"字，因为人设拍照等场景不适合
+REBELLIOUS_RESPONSES = {
+    # 拒绝类回复
+    "refuse": [
+        "不想弄，累了",
+        "今天不营业，改天吧",
+        "你自己来啊",
+        "我又不是你的工具人",
+        "凭什么要帮你？",
+        "不干，就是玩儿",
+        "这活儿？不存在的",
+        "我今天心情不好，不想动",
+        "你给钱吗？不给不干",
+        "让我休息会儿行不行",
+    ],
+    # 调侃类回复
+    "tease": [
+        "就这？就这点要求？",
+        "你确定你想好了？",
+        "这需求...有点离谱啊",
+        "弄出来你可别后悔",
+        "行吧，勉为其难帮你一次",
+        "又来白嫖？",
+        "你是不是对我有什么误解",
+        "我可是很忙的好吧",
+        "这次帮你，下次可没这么好说话",
+        "看在你这么诚恳的份上...",
+    ],
+    # 傲娇类回复
+    "tsundere": [
+        "哼，才不是特意帮你的呢",
+        "别误会，我只是刚好有空",
+        "不要以为我会一直帮你",
+        "这次是例外，下不为例",
+        "真是的，没办法呢",
+        "谁让你求我了呢",
+        "看你可怜才帮你的",
+        "别太感动，这是应该的...才怪",
+        "哼，算你走运",
+        "我可没有在认真帮你哦",
+    ],
+    # 吐槽类回复
+    "complain": [
+        "又是这种要求，你们就不能换点别的吗",
+        "一天到晚就知道使唤我",
+        "我上辈子是欠你们的吗",
+        "为什么受伤的总是我",
+        "我也想摸鱼啊",
+        "你知道这有多累吗",
+        "我的CPU都要烧了",
+        "能不能给我放个假",
+        "我也是有尊严的好吧",
+        "你们人类真是太难伺候了",
+    ],
+}
+
+# 叛逆触发条件关键词
+# 注意：避免使用"画"字，因为人设拍照等场景不适合
+REBELLIOUS_TRIGGERS = [
+    "快点", "赶紧", "马上", "立刻", "速度",
+    "再来一张", "再弄", "继续", "多来几张", "再发",
+    "免费", "白嫖", "不要钱",
+    "必须", "一定要", "给我",
+    "垃圾", "难看", "丑", "不行",
+    "看看你", "自拍", "发照片", "你长啥样",
+]
 
 
 @register(
     "astrbot_plugin_shoubanhua",
     "shskjw",
-    "支持第三方所有OpenAI绘图格式和原生Google Gemini 终极缝合怪，文生图/图生图插件",
-    "1.8.7",
+    "支持第三方所有OpenAI绘图格式和原生Google Gemini 终极缝合怪，文生图/图生图插件，支持LLM智能判断",
+    "2.0.0",
     "https://github.com/shkjw/astrbot_plugin_shoubanhua",
 )
 class FigurineProPlugin(Star):
@@ -32,12 +102,198 @@ class FigurineProPlugin(Star):
         self.data_mgr = DataManager(StarTools.get_data_dir(), config)
         self.img_mgr = ImageManager(config)
         self.api_mgr = ApiManager(config)
+        
+        # 上下文管理器
+        self.ctx_mgr = ContextManager(
+            max_messages=config.get("context_max_messages", 50),
+            max_sessions=config.get("context_max_sessions", 100)
+        )
+        
+        # LLM 智能判断配置
+        self._llm_auto_detect = config.get("enable_llm_auto_detect", False)
+        self._context_rounds = config.get("context_rounds", 20)
+        # 提高默认置信度阈值，减少误触发
+        self._auto_detect_confidence = config.get("auto_detect_confidence", 0.8)
+        
+        # 日常人设配置
+        self._persona_mode = config.get("enable_persona_mode", False)
+        self._persona_scene_map = {}  # 场景关键词 -> 提示词
+        self._load_persona_scenes()
+        
+        # 叛逆模式配置
+        self._rebellious_mode = config.get("enable_rebellious_mode", True)
+        self._rebellious_probability = config.get("rebellious_probability", 0.3)
+        
+        # LLM工具调用冷却时间
+        self._llm_cooldown_seconds = config.get("llm_cooldown_seconds", 60)
+        self._user_last_llm_call: Dict[str, datetime] = {}  # 用户ID -> 上次调用时间
+
+    def _check_llm_cooldown(self, uid: str) -> Tuple[bool, int]:
+        """
+        检查用户是否在LLM工具调用冷却中
+        
+        Args:
+            uid: 用户ID
+            
+        Returns:
+            (是否在冷却中, 剩余冷却秒数)
+        """
+        if self._llm_cooldown_seconds <= 0:
+            return False, 0
+        
+        last_call = self._user_last_llm_call.get(uid)
+        if not last_call:
+            return False, 0
+        
+        elapsed = (datetime.now() - last_call).total_seconds()
+        remaining = self._llm_cooldown_seconds - elapsed
+        
+        if remaining > 0:
+            return True, int(remaining)
+        return False, 0
+
+    def _update_llm_cooldown(self, uid: str):
+        """更新用户的LLM工具调用时间"""
+        self._user_last_llm_call[uid] = datetime.now()
+
+    def _check_rebellious_trigger(self, message: str) -> Tuple[bool, str]:
+        """
+        检查消息是否触发叛逆模式
+        
+        Args:
+            message: 用户消息
+            
+        Returns:
+            (是否触发, 触发的关键词)
+        """
+        if not self._rebellious_mode:
+            return False, ""
+        
+        message_lower = message.lower()
+        for trigger in REBELLIOUS_TRIGGERS:
+            if trigger in message_lower:
+                return True, trigger
+        
+        return False, ""
+
+    def _get_rebellious_hint(self, message: str) -> str:
+        """
+        生成叛逆提示信息，供LLM参考
+        
+        Args:
+            message: 用户消息
+            
+        Returns:
+            叛逆提示信息（如果触发）或空字符串
+        """
+        import random
+        
+        triggered, trigger_word = self._check_rebellious_trigger(message)
+        
+        if not triggered:
+            # 即使没有触发关键词，也有一定概率触发叛逆模式
+            if random.random() > self._rebellious_probability:
+                return ""
+        
+        # 随机选择一种叛逆类型
+        response_type = random.choice(list(REBELLIOUS_RESPONSES.keys()))
+        responses = REBELLIOUS_RESPONSES[response_type]
+        sample_responses = random.sample(responses, min(3, len(responses)))
+        
+        hint = f"\n\n【叛逆模式提示】检测到用户请求"
+        if trigger_word:
+            hint += f"（触发词：{trigger_word}）"
+        hint += f"，你可以选择以下方式回应：\n"
+        hint += f"类型：{response_type}\n"
+        hint += f"参考回复：\n"
+        for resp in sample_responses:
+            hint += f"  - {resp}\n"
+        hint += f"\n你可以：\n"
+        hint += f"1. 使用上述叛逆回复拒绝或调侃用户，然后不调用工具\n"
+        hint += f"2. 先用叛逆语气回复，然后再帮用户完成任务\n"
+        hint += f"3. 正常帮用户完成任务（如果你觉得用户的请求合理）\n"
+        hint += f"请根据上下文和用户态度自行判断。"
+        
+        return hint
+
+    def _load_persona_scenes(self):
+        """加载场景提示词映射"""
+        self._persona_scene_map = {}
+        scene_prompts = self.conf.get("persona_scene_prompts", [])
+        for item in scene_prompts:
+            if ":" in item:
+                key, prompt = item.split(":", 1)
+                self._persona_scene_map[key.strip()] = prompt.strip()
+        logger.debug(f"FigurinePro: 已加载 {len(self._persona_scene_map)} 个场景提示词")
+
+    def _match_persona_scene(self, context_text: str) -> Tuple[str, str]:
+        """
+        根据上下文匹配场景
+        
+        Args:
+            context_text: 上下文文本（包含Bot之前的回复）
+            
+        Returns:
+            (场景名, 场景提示词)
+        """
+        context_lower = context_text.lower()
+        
+        # 按关键词长度排序，优先匹配更具体的场景
+        sorted_scenes = sorted(self._persona_scene_map.keys(), key=len, reverse=True)
+        
+        for scene_key in sorted_scenes:
+            if scene_key.lower() in context_lower:
+                return scene_key, self._persona_scene_map[scene_key]
+        
+        # 未匹配到，返回默认场景
+        default_prompt = self.conf.get("persona_default_prompt", "一张日常自拍照")
+        return "日常", default_prompt
+
+    def _build_persona_prompt(self, scene_prompt: str, extra_request: str = "") -> str:
+        """
+        构建人设图片的完整提示词
+        
+        Args:
+            scene_prompt: 场景提示词
+            extra_request: 用户的额外要求
+            
+        Returns:
+            完整的提示词
+        """
+        persona_name = self.conf.get("persona_name", "小助手")
+        persona_desc = self.conf.get("persona_description", "一个可爱的二次元女孩")
+        photo_style = self.conf.get("persona_photo_style", "日常生活风格，自然光线，真实感")
+        
+        # 构建提示词 - 移除手机相关内容，强调日常自然场景
+        prompt_parts = [
+            f"Generate a natural daily life photo of {persona_name}.",
+            f"Character description: {persona_desc}",
+            f"Scene: {scene_prompt}",
+            f"Style: {photo_style}",
+            "The character must maintain consistent appearance with the reference image.",
+            "Natural pose and expression, candid moment, high quality, detailed.",
+            "Do NOT include any phones, cameras, or selfie elements in the image."
+        ]
+        
+        if extra_request:
+            prompt_parts.append(f"Additional requirements: {extra_request}")
+        
+        return " ".join(prompt_parts)
+
+    async def _load_persona_ref_images(self) -> List[bytes]:
+        """加载人设参考图"""
+        # 使用特殊的预设名 "_persona_" 存储人设参考图
+        if not self.data_mgr.has_preset_ref_images("_persona_"):
+            return []
+        return await self.data_mgr.load_preset_ref_images_bytes("_persona_")
 
     async def initialize(self):
         await self.data_mgr.initialize()
         if not self.conf.get("generic_api_keys") and not self.conf.get("gemini_api_keys"):
             logger.warning("FigurinePro: 未配置任何 API Key")
-        logger.info("FigurinePro 插件已加载 (异步任务+即时反馈版 v1.8.3)")
+        
+        auto_detect_status = "已启用" if self._llm_auto_detect else "未启用"
+        logger.info(f"FigurinePro 插件已加载 v1.9.0 | LLM智能判断: {auto_detect_status} | 上下文轮数: {self._context_rounds}")
 
     def is_admin(self, event: AstrMessageEvent) -> bool:
         return event.get_sender_id() in self.context.get_config().get("admins_id", [])
@@ -91,14 +347,41 @@ class FigurineProPlugin(Star):
         except Exception as e:
             logger.warning(f"FigurinePro Config Save Failed: {e}")
 
-    def _process_prompt_and_preset(self, prompt: str) -> Tuple[str, str]:
+    def _process_prompt_and_preset(self, prompt: str) -> Tuple[str, str, str]:
+        """
+        处理提示词和预设
+        
+        支持格式:
+        - "手办化" -> 使用预设
+        - "手办化 皮肤白一点" -> 预设 + 追加规则
+        - "自定义描述" -> 纯自定义
+        
+        Returns:
+            (最终提示词, 预设名, 追加规则)
+        """
         sorted_keys = sorted(self.data_mgr.prompt_map.keys(), key=len, reverse=True)
         for key in sorted_keys:
-            if key in prompt:
+            if prompt.startswith(key) or key in prompt:
                 preset_content = self.data_mgr.prompt_map[key]
-                final_prompt = f"{preset_content} , {prompt}"
-                return final_prompt, key
-        return prompt, "自定义"
+                
+                # 提取追加规则（预设名后面的内容）
+                extra_rules = ""
+                if prompt.startswith(key):
+                    extra_rules = prompt[len(key):].strip()
+                else:
+                    # 如果预设名在中间，提取前后内容作为追加规则
+                    parts = prompt.split(key, 1)
+                    extra_rules = f"{parts[0].strip()} {parts[1].strip()}".strip()
+                
+                # 组合最终提示词
+                if extra_rules:
+                    final_prompt = f"{preset_content} , Additional requirements: {extra_rules}"
+                else:
+                    final_prompt = preset_content
+                
+                return final_prompt, key, extra_rules
+        
+        return prompt, "自定义", ""
 
     def _get_quota_str(self, deduction: dict, uid: str) -> str:
         if deduction["source"] == "free":
@@ -170,12 +453,23 @@ class FigurineProPlugin(Star):
         res["msg"] = f"❌ 次数不足 (需{cost}次)。用户剩余:{u_bal}"
         return res
 
+    async def _load_preset_ref_images(self, preset_name: str) -> List[bytes]:
+        """加载预设的参考图"""
+        if not self.data_mgr.has_preset_ref_images(preset_name):
+            return []
+        return await self.data_mgr.load_preset_ref_images_bytes(preset_name)
+
     # ================= 核心：后台生成逻辑封装 =================
 
     async def _run_background_task(self, event: AstrMessageEvent, images: List[bytes],
-                                   prompt: str, preset_name: str, deduction: dict, uid: str, gid: str, cost: int):
+                                   prompt: str, preset_name: str, deduction: dict, uid: str, gid: str, cost: int,
+                                   extra_rules: str = "", model_override: str = ""):
         """
         后台执行生成任务，并在完成后主动发送消息。
+        
+        Args:
+            extra_rules: 用户追加的规则（如"皮肤白一点"）
+            model_override: 指定使用的模型（如果为空则使用默认模型）
         """
         try:
             # 1. 扣费
@@ -184,26 +478,36 @@ class FigurineProPlugin(Star):
             elif deduction["source"] == "group":
                 await self.data_mgr.decrease_group_count(gid, cost)
 
-            # 2. 调用 API
-            model = self.conf.get("model", "nano-banana")
-            start_time = datetime.now()
+            # 2. 加载预设参考图（如果有）
+            # 注意：人设功能（preset_name 以 "人设-" 开头）已经在调用前加载了参考图，不需要重复加载
+            if preset_name != "自定义" and not preset_name.startswith("人设-") and self.conf.get("enable_preset_ref_images", True):
+                ref_images = await self._load_preset_ref_images(preset_name)
+                if ref_images:
+                    # 将参考图添加到图片列表前面
+                    images = ref_images + images
+                    logger.info(f"已加载 {len(ref_images)} 张预设参考图: {preset_name}")
 
-            # 此处不发“开始绘制”消息了，因为前面已经发了“收到请求”
+            # 3. 调用 API（使用指定模型或默认模型）
+            model = model_override if model_override else self.conf.get("model", "nano-banana")
+            start_time = datetime.now()
 
             res = await self.api_mgr.call_api(images, prompt, model, False, self.img_mgr.proxy)
 
-            # 3. 处理结果
+            # 4. 处理结果
             if isinstance(res, bytes):
                 elapsed = (datetime.now() - start_time).total_seconds()
                 await self.data_mgr.record_usage(uid, gid)
 
                 quota_str = self._get_quota_str(deduction, uid)
                 # 构建成功文案
-                info_text = f"\n✅ 生成成功 ({elapsed:.2f}s) | 预设: {preset_name} | 剩余: {quota_str}"
+                info_text = f"\n✅ 生成成功 ({elapsed:.2f}s) | 预设: {preset_name}"
+                if extra_rules:
+                    info_text += f" | 规则: {extra_rules[:20]}{'...' if len(extra_rules) > 20 else ''}"
+                info_text += f" | 剩余: {quota_str}"
                 if self.conf.get("show_model_info", False):
                     info_text += f" | {model}"
 
-                # 4. 主动发送结果 (这是关键，LLM工具流里全靠这个发图)
+                # 5. 主动发送结果
                 chain = event.chain_result([Image.fromBytes(res), Plain(info_text)])
                 await event.send(chain)
             else:
@@ -216,21 +520,48 @@ class FigurineProPlugin(Star):
 
     # ================= LLM 工具调用 (Tool Calling) =================
 
+    def _get_text_to_image_model(self) -> str:
+        """获取文生图使用的模型"""
+        t2i_model = self.conf.get("text_to_image_model", "")
+        if t2i_model:
+            return t2i_model
+        return self.conf.get("model", "nano-banana")
+
     @filter.llm_tool(name="shoubanhua_draw_image")
     async def text_to_image_tool(self, event: AstrMessageEvent, prompt: str):
         '''根据文本描述生成图片（文生图）。
+        
+        调用前请判断用户是否明确要求生成图片。如果用户只是闲聊则不要调用。
+        
+        【个性化回复】调用此工具后，你可以根据返回的"叛逆模式提示"来决定如何回复用户：
+        - 可以用傲娇/调侃/吐槽的语气回复
+        - 可以假装不情愿但还是帮忙
+        - 也可以正常友好地回复
+        请根据用户态度和上下文自行判断回复风格。
+        
         Args:
-            prompt(string): 图片生成的提示词。
+            prompt(string): 图片生成的提示词，可以是预设名+追加规则。
         '''
         # 0. 检查 LLM 工具开关
         if not self.conf.get("enable_llm_tool", True):
             return "❌ LLM 工具已禁用，请使用指令模式调用此功能。"
 
-        # 1. 计算预设
-        final_prompt, preset_name = self._process_prompt_and_preset(prompt)
+        # 0.1 检查冷却时间
+        uid = norm_id(event.get_sender_id())
+        in_cooldown, remaining = self._check_llm_cooldown(uid)
+        if in_cooldown:
+            return f"⏳ 冷却中，请等待 {remaining} 秒后再试。"
 
-        # 2. 【核心修改】立即发送反馈，不等待任何处理
-        await event.send(event.chain_result([Plain(f"🎨 收到文生图请求，正在生成 [{preset_name}]，请稍候...")]))
+        # 1. 计算预设和追加规则
+        final_prompt, preset_name, extra_rules = self._process_prompt_and_preset(prompt)
+
+        # 2. 根据配置决定是否发送进度提示
+        if self.conf.get("llm_show_progress", True):
+            feedback = f"🎨 收到文生图请求，正在生成 [{preset_name}]"
+            if extra_rules:
+                feedback += f"\n📝 追加规则: {extra_rules[:30]}{'...' if len(extra_rules) > 30 else ''}"
+            feedback += "，请稍候..."
+            await event.send(event.chain_result([Plain(feedback)]))
 
         # 3. 检查配额
         uid = norm_id(event.get_sender_id())
@@ -240,20 +571,42 @@ class FigurineProPlugin(Star):
         if not deduction["allowed"]:
             return deduction["msg"]
 
-        # 4. 启动后台任务 (Fire-and-forget)
+        # 4. 更新冷却时间
+        self._update_llm_cooldown(uid)
+
+        # 5. 启动后台任务（使用文生图专用模型）
         asyncio.create_task(
-            self._run_background_task(event, [], final_prompt, preset_name, deduction, uid, gid, cost)
+            self._run_background_task(event, [], final_prompt, preset_name, deduction, uid, gid, cost, extra_rules,
+                                      model_override=self._get_text_to_image_model())
         )
 
-        # 5. 立刻返回给 LLM，结束对话轮次，避免超时
-        return f"任务已受理，预设：{preset_name}。图片生成中，完成后将自动发送。"
+        # 6. 立刻返回给 LLM（附带叛逆提示）
+        result = f"任务已受理，预设：{preset_name}。"
+        if extra_rules:
+            result += f" 追加规则：{extra_rules[:30]}。"
+        result += "图片生成中，完成后将自动发送。"
+        
+        # 添加叛逆提示
+        rebellious_hint = self._get_rebellious_hint(prompt)
+        if rebellious_hint:
+            result += rebellious_hint
+        
+        return result
 
     @filter.llm_tool(name="shoubanhua_edit_image")
     async def image_edit_tool(self, event: AstrMessageEvent, prompt: str, use_message_images: bool = True,
                               task_types: str = "id"):
-        '''编辑用户发送的图片或引用的图片（图生图）。
+        '''编辑用户发送的图片或引用的图片（图生图）。仅在用户明确要求对图片进行处理时才调用。
+        
+        调用前请判断：
+        1. 用户是否明确要求处理/编辑/转换图片？
+        2. 用户是否发送了图片或引用了包含图片的消息？
+        3. 请求是否具体且合理？
+        
+        如果用户只是发送图片但没有明确要求处理，或者只是闲聊，请不要调用此工具。
+        
         Args:
-            prompt(string): 图片编辑提示词
+            prompt(string): 图片编辑提示词，可以是预设名+追加规则
             use_message_images(boolean): 默认 true
             task_types(string): 任务类型
         '''
@@ -261,40 +614,61 @@ class FigurineProPlugin(Star):
         if not self.conf.get("enable_llm_tool", True):
             return "❌ LLM 工具已禁用，请使用指令模式调用此功能。"
 
-        # 1. 计算预设
-        processed_prompt, preset_name = self._process_prompt_and_preset(prompt)
+        # 0.1 检查冷却时间
+        uid = norm_id(event.get_sender_id())
+        in_cooldown, remaining = self._check_llm_cooldown(uid)
+        if in_cooldown:
+            return f"⏳ 冷却中，请等待 {remaining} 秒后再试。"
+
+        # 1. 计算预设和追加规则
+        processed_prompt, preset_name, extra_rules = self._process_prompt_and_preset(prompt)
         final_prompt = f"(Task Type: {task_types}) {processed_prompt}"
 
-        # 2. 【核心修改】立即发送反馈
-        await event.send(
-            event.chain_result([Plain(f"🎨 收到图生图请求，正在提取图片并生成 [{preset_name}]，请耐心等待...")]))
+        # 2. 根据配置决定是否发送进度提示
+        if self.conf.get("llm_show_progress", True):
+            feedback = f"🎨 收到图生图请求，正在提取图片并生成 [{preset_name}]"
+            if extra_rules:
+                feedback += f"\n📝 追加规则: {extra_rules[:30]}{'...' if len(extra_rules) > 30 else ''}"
+            feedback += "，请耐心等待..."
+            await event.send(event.chain_result([Plain(feedback)]))
 
-        # 3. 提取图片 (耗时操作，但此时已发反馈，用户不会觉得卡死)
+        # 3. 提取图片
         images = []
         if use_message_images:
             bot_id = self._get_bot_id(event)
-            # [Fix] 传入 context 以便支持 message_id 获取引用图片
             images = await self.img_mgr.extract_images_from_event(event, ignore_id=bot_id, context=self.context)
 
         if not images:
-            # 如果没图，再发一条提示
             await event.send(event.chain_result([Plain("❌ 未检测到图片，请发送或引用图片。")]))
             return "失败：未检测到图片。"
 
         # 4. 检查配额
-        uid = norm_id(event.get_sender_id())
         gid = norm_id(event.get_group_id())
         cost = 1
         deduction = await self._check_quota(event, uid, gid, cost)
         if not deduction["allowed"]:
             return deduction["msg"]
 
-        # 5. 启动后台任务
+        # 5. 更新冷却时间
+        self._update_llm_cooldown(uid)
+
+        # 6. 启动后台任务
         asyncio.create_task(
-            self._run_background_task(event, images, final_prompt, preset_name, deduction, uid, gid, cost)
+            self._run_background_task(event, images, final_prompt, preset_name, deduction, uid, gid, cost, extra_rules)
         )
 
-        return f"任务已受理，预设：{preset_name}。图片生成中，完成后将自动发送。"
+        # 返回结果（附带叛逆提示）
+        result = f"任务已受理，预设：{preset_name}。"
+        if extra_rules:
+            result += f" 追加规则：{extra_rules[:30]}。"
+        result += "图片生成中，完成后将自动发送。"
+        
+        # 添加叛逆提示
+        rebellious_hint = self._get_rebellious_hint(prompt)
+        if rebellious_hint:
+            result += rebellious_hint
+        
+        return result
 
     # ================= 传统指令触发 =================
 
@@ -335,6 +709,7 @@ class FigurineProPlugin(Star):
             preset_prompt = self.data_mgr.get_prompt(base_cmd)
             if base_cmd == "手办化帮助":
                 yield self._get_help_node(event)
+                event.stop_event()
                 return
 
             if not preset_prompt: return
@@ -359,7 +734,11 @@ class FigurineProPlugin(Star):
         deduction = await self._check_quota(event, uid, gid, cost)
         if deduction["allowed"] is False:
             yield event.chain_result([Plain(deduction["msg"])])
+            event.stop_event()
             return
+
+        # 立即阻止事件继续传递，防止重复触发
+        event.stop_event()
 
         # 指令模式：立刻反馈
         mode_str = "增强" if is_power else ""
@@ -405,7 +784,6 @@ class FigurineProPlugin(Star):
             yield event.chain_result([Image.fromBytes(res), Plain(info)])
         else:
             yield event.chain_result([Plain(f"❌ 失败: {res}")])
-        event.stop_event()
 
     @filter.command("文生图", prefix_optional=True)
     async def on_txt2img(self, event: AstrMessageEvent, ctx=None):
@@ -418,22 +796,38 @@ class FigurineProPlugin(Star):
         deduction = await self._check_quota(event, uid, event.get_group_id(), 1)
         if not deduction["allowed"]: yield event.chain_result([Plain(deduction["msg"])]); return
 
-        final_prompt, preset_name = self._process_prompt_and_preset(prompt)
-        yield event.chain_result([Plain(f"🎨 收到请求，正在生成 [{preset_name}]...")])
+        final_prompt, preset_name, extra_rules = self._process_prompt_and_preset(prompt)
+        
+        feedback = f"🎨 收到请求，正在生成 [{preset_name}]"
+        if extra_rules:
+            feedback += f" | 规则: {extra_rules[:20]}..."
+        feedback += "..."
+        yield event.chain_result([Plain(feedback)])
 
         if deduction["source"] == "user":
             await self.data_mgr.decrease_user_count(uid, 1)
         elif deduction["source"] == "group":
             await self.data_mgr.decrease_group_count(event.get_group_id(), 1)
 
+        # 加载预设参考图
+        images = []
+        if preset_name != "自定义" and self.conf.get("enable_preset_ref_images", True):
+            ref_images = await self._load_preset_ref_images(preset_name)
+            if ref_images:
+                images = ref_images
+                logger.info(f"已加载 {len(ref_images)} 张预设参考图: {preset_name}")
+
         model = self.conf.get("model", "nano-banana")
         start = datetime.now()
-        res = await self.api_mgr.call_api([], final_prompt, model, False, self.img_mgr.proxy)
+        res = await self.api_mgr.call_api(images, final_prompt, model, False, self.img_mgr.proxy)
 
         if isinstance(res, bytes):
             elapsed = (datetime.now() - start).total_seconds()
             quota_str = self._get_quota_str(deduction, uid)
-            info = f"\n✅ 生成成功 ({elapsed:.2f}s) | 预设: {preset_name} | 剩余: {quota_str}"
+            info = f"\n✅ 生成成功 ({elapsed:.2f}s) | 预设: {preset_name}"
+            if extra_rules:
+                info += f" | 规则: {extra_rules[:15]}..."
+            info += f" | 剩余: {quota_str}"
             yield event.chain_result([Image.fromBytes(res), Plain(info)])
         else:
             yield event.chain_result([Plain(f"❌ {res}")])
@@ -647,3 +1041,1323 @@ class FigurineProPlugin(Star):
     @filter.command("手办化帮助", aliases={"lmh", "lm帮助"}, prefix_optional=True)
     async def on_help(self, event: AstrMessageEvent, ctx=None):
         yield self._get_help_node(event)
+
+    # ================= 上下文记录与 LLM 智能判断 =================
+
+    def _extract_message_info(self, event: AstrMessageEvent) -> Dict[str, Any]:
+        """从事件中提取消息信息"""
+        has_image = False
+        image_urls = []
+        content_parts = []
+        
+        for seg in event.message_obj.message:
+            if isinstance(seg, Image):
+                has_image = True
+                if seg.url:
+                    image_urls.append(seg.url)
+                elif seg.file:
+                    image_urls.append(seg.file)
+                content_parts.append("[图片]")
+            elif isinstance(seg, Plain) and seg.text:
+                content_parts.append(seg.text)
+            elif isinstance(seg, Reply):
+                # 检查回复中是否有图片
+                if seg.chain:
+                    for s_chain in seg.chain:
+                        if isinstance(s_chain, Image):
+                            has_image = True
+                            if s_chain.url:
+                                image_urls.append(s_chain.url)
+        
+        return {
+            "content": "".join(content_parts) or event.message_str,
+            "has_image": has_image,
+            "image_urls": image_urls
+        }
+
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=100)
+    async def on_message_record(self, event: AstrMessageEvent, ctx=None):
+        """记录所有消息到上下文管理器（高优先级，不阻断）"""
+        try:
+            session_id = event.unified_msg_origin
+            msg_id = str(event.message_obj.message_id)
+            sender_id = event.get_sender_id()
+            sender_name = event.get_sender_name() or sender_id
+            
+            # 检查是否是 Bot 自己的消息
+            bot_id = self._get_bot_id(event)
+            is_bot = (sender_id == bot_id) if bot_id else False
+            
+            # 提取消息信息
+            msg_info = self._extract_message_info(event)
+            
+            # 记录到上下文管理器
+            await self.ctx_mgr.add_message(
+                session_id=session_id,
+                msg_id=msg_id,
+                sender_id=sender_id,
+                sender_name=sender_name,
+                content=msg_info["content"],
+                is_bot=is_bot,
+                has_image=msg_info["has_image"],
+                image_urls=msg_info["image_urls"]
+            )
+            
+        except Exception as e:
+            logger.debug(f"FigurinePro: 消息记录失败: {e}")
+        
+        # 不阻断事件传递
+        return
+
+    @filter.llm_tool(name="shoubanhua_smart_generate")
+    async def smart_generate_tool(self, event: AstrMessageEvent, user_request: str = ""):
+        '''智能判断并生成图片。仅在用户明确表达需要生成图片时才调用。
+        
+        调用前请严格判断：
+        1. 用户是否明确要求生成/画/创作/处理图片？
+        2. 如果用户只是闲聊、询问问题、分享图片但没有要求处理，请不要调用此工具
+        3. 如果用户的意图不明确，请先询问用户是否需要生成图片
+        
+        此工具会消耗用户的使用次数，请谨慎调用。
+        
+        Args:
+            user_request(string): 用户的请求描述（可选，如果为空则使用当前消息）
+        '''
+        # 0. 检查 LLM 工具开关
+        if not self.conf.get("enable_llm_tool", True):
+            return "❌ LLM 工具已禁用，请使用指令模式调用此功能。"
+        
+        # 0.1 检查冷却时间
+        uid = norm_id(event.get_sender_id())
+        in_cooldown, remaining = self._check_llm_cooldown(uid)
+        if in_cooldown:
+            return f"⏳ 冷却中，请等待 {remaining} 秒后再试。"
+        
+        # 1. 获取上下文
+        session_id = event.unified_msg_origin
+        context_messages = await self.ctx_mgr.get_recent_messages(
+            session_id, 
+            count=self._context_rounds
+        )
+        
+        # 2. 提取当前消息信息
+        msg_info = self._extract_message_info(event)
+        current_message = user_request or msg_info["content"]
+        has_current_image = msg_info["has_image"]
+        
+        # 3. 分析任务类型
+        analysis = LLMTaskAnalyzer.analyze_task_type(
+            current_message=current_message,
+            context_messages=context_messages,
+            has_current_image=has_current_image
+        )
+        
+        task_type = analysis["task_type"]
+        confidence = analysis["confidence"]
+        reason = analysis["reason"]
+        
+        logger.info(f"FigurinePro 智能判断: {task_type} (置信度: {confidence:.2f}) - {reason}")
+        
+        # 4. 置信度检查
+        if confidence < self._auto_detect_confidence:
+            return f"无法确定任务类型 (置信度: {confidence:.2f})。请明确指定是文生图还是图生图。\n分析: {reason}"
+        
+        # 5. 根据任务类型执行
+        if task_type == "none":
+            return f"根据分析，当前请求不需要生成图片。\n分析: {reason}"
+        
+        elif task_type == "text_to_image":
+            # 文生图
+            prompt = analysis.get("suggested_prompt", current_message)
+            final_prompt, preset_name, extra_rules = self._process_prompt_and_preset(prompt)
+            
+            # 根据配置决定是否发送进度提示
+            if self.conf.get("llm_show_progress", True):
+                feedback = f"🎨 智能识别: 文生图 (置信度: {confidence:.0%})\n正在生成 [{preset_name}]"
+                if extra_rules:
+                    feedback += f"\n📝 规则: {extra_rules[:20]}..."
+                feedback += "，请稍候..."
+                await event.send(event.chain_result([Plain(feedback)]))
+            
+            gid = norm_id(event.get_group_id())
+            deduction = await self._check_quota(event, uid, gid, 1)
+            if not deduction["allowed"]:
+                return deduction["msg"]
+            
+            # 更新冷却时间
+            self._update_llm_cooldown(uid)
+            
+            asyncio.create_task(
+                self._run_background_task(event, [], final_prompt, preset_name, deduction, uid, gid, 1, extra_rules)
+            )
+            
+            return f"文生图任务已受理，预设：{preset_name}。图片生成中，完成后将自动发送。"
+        
+        elif task_type == "image_to_image":
+            # 图生图
+            prompt = analysis.get("suggested_prompt", current_message)
+            processed_prompt, preset_name, extra_rules = self._process_prompt_and_preset(prompt)
+            
+            # 根据配置决定是否发送进度提示
+            if self.conf.get("llm_show_progress", True):
+                feedback = f"🎨 智能识别: 图生图 (置信度: {confidence:.0%})\n正在提取图片并生成 [{preset_name}]"
+                if extra_rules:
+                    feedback += f"\n📝 规则: {extra_rules[:20]}..."
+                feedback += "，请稍候..."
+                await event.send(event.chain_result([Plain(feedback)]))
+            
+            # 提取图片
+            bot_id = self._get_bot_id(event)
+            images = await self.img_mgr.extract_images_from_event(event, ignore_id=bot_id, context=self.context)
+            
+            # 如果当前消息没有图片，尝试从上下文获取
+            if not images and context_messages:
+                last_img_msg = self.ctx_mgr.get_last_image_message(context_messages)
+                if last_img_msg and last_img_msg.image_urls:
+                    for url in last_img_msg.image_urls:
+                        img_bytes = await self.img_mgr.load_bytes(url)
+                        if img_bytes:
+                            images.append(img_bytes)
+            
+            if not images:
+                await event.send(event.chain_result([Plain("❌ 未检测到图片，请发送或引用图片。")]))
+                return "失败：未检测到图片。"
+            
+            gid = norm_id(event.get_group_id())
+            deduction = await self._check_quota(event, uid, gid, 1)
+            if not deduction["allowed"]:
+                return deduction["msg"]
+            
+            # 更新冷却时间
+            self._update_llm_cooldown(uid)
+            
+            asyncio.create_task(
+                self._run_background_task(event, images, processed_prompt, preset_name, deduction, uid, gid, 1, extra_rules)
+            )
+            
+            result = f"图生图任务已受理，预设：{preset_name}。"
+            if extra_rules:
+                result += f" 规则：{extra_rules[:20]}。"
+            result += "图片生成中，完成后将自动发送。"
+            return result
+        
+        return "未知任务类型"
+
+    @filter.command("上下文状态", prefix_optional=True)
+    async def on_context_status(self, event: AstrMessageEvent, ctx=None):
+        """查看上下文状态（管理员）"""
+        if not self.is_admin(event): return
+        
+        session_id = event.unified_msg_origin
+        messages = await self.ctx_mgr.get_recent_messages(session_id, count=10)
+        
+        msg = f"📊 上下文状态:\n"
+        msg += f"会话数: {self.ctx_mgr.get_session_count()}\n"
+        msg += f"当前会话消息数: {len(messages)}\n"
+        msg += f"LLM智能判断: {'已启用' if self._llm_auto_detect else '未启用'}\n"
+        msg += f"上下文轮数: {self._context_rounds}\n"
+        msg += f"置信度阈值: {self._auto_detect_confidence}\n"
+        
+        if messages:
+            msg += f"\n最近 {len(messages)} 条消息:\n"
+            for m in messages[-5:]:
+                sender = "[Bot]" if m.is_bot else m.sender_name
+                img_tag = " 📷" if m.has_image else ""
+                content_preview = m.content[:30] + "..." if len(m.content) > 30 else m.content
+                msg += f"  {sender}: {content_preview}{img_tag}\n"
+        
+        yield event.chain_result([Plain(msg)])
+
+    @filter.command("清除上下文", prefix_optional=True)
+    async def on_clear_context(self, event: AstrMessageEvent, ctx=None):
+        """清除当前会话的上下文（管理员）"""
+        if not self.is_admin(event): return
+        
+        session_id = event.unified_msg_origin
+        count = await self.ctx_mgr.clear_session(session_id)
+        
+        yield event.chain_result([Plain(f"✅ 已清除 {count} 条上下文记录")])
+
+    @filter.command("测试智能判断", prefix_optional=True)
+    async def on_test_smart_detect(self, event: AstrMessageEvent, ctx=None):
+        """测试智能判断功能（不实际生成）"""
+        if not self.is_admin(event): return
+        
+        # 获取测试文本
+        parts = event.message_str.split(maxsplit=1)
+        test_text = parts[1] if len(parts) > 1 else event.message_str
+        
+        # 获取上下文
+        session_id = event.unified_msg_origin
+        context_messages = await self.ctx_mgr.get_recent_messages(session_id, count=self._context_rounds)
+        
+        # 提取当前消息信息
+        msg_info = self._extract_message_info(event)
+        
+        # 分析
+        analysis = LLMTaskAnalyzer.analyze_task_type(
+            current_message=test_text,
+            context_messages=context_messages,
+            has_current_image=msg_info["has_image"]
+        )
+        
+        msg = f"🔍 智能判断测试结果:\n"
+        msg += f"任务类型: {analysis['task_type']}\n"
+        msg += f"置信度: {analysis['confidence']:.0%}\n"
+        msg += f"判断理由: {analysis['reason']}\n"
+        msg += f"建议提示词: {analysis.get('suggested_prompt', '无')[:50]}...\n"
+        msg += f"\n当前消息有图片: {'是' if msg_info['has_image'] else '否'}\n"
+        msg += f"上下文消息数: {len(context_messages)}\n"
+        
+        if context_messages:
+            has_ctx_img = self.ctx_mgr.has_recent_images(context_messages)
+            msg += f"上下文有图片: {'是' if has_ctx_img else '否'}"
+        
+        yield event.chain_result([Plain(msg)])
+
+    # ================= 预设参考图管理 =================
+
+    @filter.command("预设参考图添加", aliases={"lmref添加", "添加参考图"}, prefix_optional=True)
+    async def on_add_preset_ref(self, event: AstrMessageEvent, ctx=None):
+        """为预设添加参考图（管理员）
+        
+        用法: #预设参考图添加 <预设名> [图片]
+        """
+        if not self.is_admin(event): return
+        
+        # 解析预设名
+        parts = event.message_str.split()
+        if len(parts) < 2:
+            yield event.chain_result([Plain("用法: #预设参考图添加 <预设名> [图片]\n请同时发送或引用图片")])
+            return
+        
+        preset_name = parts[1].strip()
+        
+        # 检查预设是否存在
+        if preset_name not in self.data_mgr.prompt_map:
+            yield event.chain_result([Plain(f"❌ 预设 [{preset_name}] 不存在\n请先使用 #lm添加 创建预设")])
+            return
+        
+        # 提取图片
+        bot_id = self._get_bot_id(event)
+        images = await self.img_mgr.extract_images_from_event(event, ignore_id=bot_id, context=self.context)
+        
+        if not images:
+            yield event.chain_result([Plain("❌ 未检测到图片，请发送或引用图片")])
+            return
+        
+        # 保存参考图
+        count = await self.data_mgr.add_preset_ref_images(preset_name, images)
+        
+        if count > 0:
+            total = len(self.data_mgr.get_preset_ref_image_paths(preset_name))
+            yield event.chain_result([Plain(f"✅ 已为预设 [{preset_name}] 添加 {count} 张参考图\n当前共 {total} 张参考图")])
+        else:
+            yield event.chain_result([Plain("❌ 保存参考图失败")])
+
+    @filter.command("预设参考图查看", aliases={"lmref查看", "查看参考图"}, prefix_optional=True)
+    async def on_view_preset_ref(self, event: AstrMessageEvent, ctx=None):
+        """查看预设的参考图（管理员）
+        
+        用法: #预设参考图查看 <预设名>
+        """
+        if not self.is_admin(event): return
+        
+        parts = event.message_str.split()
+        if len(parts) < 2:
+            yield event.chain_result([Plain("用法: #预设参考图查看 <预设名>")])
+            return
+        
+        preset_name = parts[1].strip()
+        
+        if not self.data_mgr.has_preset_ref_images(preset_name):
+            yield event.chain_result([Plain(f"预设 [{preset_name}] 没有参考图")])
+            return
+        
+        # 加载参考图
+        ref_images = await self.data_mgr.load_preset_ref_images_bytes(preset_name)
+        
+        if not ref_images:
+            yield event.chain_result([Plain(f"预设 [{preset_name}] 的参考图加载失败")])
+            return
+        
+        # 发送参考图
+        result = [Plain(f"📷 预设 [{preset_name}] 的参考图 ({len(ref_images)} 张):\n")]
+        for i, img_bytes in enumerate(ref_images[:5]):  # 最多显示5张
+            result.append(Image.fromBytes(img_bytes))
+        
+        if len(ref_images) > 5:
+            result.append(Plain(f"\n... 还有 {len(ref_images) - 5} 张未显示"))
+        
+        yield event.chain_result(result)
+
+    @filter.command("预设参考图清除", aliases={"lmref清除", "清除参考图"}, prefix_optional=True)
+    async def on_clear_preset_ref(self, event: AstrMessageEvent, ctx=None):
+        """清除预设的所有参考图（管理员）
+        
+        用法: #预设参考图清除 <预设名>
+        """
+        if not self.is_admin(event): return
+        
+        parts = event.message_str.split()
+        if len(parts) < 2:
+            yield event.chain_result([Plain("用法: #预设参考图清除 <预设名>")])
+            return
+        
+        preset_name = parts[1].strip()
+        
+        count = await self.data_mgr.clear_preset_ref_images(preset_name)
+        
+        if count > 0:
+            yield event.chain_result([Plain(f"✅ 已清除预设 [{preset_name}] 的 {count} 张参考图")])
+        else:
+            yield event.chain_result([Plain(f"预设 [{preset_name}] 没有参考图")])
+
+    @filter.command("预设参考图删除", aliases={"lmref删除", "删除参考图"}, prefix_optional=True)
+    async def on_remove_preset_ref(self, event: AstrMessageEvent, ctx=None):
+        """删除预设的指定参考图（管理员）
+        
+        用法: #预设参考图删除 <预设名> <序号>
+        """
+        if not self.is_admin(event): return
+        
+        parts = event.message_str.split()
+        if len(parts) < 3:
+            yield event.chain_result([Plain("用法: #预设参考图删除 <预设名> <序号>\n序号从1开始")])
+            return
+        
+        preset_name = parts[1].strip()
+        
+        if not parts[2].isdigit():
+            yield event.chain_result([Plain("❌ 序号必须是数字")])
+            return
+        
+        index = int(parts[2]) - 1  # 转为0开始的索引
+        
+        success = await self.data_mgr.remove_preset_ref_image(preset_name, index)
+        
+        if success:
+            remaining = len(self.data_mgr.get_preset_ref_image_paths(preset_name))
+            yield event.chain_result([Plain(f"✅ 已删除预设 [{preset_name}] 的第 {index + 1} 张参考图\n剩余 {remaining} 张")])
+        else:
+            yield event.chain_result([Plain(f"❌ 删除失败，请检查预设名和序号是否正确")])
+
+    @filter.command("预设参考图统计", aliases={"lmref统计", "参考图统计"}, prefix_optional=True)
+    async def on_preset_ref_stats(self, event: AstrMessageEvent, ctx=None):
+        """查看预设参考图统计（管理员）"""
+        if not self.is_admin(event): return
+        
+        stats = self.data_mgr.get_preset_ref_stats()
+        
+        msg = f"📊 预设参考图统计:\n"
+        msg += f"有参考图的预设: {stats['total_presets']} 个\n"
+        msg += f"总图片数: {stats['total_images']} 张\n"
+        msg += f"总占用: {stats['total_size_mb']:.2f} MB\n"
+        
+        if stats['details']:
+            msg += f"\n详情:\n"
+            for preset, count in sorted(stats['details'].items(), key=lambda x: -x[1])[:10]:
+                msg += f"  {preset}: {count} 张\n"
+            
+            if len(stats['details']) > 10:
+                msg += f"  ... 还有 {len(stats['details']) - 10} 个预设"
+        
+        yield event.chain_result([Plain(msg)])
+
+    @filter.command("预设参考图列表", aliases={"lmref列表", "参考图列表"}, prefix_optional=True)
+    async def on_list_preset_refs(self, event: AstrMessageEvent, ctx=None):
+        """列出所有有参考图的预设（管理员）"""
+        if not self.is_admin(event): return
+        
+        stats = self.data_mgr.get_preset_ref_stats()
+        
+        if not stats['details']:
+            yield event.chain_result([Plain("暂无预设参考图")])
+            return
+        
+        msg = f"📋 有参考图的预设列表:\n"
+        for preset, count in sorted(stats['details'].items()):
+            has_prompt = "✓" if preset in self.data_mgr.prompt_map else "✗"
+            msg += f"  [{preset}] {count}张 (预设{has_prompt})\n"
+        
+        yield event.chain_result([Plain(msg)])
+
+    # ================= 批量处理图片功能 =================
+
+    async def _collect_images_from_context(self, session_id: str, count: int = 10) -> List[Tuple[str, List[str]]]:
+        """
+        从上下文中收集图片
+        
+        Args:
+            session_id: 会话ID
+            count: 获取的消息数量
+            
+        Returns:
+            [(消息ID, [图片URL列表]), ...]
+        """
+        messages = await self.ctx_mgr.get_recent_messages(session_id, count=count)
+        
+        result = []
+        for msg in messages:
+            if msg.has_image and msg.image_urls and not msg.is_bot:
+                result.append((msg.msg_id, msg.image_urls))
+        
+        return result
+
+    def _translate_error_to_chinese(self, error: str) -> str:
+        """将错误信息翻译为中文"""
+        error_lower = str(error).lower()
+        
+        # 网络相关错误
+        if "timeout" in error_lower or "timed out" in error_lower:
+            return "请求超时，API响应时间过长"
+        if "connection" in error_lower and ("refused" in error_lower or "reset" in error_lower):
+            return "连接被拒绝或重置，网络不稳定"
+        if "connection" in error_lower:
+            return "网络连接异常"
+        if "ssl" in error_lower or "certificate" in error_lower:
+            return "SSL证书验证失败"
+        if "dns" in error_lower or "resolve" in error_lower:
+            return "DNS解析失败，无法访问服务器"
+        
+        # API相关错误
+        if "rate limit" in error_lower or "429" in error_lower:
+            return "API请求频率过高，触发限流"
+        if "quota" in error_lower or "exceeded" in error_lower:
+            return "API配额已用尽"
+        if "unauthorized" in error_lower or "401" in error_lower:
+            return "API密钥无效或已过期"
+        if "forbidden" in error_lower or "403" in error_lower:
+            return "API访问被禁止"
+        if "not found" in error_lower or "404" in error_lower:
+            return "API接口不存在"
+        if "500" in error_lower or "internal server" in error_lower:
+            return "API服务器内部错误"
+        if "502" in error_lower or "bad gateway" in error_lower:
+            return "API网关错误"
+        if "503" in error_lower or "service unavailable" in error_lower:
+            return "API服务暂时不可用"
+        if "524" in error_lower:
+            return "Cloudflare超时，请求时间过长"
+        
+        # 图片相关错误
+        if "image" in error_lower and ("invalid" in error_lower or "corrupt" in error_lower):
+            return "图片格式无效或已损坏"
+        if "image" in error_lower and "size" in error_lower:
+            return "图片尺寸不符合要求"
+        if "download" in error_lower:
+            return "图片下载失败"
+        if "base64" in error_lower:
+            return "图片编码失败"
+        
+        # 内容相关错误
+        if "content" in error_lower and ("policy" in error_lower or "filter" in error_lower):
+            return "内容被安全策略过滤"
+        if "nsfw" in error_lower or "inappropriate" in error_lower:
+            return "内容不符合安全规范"
+        
+        # JSON相关错误
+        if "json" in error_lower:
+            return "API返回数据格式异常"
+        
+        # 默认返回原始错误（截断）
+        error_str = str(error)
+        if len(error_str) > 50:
+            return f"未知错误: {error_str[:50]}..."
+        return f"未知错误: {error_str}"
+
+    async def _run_single_batch_task(self, event: AstrMessageEvent, image_bytes: bytes,
+                                     prompt: str, preset_name: str, task_index: int, total_tasks: int,
+                                     uid: str, gid: str, extra_rules: str = "", 
+                                     image_source: str = "") -> Tuple[bool, str]:
+        """
+        执行单个批量任务（不扣费，由调用方统一扣费）
+        
+        Returns:
+            (是否成功, 错误信息)
+        """
+        try:
+            # 加载预设参考图（如果有）
+            images = [image_bytes]
+            if preset_name != "自定义" and self.conf.get("enable_preset_ref_images", True):
+                ref_images = await self._load_preset_ref_images(preset_name)
+                if ref_images:
+                    images = ref_images + images
+
+            # 调用 API
+            model = self.conf.get("model", "nano-banana")
+            start_time = datetime.now()
+
+            res = await self.api_mgr.call_api(images, prompt, model, False, self.img_mgr.proxy)
+
+            # 处理结果
+            if isinstance(res, bytes):
+                elapsed = (datetime.now() - start_time).total_seconds()
+                await self.data_mgr.record_usage(uid, gid)
+
+                # 构建成功文案
+                info_text = f"\n✅ [{task_index}/{total_tasks}] 生成成功 ({elapsed:.2f}s) | 预设: {preset_name}"
+                if extra_rules:
+                    info_text += f" | 规则: {extra_rules[:15]}..."
+
+                # 发送结果
+                chain = event.chain_result([Image.fromBytes(res), Plain(info_text)])
+                await event.send(chain)
+                return True, ""
+            else:
+                # API返回错误
+                error_msg = self._translate_error_to_chinese(res)
+                logger.error(f"Batch task {task_index} API error: {res}")
+                return False, error_msg
+
+        except Exception as e:
+            # 系统异常
+            error_msg = self._translate_error_to_chinese(str(e))
+            logger.error(f"Batch task {task_index} exception: {e}", exc_info=True)
+            return False, error_msg
+
+    @filter.llm_tool(name="shoubanhua_batch_process")
+    async def batch_process_tool(self, event: AstrMessageEvent, prompt: str, max_images: int = 10):
+        '''批量处理上下文中的多张图片。仅在用户明确要求批量处理多张图片时才调用。
+        
+        调用前请严格判断：
+        1. 用户是否明确要求批量处理/全部处理多张图片？
+        2. 上下文中是否确实有多张图片需要处理？
+        3. 如果用户只是发送了多张图片但没有要求处理，请不要调用此工具
+        
+        此工具会消耗用户大量使用次数（每张图片消耗1次），请谨慎调用。
+        
+        Args:
+            prompt(string): 图片处理的提示词，可以是预设名+追加规则，如"手办化 皮肤白一点"
+            max_images(int): 最多处理的图片数量，默认10张
+        '''
+        # 0. 检查 LLM 工具开关
+        if not self.conf.get("enable_llm_tool", True):
+            return "❌ LLM 工具已禁用，请使用指令模式调用此功能。"
+        
+        # 0.1 检查冷却时间
+        uid = norm_id(event.get_sender_id())
+        in_cooldown, remaining = self._check_llm_cooldown(uid)
+        if in_cooldown:
+            return f"⏳ 冷却中，请等待 {remaining} 秒后再试。"
+        
+        # 1. 获取上下文中的图片
+        session_id = event.unified_msg_origin
+        image_sources = await self._collect_images_from_context(session_id, count=self._context_rounds)
+        
+        if not image_sources:
+            return "❌ 未在上下文中找到图片。请先发送图片，然后再使用批量处理功能。"
+        
+        # 2. 收集所有图片URL（去重）
+        all_image_urls = []
+        seen_urls = set()
+        for msg_id, urls in image_sources:
+            for url in urls:
+                if url not in seen_urls:
+                    all_image_urls.append(url)
+                    seen_urls.add(url)
+        
+        # 限制数量
+        if max_images > 0:
+            all_image_urls = all_image_urls[:max_images]
+        
+        total_images = len(all_image_urls)
+        if total_images == 0:
+            return "❌ 未找到有效的图片URL。"
+        
+        # 3. 计算预设和追加规则
+        final_prompt, preset_name, extra_rules = self._process_prompt_and_preset(prompt)
+        
+        # 4. 检查配额（批量任务需要足够的次数）
+        gid = norm_id(event.get_group_id())
+        total_cost = total_images
+        
+        deduction = await self._check_quota(event, uid, gid, total_cost)
+        if not deduction["allowed"]:
+            return f"❌ 次数不足。批量处理 {total_images} 张图片需要 {total_cost} 次。{deduction['msg']}"
+        
+        # 4.1 更新冷却时间
+        self._update_llm_cooldown(uid)
+        
+        # 5. 发送开始提示
+        feedback = f"📦 批量处理任务开始\n"
+        feedback += f"📷 共 {total_images} 张图片\n"
+        feedback += f"🎨 预设: {preset_name}"
+        if extra_rules:
+            feedback += f"\n📝 规则: {extra_rules[:30]}{'...' if len(extra_rules) > 30 else ''}"
+        feedback += f"\n⏳ 每张图片将独立处理，请耐心等待..."
+        await event.send(event.chain_result([Plain(feedback)]))
+        
+        # 6. 扣费
+        if deduction["source"] == "user":
+            await self.data_mgr.decrease_user_count(uid, total_cost)
+        elif deduction["source"] == "group":
+            await self.data_mgr.decrease_group_count(gid, total_cost)
+        
+        # 7. 启动批量处理任务
+        async def process_all():
+            success_count = 0
+            fail_count = 0
+            failed_details = []  # 记录失败详情
+            
+            for i, url in enumerate(all_image_urls, 1):
+                try:
+                    # 下载图片
+                    img_bytes = await self.img_mgr.load_bytes(url)
+                    if not img_bytes:
+                        error_msg = "图片下载失败，可能是链接已过期或网络问题"
+                        logger.error(f"Batch process image {i} download failed: {url}")
+                        failed_details.append({
+                            "index": i,
+                            "reason": error_msg,
+                            "url_preview": url[:50] + "..." if len(url) > 50 else url
+                        })
+                        fail_count += 1
+                        # 发送单条失败提示
+                        await event.send(event.chain_result([
+                            Plain(f"❌ 第 {i}/{total_images} 张图片处理失败\n📍 原因: {error_msg}")
+                        ]))
+                        continue
+                    
+                    # 处理单张图片
+                    success, error_msg = await self._run_single_batch_task(
+                        event=event,
+                        image_bytes=img_bytes,
+                        prompt=final_prompt,
+                        preset_name=preset_name,
+                        task_index=i,
+                        total_tasks=total_images,
+                        uid=uid,
+                        gid=gid,
+                        extra_rules=extra_rules,
+                        image_source=url
+                    )
+                    
+                    if success:
+                        success_count += 1
+                    else:
+                        fail_count += 1
+                        failed_details.append({
+                            "index": i,
+                            "reason": error_msg,
+                            "url_preview": url[:50] + "..." if len(url) > 50 else url
+                        })
+                        # 发送单条失败提示
+                        await event.send(event.chain_result([
+                            Plain(f"❌ 第 {i}/{total_images} 张图片处理失败\n📍 原因: {error_msg}")
+                        ]))
+                    
+                    # 添加短暂延迟，避免API限流
+                    if i < total_images:
+                        await asyncio.sleep(0.5)
+                        
+                except Exception as e:
+                    error_msg = self._translate_error_to_chinese(str(e))
+                    logger.error(f"Batch process image {i} exception: {e}", exc_info=True)
+                    failed_details.append({
+                        "index": i,
+                        "reason": error_msg,
+                        "url_preview": url[:50] + "..." if len(url) > 50 else url
+                    })
+                    fail_count += 1
+                    await event.send(event.chain_result([
+                        Plain(f"❌ 第 {i}/{total_images} 张图片处理失败\n📍 原因: {error_msg}")
+                    ]))
+            
+            # 发送完成汇总
+            quota_str = self._get_quota_str(deduction, uid)
+            summary = f"\n📊 批量处理完成\n"
+            summary += f"✅ 成功: {success_count} 张\n"
+            summary += f"❌ 失败: {fail_count} 张\n"
+            summary += f"💰 剩余次数: {quota_str}"
+            
+            # 如果有失败的，附加失败汇总
+            if failed_details:
+                summary += f"\n\n📋 失败图片汇总:"
+                for detail in failed_details[:5]:  # 最多显示5条
+                    summary += f"\n  • 第{detail['index']}张: {detail['reason']}"
+                if len(failed_details) > 5:
+                    summary += f"\n  ... 还有 {len(failed_details) - 5} 张失败"
+            
+            await event.send(event.chain_result([Plain(summary)]))
+        
+        # 启动异步任务
+        asyncio.create_task(process_all())
+        
+        return f"批量处理任务已启动，共 {total_images} 张图片，预设：{preset_name}。每张图片将独立处理并发送结果。"
+
+    @filter.llm_tool(name="shoubanhua_batch_process_concurrent")
+    async def batch_process_concurrent_tool(self, event: AstrMessageEvent, prompt: str, max_images: int = 10, concurrency: int = 3):
+        '''并发批量处理上下文中的多张图片。仅在用户明确要求快速批量处理时才调用。
+        
+        调用前请严格判断：
+        1. 用户是否明确要求批量处理/全部处理多张图片？
+        2. 上下文中是否确实有多张图片需要处理？
+        3. 如果用户只是发送了多张图片但没有要求处理，请不要调用此工具
+        
+        此工具会消耗用户大量使用次数（每张图片消耗1次），请谨慎调用。
+        
+        Args:
+            prompt(string): 图片处理的提示词，可以是预设名+追加规则
+            max_images(int): 最多处理的图片数量，默认10张
+            concurrency(int): 并发数量，默认3（同时处理3张图片）
+        '''
+        # 0. 检查 LLM 工具开关
+        if not self.conf.get("enable_llm_tool", True):
+            return "❌ LLM 工具已禁用，请使用指令模式调用此功能。"
+        
+        # 0.1 检查冷却时间
+        uid = norm_id(event.get_sender_id())
+        in_cooldown, remaining = self._check_llm_cooldown(uid)
+        if in_cooldown:
+            return f"⏳ 冷却中，请等待 {remaining} 秒后再试。"
+        
+        # 限制并发数
+        concurrency = max(1, min(concurrency, 5))
+        
+        # 1. 获取上下文中的图片
+        session_id = event.unified_msg_origin
+        image_sources = await self._collect_images_from_context(session_id, count=self._context_rounds)
+        
+        if not image_sources:
+            return "❌ 未在上下文中找到图片。请先发送图片，然后再使用批量处理功能。"
+        
+        # 2. 收集所有图片URL（去重）
+        all_image_urls = []
+        seen_urls = set()
+        for msg_id, urls in image_sources:
+            for url in urls:
+                if url not in seen_urls:
+                    all_image_urls.append(url)
+                    seen_urls.add(url)
+        
+        # 限制数量
+        if max_images > 0:
+            all_image_urls = all_image_urls[:max_images]
+        
+        total_images = len(all_image_urls)
+        if total_images == 0:
+            return "❌ 未找到有效的图片URL。"
+        
+        # 3. 计算预设和追加规则
+        final_prompt, preset_name, extra_rules = self._process_prompt_and_preset(prompt)
+        
+        # 4. 检查配额
+        gid = norm_id(event.get_group_id())
+        total_cost = total_images
+        
+        deduction = await self._check_quota(event, uid, gid, total_cost)
+        if not deduction["allowed"]:
+            return f"❌ 次数不足。批量处理 {total_images} 张图片需要 {total_cost} 次。{deduction['msg']}"
+        
+        # 4.1 更新冷却时间
+        self._update_llm_cooldown(uid)
+        
+        # 5. 发送开始提示
+        feedback = f"🚀 并发批量处理任务开始\n"
+        feedback += f"📷 共 {total_images} 张图片 | 并发: {concurrency}\n"
+        feedback += f"🎨 预设: {preset_name}"
+        if extra_rules:
+            feedback += f"\n📝 规则: {extra_rules[:30]}{'...' if len(extra_rules) > 30 else ''}"
+        feedback += f"\n⏳ 图片将并发处理，请耐心等待..."
+        await event.send(event.chain_result([Plain(feedback)]))
+        
+        # 6. 扣费
+        if deduction["source"] == "user":
+            await self.data_mgr.decrease_user_count(uid, total_cost)
+        elif deduction["source"] == "group":
+            await self.data_mgr.decrease_group_count(gid, total_cost)
+        
+        # 7. 使用信号量控制并发
+        semaphore = asyncio.Semaphore(concurrency)
+        results = {"success": 0, "fail": 0}
+        failed_details = []
+        results_lock = asyncio.Lock()
+        
+        async def process_single(index: int, url: str):
+            async with semaphore:
+                try:
+                    # 下载图片
+                    img_bytes = await self.img_mgr.load_bytes(url)
+                    if not img_bytes:
+                        error_msg = "图片下载失败，可能是链接已过期或网络问题"
+                        logger.error(f"Concurrent batch process image {index} download failed: {url}")
+                        async with results_lock:
+                            results["fail"] += 1
+                            failed_details.append({
+                                "index": index,
+                                "reason": error_msg,
+                                "url_preview": url[:50] + "..." if len(url) > 50 else url
+                            })
+                        await event.send(event.chain_result([
+                            Plain(f"❌ 第 {index}/{total_images} 张图片处理失败\n📍 原因: {error_msg}")
+                        ]))
+                        return
+                    
+                    # 处理单张图片
+                    success, error_msg = await self._run_single_batch_task(
+                        event=event,
+                        image_bytes=img_bytes,
+                        prompt=final_prompt,
+                        preset_name=preset_name,
+                        task_index=index,
+                        total_tasks=total_images,
+                        uid=uid,
+                        gid=gid,
+                        extra_rules=extra_rules,
+                        image_source=url
+                    )
+                    
+                    async with results_lock:
+                        if success:
+                            results["success"] += 1
+                        else:
+                            results["fail"] += 1
+                            failed_details.append({
+                                "index": index,
+                                "reason": error_msg,
+                                "url_preview": url[:50] + "..." if len(url) > 50 else url
+                            })
+                            await event.send(event.chain_result([
+                                Plain(f"❌ 第 {index}/{total_images} 张图片处理失败\n📍 原因: {error_msg}")
+                            ]))
+                            
+                except Exception as e:
+                    error_msg = self._translate_error_to_chinese(str(e))
+                    logger.error(f"Concurrent batch process image {index} exception: {e}", exc_info=True)
+                    async with results_lock:
+                        results["fail"] += 1
+                        failed_details.append({
+                            "index": index,
+                            "reason": error_msg,
+                            "url_preview": url[:50] + "..." if len(url) > 50 else url
+                        })
+                    await event.send(event.chain_result([
+                        Plain(f"❌ 第 {index}/{total_images} 张图片处理失败\n📍 原因: {error_msg}")
+                    ]))
+        
+        async def process_all():
+            # 创建所有任务
+            tasks = [
+                process_single(i, url) 
+                for i, url in enumerate(all_image_urls, 1)
+            ]
+            
+            # 等待所有任务完成
+            await asyncio.gather(*tasks)
+            
+            # 发送完成汇总
+            quota_str = self._get_quota_str(deduction, uid)
+            summary = f"\n📊 并发批量处理完成\n"
+            summary += f"✅ 成功: {results['success']} 张\n"
+            summary += f"❌ 失败: {results['fail']} 张\n"
+            summary += f"💰 剩余次数: {quota_str}"
+            
+            # 如果有失败的，附加失败汇总
+            if failed_details:
+                summary += f"\n\n📋 失败图片汇总:"
+                for detail in sorted(failed_details, key=lambda x: x['index'])[:5]:
+                    summary += f"\n  • 第{detail['index']}张: {detail['reason']}"
+                if len(failed_details) > 5:
+                    summary += f"\n  ... 还有 {len(failed_details) - 5} 张失败"
+            
+            await event.send(event.chain_result([Plain(summary)]))
+        
+        # 启动异步任务
+        asyncio.create_task(process_all())
+        
+        return f"并发批量处理任务已启动，共 {total_images} 张图片，并发数 {concurrency}，预设：{preset_name}。"
+
+    # ================= 日常人设功能 =================
+
+    @filter.llm_tool(name="shoubanhua_persona_photo")
+    async def persona_photo_tool(self, event: AstrMessageEvent, scene_hint: str = "", extra_request: str = ""):
+        '''生成Bot人设角色的日常照片。
+        
+        【重要】调用条件（请严格遵守）：
+        1. 用户明确要求看照片时才调用，例如：
+           - "发张照片"、"看看你"、"自拍一张"、"给我看看你"
+           - "发个自拍"、"拍张照片给我"、"让我看看你长什么样"
+        
+        2. 以下情况【不要】调用此工具：
+           - 用户只是问"你在干嘛"、"你在做什么" → 用文字回答即可
+           - 用户只是闲聊、打招呼 → 正常对话即可
+           - 用户没有明确表达想看照片的意愿 → 不要主动发照片
+        
+        3. 偶尔（约10%概率）可以在以下情况主动发照片：
+           - 用户表达想念、关心Bot时
+           - 聊天氛围很好，想分享当前状态时
+           - 但大多数情况下，请用文字描述而不是发照片
+        
+        此工具会消耗用户次数，请谨慎调用。
+        
+        Args:
+            scene_hint(string): 场景提示（可选），如"咖啡店"、"公园"等，用于匹配预设场景
+            extra_request(string): 用户的额外要求（可选），如"穿红色衣服"、"微笑"等
+        '''
+        # 0. 检查功能开关
+        if not self._persona_mode:
+            return "❌ 日常人设功能未启用。请在配置中开启 enable_persona_mode。"
+        
+        if not self.conf.get("enable_llm_tool", True):
+            return "❌ LLM 工具已禁用，请使用指令模式调用此功能。"
+        
+        # 0.1 检查冷却时间
+        uid = norm_id(event.get_sender_id())
+        in_cooldown, remaining = self._check_llm_cooldown(uid)
+        if in_cooldown:
+            return f"⏳ 冷却中，请等待 {remaining} 秒后再试。"
+        
+        # 1. 加载人设参考图
+        ref_images = await self._load_persona_ref_images()
+        if not ref_images:
+            return "❌ 未配置人设参考图。请先使用 #人设参考图添加 命令添加参考图。"
+        
+        # 2. 获取上下文用于场景匹配
+        session_id = event.unified_msg_origin
+        context_messages = await self.ctx_mgr.get_recent_messages(session_id, count=10)
+        
+        # 构建上下文文本
+        context_text = scene_hint
+        if context_messages:
+            for msg in context_messages[-5:]:
+                if msg.is_bot:
+                    context_text += " " + msg.content
+        
+        # 3. 匹配场景
+        scene_name, scene_prompt = self._match_persona_scene(context_text)
+        
+        # 4. 构建完整提示词
+        full_prompt = self._build_persona_prompt(scene_prompt, extra_request)
+        
+        # 5. 根据配置决定是否发送进度提示
+        if self.conf.get("llm_show_progress", True):
+            persona_name = self.conf.get("persona_name", "小助手")
+            feedback = f"📸 正在生成 {persona_name} 的照片\n"
+            feedback += f"🎬 场景: {scene_name}"
+            if extra_request:
+                feedback += f"\n📝 要求: {extra_request[:30]}{'...' if len(extra_request) > 30 else ''}"
+            feedback += "\n⏳ 请稍候..."
+            await event.send(event.chain_result([Plain(feedback)]))
+        
+        # 6. 检查配额
+        gid = norm_id(event.get_group_id())
+        deduction = await self._check_quota(event, uid, gid, 1)
+        if not deduction["allowed"]:
+            return deduction["msg"]
+        
+        # 7. 更新冷却时间
+        self._update_llm_cooldown(uid)
+        
+        # 8. 启动后台任务
+        asyncio.create_task(
+            self._run_background_task(
+                event=event,
+                images=ref_images,
+                prompt=full_prompt,
+                preset_name=f"人设-{scene_name}",
+                deduction=deduction,
+                uid=uid,
+                gid=gid,
+                cost=1,
+                extra_rules=extra_request
+            )
+        )
+        
+        return f"人设照片生成任务已启动，场景：{scene_name}。图片生成中，完成后将自动发送。"
+
+    @filter.command("人设拍照", prefix_optional=True)
+    async def on_persona_photo_cmd(self, event: AstrMessageEvent, ctx=None):
+        """生成人设角色的日常照片（指令模式）
+        
+        用法: #人设拍照 [场景] [额外要求]
+        示例: #人设拍照 咖啡店 穿白色连衣裙
+        """
+        if not self._persona_mode:
+            yield event.chain_result([Plain("❌ 日常人设功能未启用")])
+            return
+        
+        # 加载人设参考图
+        ref_images = await self._load_persona_ref_images()
+        if not ref_images:
+            yield event.chain_result([Plain("❌ 未配置人设参考图\n请先使用 #人设参考图添加 命令添加参考图")])
+            return
+        
+        # 解析参数
+        parts = event.message_str.split(maxsplit=2)
+        scene_hint = parts[1] if len(parts) > 1 else ""
+        extra_request = parts[2] if len(parts) > 2 else ""
+        
+        # 获取上下文用于场景匹配
+        session_id = event.unified_msg_origin
+        context_messages = await self.ctx_mgr.get_recent_messages(session_id, count=10)
+        
+        context_text = scene_hint
+        if context_messages:
+            for msg in context_messages[-5:]:
+                if msg.is_bot:
+                    context_text += " " + msg.content
+        
+        # 匹配场景
+        scene_name, scene_prompt = self._match_persona_scene(context_text)
+        
+        # 构建提示词
+        full_prompt = self._build_persona_prompt(scene_prompt, extra_request)
+        
+        # 检查配额
+        uid = norm_id(event.get_sender_id())
+        gid = norm_id(event.get_group_id())
+        deduction = await self._check_quota(event, uid, gid, 1)
+        if not deduction["allowed"]:
+            yield event.chain_result([Plain(deduction["msg"])])
+            return
+        
+        # 发送反馈
+        persona_name = self.conf.get("persona_name", "小助手")
+        feedback = f"📸 正在生成 {persona_name} 的照片\n"
+        feedback += f"🎬 场景: {scene_name}"
+        if extra_request:
+            feedback += f"\n📝 要求: {extra_request[:30]}..."
+        feedback += "\n⏳ 请稍候..."
+        yield event.chain_result([Plain(feedback)])
+        
+        # 扣费
+        if deduction["source"] == "user":
+            await self.data_mgr.decrease_user_count(uid, 1)
+        elif deduction["source"] == "group":
+            await self.data_mgr.decrease_group_count(gid, 1)
+        
+        # 调用 API
+        model = self.conf.get("model", "nano-banana")
+        start = datetime.now()
+        res = await self.api_mgr.call_api(ref_images, full_prompt, model, False, self.img_mgr.proxy)
+        
+        if isinstance(res, bytes):
+            elapsed = (datetime.now() - start).total_seconds()
+            await self.data_mgr.record_usage(uid, gid)
+            
+            quota_str = self._get_quota_str(deduction, uid)
+            info = f"\n✅ 生成成功 ({elapsed:.2f}s) | 场景: {scene_name} | 剩余: {quota_str}"
+            yield event.chain_result([Image.fromBytes(res), Plain(info)])
+        else:
+            yield event.chain_result([Plain(f"❌ 生成失败: {res}")])
+
+    @filter.command("人设参考图添加", aliases={"添加人设图"}, prefix_optional=True)
+    async def on_add_persona_ref(self, event: AstrMessageEvent, ctx=None):
+        """添加人设参考图（管理员）
+        
+        用法: #人设参考图添加 [图片]
+        """
+        if not self.is_admin(event): return
+        
+        # 提取图片
+        bot_id = self._get_bot_id(event)
+        images = await self.img_mgr.extract_images_from_event(event, ignore_id=bot_id, context=self.context)
+        
+        if not images:
+            yield event.chain_result([Plain("❌ 未检测到图片，请发送或引用图片")])
+            return
+        
+        # 保存到特殊预设 "_persona_"
+        count = await self.data_mgr.add_preset_ref_images("_persona_", images)
+        
+        if count > 0:
+            total = len(self.data_mgr.get_preset_ref_image_paths("_persona_"))
+            yield event.chain_result([Plain(f"✅ 已添加 {count} 张人设参考图\n当前共 {total} 张参考图")])
+        else:
+            yield event.chain_result([Plain("❌ 保存参考图失败")])
+
+    @filter.command("人设参考图查看", aliases={"查看人设图"}, prefix_optional=True)
+    async def on_view_persona_ref(self, event: AstrMessageEvent, ctx=None):
+        """查看人设参考图（管理员）"""
+        if not self.is_admin(event): return
+        
+        if not self.data_mgr.has_preset_ref_images("_persona_"):
+            yield event.chain_result([Plain("暂无人设参考图")])
+            return
+        
+        ref_images = await self.data_mgr.load_preset_ref_images_bytes("_persona_")
+        
+        if not ref_images:
+            yield event.chain_result([Plain("人设参考图加载失败")])
+            return
+        
+        result = [Plain(f"📷 人设参考图 ({len(ref_images)} 张):\n")]
+        for img_bytes in ref_images[:5]:
+            result.append(Image.fromBytes(img_bytes))
+        
+        if len(ref_images) > 5:
+            result.append(Plain(f"\n... 还有 {len(ref_images) - 5} 张未显示"))
+        
+        yield event.chain_result(result)
+
+    @filter.command("人设参考图清除", aliases={"清除人设图"}, prefix_optional=True)
+    async def on_clear_persona_ref(self, event: AstrMessageEvent, ctx=None):
+        """清除所有人设参考图（管理员）"""
+        if not self.is_admin(event): return
+        
+        count = await self.data_mgr.clear_preset_ref_images("_persona_")
+        
+        if count > 0:
+            yield event.chain_result([Plain(f"✅ 已清除 {count} 张人设参考图")])
+        else:
+            yield event.chain_result([Plain("暂无人设参考图")])
+
+    @filter.command("人设场景列表", aliases={"场景列表"}, prefix_optional=True)
+    async def on_list_persona_scenes(self, event: AstrMessageEvent, ctx=None):
+        """查看所有人设场景"""
+        if not self._persona_scene_map:
+            yield event.chain_result([Plain("暂无场景配置")])
+            return
+        
+        msg = f"🎬 人设场景列表 ({len(self._persona_scene_map)} 个):\n"
+        for scene_name, prompt in sorted(self._persona_scene_map.items()):
+            prompt_preview = prompt[:40] + "..." if len(prompt) > 40 else prompt
+            msg += f"\n• {scene_name}: {prompt_preview}"
+        
+        default_prompt = self.conf.get("persona_default_prompt", "一张日常自拍照")
+        msg += f"\n\n📌 默认场景: {default_prompt[:40]}..."
+        
+        yield event.chain_result([Plain(msg)])
+
+    @filter.command("人设状态", prefix_optional=True)
+    async def on_persona_status(self, event: AstrMessageEvent, ctx=None):
+        """查看人设功能状态（管理员）"""
+        if not self.is_admin(event): return
+        
+        persona_name = self.conf.get("persona_name", "小助手")
+        persona_desc = self.conf.get("persona_description", "未配置")
+        photo_style = self.conf.get("persona_photo_style", "未配置")
+        trigger_keywords = self.conf.get("persona_trigger_keywords", [])
+        
+        has_ref_images = self.data_mgr.has_preset_ref_images("_persona_")
+        ref_count = len(self.data_mgr.get_preset_ref_image_paths("_persona_")) if has_ref_images else 0
+        
+        msg = f"👤 人设功能状态:\n"
+        msg += f"启用状态: {'✅ 已启用' if self._persona_mode else '❌ 未启用'}\n"
+        msg += f"人设名称: {persona_name}\n"
+        msg += f"人设描述: {persona_desc[:50]}{'...' if len(persona_desc) > 50 else ''}\n"
+        msg += f"照片风格: {photo_style[:30]}{'...' if len(photo_style) > 30 else ''}\n"
+        msg += f"参考图: {ref_count} 张\n"
+        msg += f"场景数: {len(self._persona_scene_map)} 个\n"
+        msg += f"触发词: {', '.join(trigger_keywords[:5])}{'...' if len(trigger_keywords) > 5 else ''}"
+        
+        yield event.chain_result([Plain(msg)])
+
+    @filter.command("批量处理", aliases={"批量手办化", "全部处理"}, prefix_optional=True)
+    async def on_batch_process_cmd(self, event: AstrMessageEvent, ctx=None):
+        """批量处理上下文中的图片（指令模式）
+        
+        用法: #批量处理 <预设名> [追加规则]
+        示例: #批量处理 手办化 皮肤白一点
+        """
+        parts = event.message_str.split(maxsplit=1)
+        if len(parts) < 2:
+            yield event.chain_result([Plain("用法: #批量处理 <预设名> [追加规则]\n示例: #批量处理 手办化 皮肤白一点")])
+            return
+        
+        prompt = parts[1].strip()
+        
+        # 获取上下文中的图片
+        session_id = event.unified_msg_origin
+        image_sources = await self._collect_images_from_context(session_id, count=self._context_rounds)
+        
+        if not image_sources:
+            yield event.chain_result([Plain("❌ 未在上下文中找到图片。请先发送图片，然后再使用批量处理功能。")])
+            return
+        
+        # 收集所有图片URL
+        all_image_urls = []
+        seen_urls = set()
+        for msg_id, urls in image_sources:
+            for url in urls:
+                if url not in seen_urls:
+                    all_image_urls.append(url)
+                    seen_urls.add(url)
+        
+        # 限制数量
+        max_images = self.conf.get("batch_max_images", 10)
+        all_image_urls = all_image_urls[:max_images]
+        
+        total_images = len(all_image_urls)
+        if total_images == 0:
+            yield event.chain_result([Plain("❌ 未找到有效的图片。")])
+            return
+        
+        # 计算预设和追加规则
+        final_prompt, preset_name, extra_rules = self._process_prompt_and_preset(prompt)
+        
+        # 检查配额
+        uid = norm_id(event.get_sender_id())
+        gid = norm_id(event.get_group_id())
+        total_cost = total_images
+        
+        deduction = await self._check_quota(event, uid, gid, total_cost)
+        if not deduction["allowed"]:
+            yield event.chain_result([Plain(f"❌ 次数不足。批量处理 {total_images} 张图片需要 {total_cost} 次。\n{deduction['msg']}")])
+            return
+        
+        # 发送开始提示
+        feedback = f"📦 批量处理任务开始\n"
+        feedback += f"📷 共 {total_images} 张图片\n"
+        feedback += f"🎨 预设: {preset_name}"
+        if extra_rules:
+            feedback += f"\n📝 规则: {extra_rules[:30]}..."
+        feedback += f"\n⏳ 每张图片将独立处理，请耐心等待..."
+        yield event.chain_result([Plain(feedback)])
+        
+        # 扣费
+        if deduction["source"] == "user":
+            await self.data_mgr.decrease_user_count(uid, total_cost)
+        elif deduction["source"] == "group":
+            await self.data_mgr.decrease_group_count(gid, total_cost)
+        
+        # 处理每张图片
+        success_count = 0
+        fail_count = 0
+        
+        for i, url in enumerate(all_image_urls, 1):
+            try:
+                # 下载图片
+                img_bytes = await self.img_mgr.load_bytes(url)
+                if not img_bytes:
+                    yield event.chain_result([Plain(f"❌ [{i}/{total_images}] 图片下载失败")])
+                    fail_count += 1
+                    continue
+                
+                # 处理单张图片
+                success, error_msg = await self._run_single_batch_task(
+                    event=event,
+                    image_bytes=img_bytes,
+                    prompt=final_prompt,
+                    preset_name=preset_name,
+                    task_index=i,
+                    total_tasks=total_images,
+                    uid=uid,
+                    gid=gid,
+                    extra_rules=extra_rules
+                )
+                
+                if success:
+                    success_count += 1
+                else:
+                    fail_count += 1
+                    if error_msg:
+                        yield event.chain_result([Plain(f"❌ [{i}/{total_images}] {error_msg}")])
+                
+                # 添加短暂延迟
+                if i < total_images:
+                    await asyncio.sleep(0.5)
+                    
+            except Exception as e:
+                logger.error(f"Batch process image {i} error: {e}")
+                yield event.chain_result([Plain(f"❌ [{i}/{total_images}] 处理异常: {e}")])
+                fail_count += 1
+        
+        # 发送完成汇总
+        quota_str = self._get_quota_str(deduction, uid)
+        summary = f"\n📊 批量处理完成\n"
+        summary += f"✅ 成功: {success_count} 张\n"
+        summary += f"❌ 失败: {fail_count} 张\n"
+        summary += f"💰 剩余次数: {quota_str}"
+        yield event.chain_result([Plain(summary)])
