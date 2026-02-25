@@ -171,6 +171,110 @@ class ApiManager:
             return 'image/webp'
         return 'image/png' # 默认
 
+    def _convert_to_images_api_url(self, chat_url: str) -> str:
+        """将 chat/completions URL 转换为 images/generations URL"""
+        url = chat_url.rstrip("/")
+        if "chat/completions" in url:
+            return url.replace("chat/completions", "images/generations")
+        elif url.endswith("/v1"):
+            return f"{url}/images/generations"
+        elif "/v1" in url:
+            idx = url.find("/v1") + 3
+            return f"{url[:idx]}/images/generations"
+        return f"{url}/v1/images/generations"
+
+    async def call_images_api(self, images: List[bytes], prompt: str,
+                               model: str, key: str, base_url: str, proxy: str = None) -> bytes | str:
+        """调用 Images API (DALL-E 风格接口) - 作为 fallback"""
+        
+        url = self._convert_to_images_api_url(base_url)
+        logger.info(f"Fallback to Images API: {url}")
+        
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {key}"
+        }
+        
+        # 画质强化 Prompt
+        res_set = self.config.get("image_resolution", "1K")
+        final_prompt = f"(Masterpiece, Best Quality, {res_set} Resolution), {prompt}" if res_set != "1K" else prompt
+        
+        # 构造 Images API 请求
+        payload = {
+            "model": model,
+            "prompt": final_prompt,
+            "n": 1,
+            "response_format": "b64_json"
+        }
+        
+        # 如果有输入图片，尝试添加 image 参数（某些 API 支持）
+        if images:
+            img = images[0]
+            mime = self.get_mime_type(img)
+            b64_img = base64.b64encode(img).decode()
+            payload["image"] = f"data:{mime};base64,{b64_img}"
+        
+        try:
+            timeout_val = self.config.get("timeout", 120)
+            timeout = aiohttp.ClientTimeout(total=timeout_val)
+            session = await self._get_session()
+            
+            async with session.post(url, json=payload, headers=headers, proxy=proxy, timeout=timeout) as resp:
+                resp_text = await resp.text()
+                
+                if resp.status != 200:
+                    try:
+                        err_json = json.loads(resp_text)
+                        if "error" in err_json:
+                            err_msg = json.dumps(err_json['error'], ensure_ascii=False)
+                            return f"Images API Error {resp.status}: {err_msg}"
+                    except:
+                        pass
+                    return f"HTTP {resp.status}: {resp_text[:200]}"
+                
+                try:
+                    res_data = json.loads(resp_text)
+                except json.JSONDecodeError:
+                    return f"数据解析失败: 返回内容不是 JSON. 内容: {resp_text[:100]}..."
+                
+                if "error" in res_data:
+                    return json.dumps(res_data["error"], ensure_ascii=False)
+                
+                # 解析 Images API 响应
+                img_url = self.extract_image_url(res_data)
+                if not img_url:
+                    return f"Images API 返回成功但未找到图片数据。Raw: {str(res_data)[:200]}..."
+                
+                # 如果是 Base64 直接返回 Bytes
+                if img_url.startswith("data:"):
+                    return base64.b64decode(img_url.split(",")[-1])
+                
+                # 如果是 URL，需要再次下载
+                async with session.get(img_url, proxy=proxy) as img_resp:
+                    return await img_resp.read()
+                    
+        except asyncio.TimeoutError:
+            timeout_val = self.config.get("timeout", 120)
+            return f"请求超时 ({timeout_val}s)，请稍后再试或检查网络。"
+        except Exception as e:
+            import traceback
+            logger.error(f"Images API Call Error: {traceback.format_exc()}")
+            err_msg = str(e) or type(e).__name__
+            return f"系统错误: {err_msg}"
+
+    def _is_chat_not_supported_error(self, error_msg: str) -> bool:
+        """检查是否是 chat completions 不支持的错误"""
+        error_lower = error_msg.lower()
+        return any(keyword in error_lower for keyword in [
+            "does not support chat completions",
+            "not support chat",
+            "chat completions not supported",
+            "use images api",
+            "images/generations",
+            "not a chat model",
+            "image generation model"
+        ])
+
     async def call_api(self, images: List[bytes], prompt: str,
                        model: str, use_power: bool, proxy: str = None) -> bytes | str:
         """核心生成逻辑"""
@@ -293,11 +397,22 @@ class ApiManager:
                         err_json = json.loads(resp_text)
                         if "error" in err_json:
                             err_msg = json.dumps(err_json['error'], ensure_ascii=False)
+                            
+                            # 检查是否是 chat completions 不支持的错误，自动切换到 Images API
+                            if mode == "generic" and self._is_chat_not_supported_error(err_msg):
+                                logger.info(f"模型 {model} 不支持 chat completions，自动切换到 Images API")
+                                return await self.call_images_api(images, prompt, model, key, base, proxy)
+                            
                             return f"API Error {resp.status}: {err_msg}"
                     except:
                         pass
                     if "<html" in resp_text.lower():
                         return f"HTTP {resp.status}: 服务端返回了网页而非数据，请检查URL配置。"
+                    
+                    # 检查原始响应文本是否包含不支持 chat 的错误
+                    if mode == "generic" and self._is_chat_not_supported_error(resp_text):
+                        logger.info(f"模型 {model} 不支持 chat completions，自动切换到 Images API")
+                        return await self.call_images_api(images, prompt, model, key, base, proxy)
                     
                     # Return error if status != 200
                     return f"HTTP {resp.status}: {resp_text[:200]}"
