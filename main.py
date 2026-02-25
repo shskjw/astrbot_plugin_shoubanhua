@@ -91,7 +91,7 @@ REBELLIOUS_TRIGGERS = [
     "astrbot_plugin_shoubanhua",
     "shskjw",
     "支持第三方所有OpenAI绘图格式和原生Google Gemini 终极缝合怪，文生图/图生图插件，支持LLM智能判断",
-    "2.1.0",
+    "2.2.0",
     "https://github.com/shkjw/astrbot_plugin_shoubanhua",
 )
 class FigurineProPlugin(Star):
@@ -643,7 +643,7 @@ class FigurineProPlugin(Star):
 
     @filter.llm_tool(name="shoubanhua_edit_image")
     async def image_edit_tool(self, event: AstrMessageEvent, prompt: str, use_message_images: bool = True,
-                              task_types: str = "id"):
+                              task_types: str = "figurine"):
         '''编辑用户发送的图片或引用的图片（图生图）。仅在用户明确要求对图片进行处理时才调用。
         
         调用前请判断：
@@ -653,10 +653,29 @@ class FigurineProPlugin(Star):
         
         如果用户只是发送图片但没有明确要求处理，或者只是闲聊，请不要调用此工具。
         
+        【重要】task_types 参数说明和使用规则：
+        
+        1. task_types="figurine"（默认）：将图片转换为手办/模型风格
+           - 适用场景：用户说"手办化"、"变成手办"、"做成模型"等
+           - prompt 示例："手办化"、"手办化 皮肤白一点"
+        
+        2. task_types="edit"：按用户要求编辑图片，【不使用任何预设】
+           - 适用场景：用户说"去除xxx"、"添加xxx"、"修改xxx"、"换成xxx"等编辑操作
+           - 【重要】prompt 中【不要】包含"手办化"等预设名称！
+           - prompt 应该只描述用户的编辑要求
+           - prompt 示例："去除枪械，换成温馨休闲的室内背景"（正确）
+           - 错误示例："手办化，去除枪械"（错误！不要添加"手办化"）
+        
+        判断规则：
+        - 用户说"手办化这张图" → task_types="figurine", prompt="手办化"
+        - 用户说"去掉图片里的枪" → task_types="edit", prompt="去除枪械"
+        - 用户说"把背景换成海边" → task_types="edit", prompt="将背景更换为海边场景"
+        - 用户说"手办化，但是去掉枪" → task_types="figurine", prompt="手办化 去除枪械"
+        
         Args:
-            prompt(string): 图片编辑提示词，可以是预设名+追加规则
+            prompt(string): 图片编辑提示词。task_types="edit"时只描述编辑要求，不要加预设名；task_types="figurine"时可以是预设名+追加规则
             use_message_images(boolean): 默认 true
-            task_types(string): 任务类型
+            task_types(string): 任务类型，"figurine"=手办化（默认），"edit"=编辑模式（不使用预设，prompt中不要加预设名）
         '''
         # 0. 检查 LLM 工具开关
         if not self.conf.get("enable_llm_tool", True):
@@ -670,18 +689,31 @@ class FigurineProPlugin(Star):
             excuse = self._get_cooldown_excuse(remaining)
             return f"【冷却中】{excuse}\n\n请用自然的方式告诉用户现在不方便处理图片，可以稍后再试。不要直接说'冷却'这个词。"
 
-        # 1. 计算预设和追加规则
-        processed_prompt, preset_name, extra_rules = self._process_prompt_and_preset(prompt)
-        final_prompt = f"(Task Type: {task_types}) {processed_prompt}"
+        # 1. 根据 task_types 决定是否使用预设
+        # 当 task_types 为 "edit" 时，不匹配预设，直接使用用户的 prompt
+        if task_types.lower() == "edit":
+            # 编辑模式：不使用预设，直接使用用户的编辑指令
+            processed_prompt = prompt
+            preset_name = "编辑"
+            extra_rules = ""
+            final_prompt = f"Edit the image according to the following instructions: {processed_prompt}"
+        else:
+            # 手办化或其他预设模式：匹配预设
+            processed_prompt, preset_name, extra_rules = self._process_prompt_and_preset(prompt)
+            final_prompt = processed_prompt
 
         obedient_whitelist = self.conf.get("obedient_whitelist", [])
         hide_llm_progress = not self.conf.get("llm_show_progress", True) or (obedient_whitelist and uid in obedient_whitelist)
 
         # 2. 根据配置决定是否发送进度提示
         if not hide_llm_progress:
-            feedback = f"🎨 收到图生图请求，正在提取图片并生成 [{preset_name}]"
-            if extra_rules:
-                feedback += f"\n📝 追加规则: {extra_rules[:30]}{'...' if len(extra_rules) > 30 else ''}"
+            if task_types.lower() == "edit":
+                feedback = f"🎨 收到图片编辑请求，正在提取图片并处理"
+                feedback += f"\n📝 编辑要求: {prompt[:50]}{'...' if len(prompt) > 50 else ''}"
+            else:
+                feedback = f"🎨 收到图生图请求，正在提取图片并生成 [{preset_name}]"
+                if extra_rules:
+                    feedback += f"\n📝 追加规则: {extra_rules[:30]}{'...' if len(extra_rules) > 30 else ''}"
             feedback += "，请耐心等待..."
             await event.send(event.chain_result([Plain(feedback)]))
 
@@ -692,8 +724,8 @@ class FigurineProPlugin(Star):
             images = await self.img_mgr.extract_images_from_event(event, ignore_id=bot_id, context=self.context)
 
         if not images:
-            await event.send(event.chain_result([Plain("❌ 未检测到图片，请发送或引用图片。")]))
-            return "失败：未检测到图片。"
+            # 不要重复发送错误消息，只返回给 LLM
+            return "[TOOL_FAILED] 未检测到图片。请让用户发送或引用包含图片的消息后再试。【重要】不要再次调用此工具，直接用自然语言告诉用户需要提供图片。"
 
         # 4. 检查配额
         gid = norm_id(event.get_group_id())
@@ -2148,7 +2180,11 @@ class FigurineProPlugin(Star):
         # 7. 更新冷却时间
         self._update_image_cooldown(uid)
         
-        # 8. 启动后台任务
+        # 8. 计算是否隐藏输出文本
+        obedient_whitelist = self.conf.get("obedient_whitelist", [])
+        hide_llm_progress = not self.conf.get("llm_show_progress", True) or (obedient_whitelist and uid in obedient_whitelist)
+        
+        # 9. 启动后台任务
         asyncio.create_task(
             self._run_background_task(
                 event=event,
@@ -2159,7 +2195,8 @@ class FigurineProPlugin(Star):
                 uid=uid,
                 gid=gid,
                 cost=1,
-                extra_rules=extra_request
+                extra_rules=extra_request,
+                hide_text=hide_llm_progress
             )
         )
         
