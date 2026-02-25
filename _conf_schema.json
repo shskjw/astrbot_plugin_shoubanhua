@@ -237,6 +237,16 @@
         },
         "default": []
     },
+    "obedient_whitelist": {
+        "description": "【权限】顺从白名单（主人）",
+        "type": "list",
+        "hint": "只对列表内的用户百依百顺（不触发叛逆模式，且不显示生成成功等提示信息）。留空则全局需要用户填入ID才能生效。",
+        "items": {
+            "type": "string",
+            "description": "用户QQ号"
+        },
+        "default": []
+    },
     "group_whitelist": {
         "description": "【权限】群聊白名单",
         "type": "list",

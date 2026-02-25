@@ -91,7 +91,7 @@ REBELLIOUS_TRIGGERS = [
     "astrbot_plugin_shoubanhua",
     "shskjw",
     "支持第三方所有OpenAI绘图格式和原生Google Gemini 终极缝合怪，文生图/图生图插件，支持LLM智能判断",
-    "2.0.0",
+    "2.1.0",
     "https://github.com/shkjw/astrbot_plugin_shoubanhua",
 )
 class FigurineProPlugin(Star):
@@ -183,17 +183,22 @@ class FigurineProPlugin(Star):
         
         return random.choice(excuses)
 
-    def _check_rebellious_trigger(self, message: str) -> Tuple[bool, str]:
+    def _check_rebellious_trigger(self, message: str, uid: str) -> Tuple[bool, str]:
         """
         检查消息是否触发叛逆模式
         
         Args:
             message: 用户消息
+            uid: 用户ID
             
         Returns:
             (是否触发, 触发的关键词)
         """
         if not self._rebellious_mode:
+            return False, ""
+            
+        obedient_whitelist = self.conf.get("obedient_whitelist", [])
+        if obedient_whitelist and uid in obedient_whitelist:
             return False, ""
         
         message_lower = message.lower()
@@ -203,19 +208,24 @@ class FigurineProPlugin(Star):
         
         return False, ""
 
-    def _get_rebellious_hint(self, message: str) -> str:
+    def _get_rebellious_hint(self, message: str, uid: str) -> str:
         """
         生成叛逆提示信息，供LLM参考
         
         Args:
             message: 用户消息
+            uid: 用户ID
             
         Returns:
             叛逆提示信息（如果触发）或空字符串
         """
         import random
         
-        triggered, trigger_word = self._check_rebellious_trigger(message)
+        obedient_whitelist = self.conf.get("obedient_whitelist", [])
+        if obedient_whitelist and uid in obedient_whitelist:
+            return ""
+            
+        triggered, trigger_word = self._check_rebellious_trigger(message, uid)
         
         if not triggered:
             # 即使没有触发关键词，也有一定概率触发叛逆模式
@@ -490,13 +500,14 @@ class FigurineProPlugin(Star):
 
     async def _run_background_task(self, event: AstrMessageEvent, images: List[bytes],
                                    prompt: str, preset_name: str, deduction: dict, uid: str, gid: str, cost: int,
-                                   extra_rules: str = "", model_override: str = ""):
+                                   extra_rules: str = "", model_override: str = "", hide_text: bool = False):
         """
         后台执行生成任务，并在完成后主动发送消息。
         
         Args:
             extra_rules: 用户追加的规则（如"皮肤白一点"）
             model_override: 指定使用的模型（如果为空则使用默认模型）
+            hide_text: 是否隐藏生成成功提示文字
         """
         try:
             # 1. 扣费
@@ -525,17 +536,20 @@ class FigurineProPlugin(Star):
                 elapsed = (datetime.now() - start_time).total_seconds()
                 await self.data_mgr.record_usage(uid, gid)
 
-                quota_str = self._get_quota_str(deduction, uid)
-                # 构建成功文案
-                info_text = f"\n✅ 生成成功 ({elapsed:.2f}s) | 预设: {preset_name}"
-                if extra_rules:
-                    info_text += f" | 规则: {extra_rules[:20]}{'...' if len(extra_rules) > 20 else ''}"
-                info_text += f" | 剩余: {quota_str}"
-                if self.conf.get("show_model_info", False):
-                    info_text += f" | {model}"
-
                 # 5. 主动发送结果
-                chain = event.chain_result([Image.fromBytes(res), Plain(info_text)])
+                chain_nodes = [Image.fromBytes(res)]
+                if not hide_text:
+                    quota_str = self._get_quota_str(deduction, uid)
+                    # 构建成功文案
+                    info_text = f"\n✅ 生成成功 ({elapsed:.2f}s) | 预设: {preset_name}"
+                    if extra_rules:
+                        info_text += f" | 规则: {extra_rules[:20]}{'...' if len(extra_rules) > 20 else ''}"
+                    info_text += f" | 剩余: {quota_str}"
+                    if self.conf.get("show_model_info", False):
+                        info_text += f" | {model}"
+                    chain_nodes.append(Plain(info_text))
+                    
+                chain = event.chain_result(chain_nodes)
                 await event.send(chain)
             else:
                 # 失败反馈
@@ -584,8 +598,11 @@ class FigurineProPlugin(Star):
         # 1. 计算预设和追加规则
         final_prompt, preset_name, extra_rules = self._process_prompt_and_preset(prompt)
 
+        obedient_whitelist = self.conf.get("obedient_whitelist", [])
+        hide_llm_progress = not self.conf.get("llm_show_progress", True) or (obedient_whitelist and uid in obedient_whitelist)
+
         # 2. 根据配置决定是否发送进度提示
-        if self.conf.get("llm_show_progress", True):
+        if not hide_llm_progress:
             feedback = f"🎨 收到文生图请求，正在生成 [{preset_name}]"
             if extra_rules:
                 feedback += f"\n📝 追加规则: {extra_rules[:30]}{'...' if len(extra_rules) > 30 else ''}"
@@ -605,21 +622,24 @@ class FigurineProPlugin(Star):
         # 5. 启动后台任务（使用文生图专用模型）
         asyncio.create_task(
             self._run_background_task(event, [], final_prompt, preset_name, deduction, uid, gid, cost, extra_rules,
-                                      model_override=self._get_text_to_image_model())
+                                      model_override=self._get_text_to_image_model(), hide_text=hide_llm_progress)
         )
 
-        # 6. 立刻返回给 LLM（附带叛逆提示）
-        result = f"任务已受理，预设：{preset_name}。"
-        if extra_rules:
-            result += f" 追加规则：{extra_rules[:30]}。"
-        result += "图片生成中，完成后将自动发送。"
+        # 6. 立刻返回给 LLM - 明确告诉 LLM 不需要再回复
+        # 添加叛逆提示（如果有）
+        rebellious_hint = self._get_rebellious_hint(prompt, uid)
         
-        # 添加叛逆提示
-        rebellious_hint = self._get_rebellious_hint(prompt)
         if rebellious_hint:
+            # 有叛逆提示时，让 LLM 可以用叛逆语气回复
+            result = f"任务已受理，预设：{preset_name}。"
+            if extra_rules:
+                result += f" 追加规则：{extra_rules[:30]}。"
+            result += "图片生成中，完成后将自动发送。"
             result += rebellious_hint
-        
-        return result
+            return result
+        else:
+            # 没有叛逆提示时，告诉 LLM 保持沉默
+            return f"[TOOL_SUCCESS] 文生图任务已启动，预设：{preset_name}。图片将在后台生成并自动发送给用户。【重要】你不需要再回复任何内容，保持沉默即可，用户会直接收到图片。"
 
     @filter.llm_tool(name="shoubanhua_edit_image")
     async def image_edit_tool(self, event: AstrMessageEvent, prompt: str, use_message_images: bool = True,
@@ -654,8 +674,11 @@ class FigurineProPlugin(Star):
         processed_prompt, preset_name, extra_rules = self._process_prompt_and_preset(prompt)
         final_prompt = f"(Task Type: {task_types}) {processed_prompt}"
 
+        obedient_whitelist = self.conf.get("obedient_whitelist", [])
+        hide_llm_progress = not self.conf.get("llm_show_progress", True) or (obedient_whitelist and uid in obedient_whitelist)
+
         # 2. 根据配置决定是否发送进度提示
-        if self.conf.get("llm_show_progress", True):
+        if not hide_llm_progress:
             feedback = f"🎨 收到图生图请求，正在提取图片并生成 [{preset_name}]"
             if extra_rules:
                 feedback += f"\n📝 追加规则: {extra_rules[:30]}{'...' if len(extra_rules) > 30 else ''}"
@@ -684,21 +707,24 @@ class FigurineProPlugin(Star):
 
         # 6. 启动后台任务
         asyncio.create_task(
-            self._run_background_task(event, images, final_prompt, preset_name, deduction, uid, gid, cost, extra_rules)
+            self._run_background_task(event, images, final_prompt, preset_name, deduction, uid, gid, cost, extra_rules, hide_text=hide_llm_progress)
         )
 
-        # 返回结果（附带叛逆提示）
-        result = f"任务已受理，预设：{preset_name}。"
-        if extra_rules:
-            result += f" 追加规则：{extra_rules[:30]}。"
-        result += "图片生成中，完成后将自动发送。"
+        # 返回结果 - 明确告诉 LLM 不需要再回复
+        # 添加叛逆提示（如果有）
+        rebellious_hint = self._get_rebellious_hint(prompt, uid)
         
-        # 添加叛逆提示
-        rebellious_hint = self._get_rebellious_hint(prompt)
         if rebellious_hint:
+            # 有叛逆提示时，让 LLM 可以用叛逆语气回复
+            result = f"任务已受理，预设：{preset_name}。"
+            if extra_rules:
+                result += f" 追加规则：{extra_rules[:30]}。"
+            result += "图片生成中，完成后将自动发送。"
             result += rebellious_hint
-        
-        return result
+            return result
+        else:
+            # 没有叛逆提示时，告诉 LLM 保持沉默
+            return f"[TOOL_SUCCESS] 图生图任务已启动，预设：{preset_name}。图片将在后台生成并自动发送给用户。【重要】你不需要再回复任何内容，保持沉默即可，用户会直接收到图片。"
 
     # ================= 传统指令触发 =================
 
@@ -787,7 +813,17 @@ class FigurineProPlugin(Star):
             yield event.chain_result([Plain("请发送图片或提供描述。")])
             return
 
-        model = self.conf.get("power_model_id") if is_power else self.conf.get("model", "nano-banana")
+        # 判断是否为纯文生图模式（bnn 指令且没有图片）
+        is_text_to_image = is_bnn and not images and user_prompt
+        
+        if is_power:
+            model = self.conf.get("power_model_id")
+        elif is_text_to_image:
+            # 纯文生图使用专用模型
+            model = self._get_text_to_image_model()
+        else:
+            model = self.conf.get("model", "nano-banana")
+        
         if model_idx_override is not None and not is_power:
             all_models = [m if isinstance(m, str) else m["id"] for m in self.conf.get("model_list", [])]
             if 0 <= model_idx_override < len(all_models):
@@ -847,7 +883,8 @@ class FigurineProPlugin(Star):
                 images = ref_images
                 logger.info(f"已加载 {len(ref_images)} 张预设参考图: {preset_name}")
 
-        model = self.conf.get("model", "nano-banana")
+        # 文生图使用专用模型
+        model = self._get_text_to_image_model()
         start = datetime.now()
         res = await self.api_mgr.call_api(images, final_prompt, model, False, self.img_mgr.proxy)
 
@@ -1236,7 +1273,7 @@ class FigurineProPlugin(Star):
                 self._run_background_task(event, [], final_prompt, preset_name, deduction, uid, gid, 1, extra_rules)
             )
             
-            return f"文生图任务已受理，预设：{preset_name}。图片生成中，完成后将自动发送。"
+            return f"[TOOL_SUCCESS] 文生图任务已启动，预设：{preset_name}。图片将在后台生成并自动发送给用户。【重要】你不需要再回复任何内容，保持沉默即可，用户会直接收到图片。"
         
         elif task_type == "image_to_image":
             # 图生图
@@ -1280,11 +1317,7 @@ class FigurineProPlugin(Star):
                 self._run_background_task(event, images, processed_prompt, preset_name, deduction, uid, gid, 1, extra_rules)
             )
             
-            result = f"图生图任务已受理，预设：{preset_name}。"
-            if extra_rules:
-                result += f" 规则：{extra_rules[:20]}。"
-            result += "图片生成中，完成后将自动发送。"
-            return result
+            return f"[TOOL_SUCCESS] 图生图任务已启动，预设：{preset_name}。图片将在后台生成并自动发送给用户。【重要】你不需要再回复任何内容，保持沉默即可，用户会直接收到图片。"
         
         return "未知任务类型"
 
@@ -1614,7 +1647,7 @@ class FigurineProPlugin(Star):
     async def _run_single_batch_task(self, event: AstrMessageEvent, image_bytes: bytes,
                                      prompt: str, preset_name: str, task_index: int, total_tasks: int,
                                      uid: str, gid: str, extra_rules: str = "", 
-                                     image_source: str = "") -> Tuple[bool, str]:
+                                     image_source: str = "", hide_text: bool = False) -> Tuple[bool, str]:
         """
         执行单个批量任务（不扣费，由调用方统一扣费）
         
@@ -1640,13 +1673,16 @@ class FigurineProPlugin(Star):
                 elapsed = (datetime.now() - start_time).total_seconds()
                 await self.data_mgr.record_usage(uid, gid)
 
-                # 构建成功文案
-                info_text = f"\n✅ [{task_index}/{total_tasks}] 生成成功 ({elapsed:.2f}s) | 预设: {preset_name}"
-                if extra_rules:
-                    info_text += f" | 规则: {extra_rules[:15]}..."
+                chain_nodes = [Image.fromBytes(res)]
+                if not hide_text:
+                    # 构建成功文案
+                    info_text = f"\n✅ [{task_index}/{total_tasks}] 生成成功 ({elapsed:.2f}s) | 预设: {preset_name}"
+                    if extra_rules:
+                        info_text += f" | 规则: {extra_rules[:15]}..."
+                    chain_nodes.append(Plain(info_text))
 
                 # 发送结果
-                chain = event.chain_result([Image.fromBytes(res), Plain(info_text)])
+                chain = event.chain_result(chain_nodes)
                 await event.send(chain)
                 return True, ""
             else:
@@ -1726,14 +1762,18 @@ class FigurineProPlugin(Star):
         # 4.1 更新冷却时间
         self._update_image_cooldown(uid)
         
+        obedient_whitelist = self.conf.get("obedient_whitelist", [])
+        hide_llm_progress = not self.conf.get("llm_show_progress", True) or (obedient_whitelist and uid in obedient_whitelist)
+
         # 5. 发送开始提示
-        feedback = f"📦 批量处理任务开始\n"
-        feedback += f"📷 共 {total_images} 张图片\n"
-        feedback += f"🎨 预设: {preset_name}"
-        if extra_rules:
-            feedback += f"\n📝 规则: {extra_rules[:30]}{'...' if len(extra_rules) > 30 else ''}"
-        feedback += f"\n⏳ 每张图片将独立处理，请耐心等待..."
-        await event.send(event.chain_result([Plain(feedback)]))
+        if not hide_llm_progress:
+            feedback = f"📦 批量处理任务开始\n"
+            feedback += f"📷 共 {total_images} 张图片\n"
+            feedback += f"🎨 预设: {preset_name}"
+            if extra_rules:
+                feedback += f"\n📝 规则: {extra_rules[:30]}{'...' if len(extra_rules) > 30 else ''}"
+            feedback += f"\n⏳ 每张图片将独立处理，请耐心等待..."
+            await event.send(event.chain_result([Plain(feedback)]))
         
         # 6. 扣费
         if deduction["source"] == "user":
@@ -1777,7 +1817,8 @@ class FigurineProPlugin(Star):
                         uid=uid,
                         gid=gid,
                         extra_rules=extra_rules,
-                        image_source=url
+                        image_source=url,
+                        hide_text=hide_llm_progress
                     )
                     
                     if success:
@@ -1811,22 +1852,23 @@ class FigurineProPlugin(Star):
                         Plain(f"❌ 第 {i}/{total_images} 张图片处理失败\n📍 原因: {error_msg}")
                     ]))
             
-            # 发送完成汇总
-            quota_str = self._get_quota_str(deduction, uid)
-            summary = f"\n📊 批量处理完成\n"
-            summary += f"✅ 成功: {success_count} 张\n"
-            summary += f"❌ 失败: {fail_count} 张\n"
-            summary += f"💰 剩余次数: {quota_str}"
-            
-            # 如果有失败的，附加失败汇总
-            if failed_details:
-                summary += f"\n\n📋 失败图片汇总:"
-                for detail in failed_details[:5]:  # 最多显示5条
-                    summary += f"\n  • 第{detail['index']}张: {detail['reason']}"
-                if len(failed_details) > 5:
-                    summary += f"\n  ... 还有 {len(failed_details) - 5} 张失败"
-            
-            await event.send(event.chain_result([Plain(summary)]))
+            if not hide_llm_progress:
+                # 发送完成汇总
+                quota_str = self._get_quota_str(deduction, uid)
+                summary = f"\n📊 批量处理完成\n"
+                summary += f"✅ 成功: {success_count} 张\n"
+                summary += f"❌ 失败: {fail_count} 张\n"
+                summary += f"💰 剩余次数: {quota_str}"
+                
+                # 如果有失败的，附加失败汇总
+                if failed_details:
+                    summary += f"\n\n📋 失败图片汇总:"
+                    for detail in failed_details[:5]:  # 最多显示5条
+                        summary += f"\n  • 第{detail['index']}张: {detail['reason']}"
+                    if len(failed_details) > 5:
+                        summary += f"\n  ... 还有 {len(failed_details) - 5} 张失败"
+                
+                await event.send(event.chain_result([Plain(summary)]))
         
         # 启动异步任务
         asyncio.create_task(process_all())
@@ -1902,14 +1944,18 @@ class FigurineProPlugin(Star):
         # 4.1 更新冷却时间
         self._update_image_cooldown(uid)
         
+        obedient_whitelist = self.conf.get("obedient_whitelist", [])
+        hide_llm_progress = not self.conf.get("llm_show_progress", True) or (obedient_whitelist and uid in obedient_whitelist)
+
         # 5. 发送开始提示
-        feedback = f"🚀 并发批量处理任务开始\n"
-        feedback += f"📷 共 {total_images} 张图片 | 并发: {concurrency}\n"
-        feedback += f"🎨 预设: {preset_name}"
-        if extra_rules:
-            feedback += f"\n📝 规则: {extra_rules[:30]}{'...' if len(extra_rules) > 30 else ''}"
-        feedback += f"\n⏳ 图片将并发处理，请耐心等待..."
-        await event.send(event.chain_result([Plain(feedback)]))
+        if not hide_llm_progress:
+            feedback = f"🚀 并发批量处理任务开始\n"
+            feedback += f"📷 共 {total_images} 张图片 | 并发: {concurrency}\n"
+            feedback += f"🎨 预设: {preset_name}"
+            if extra_rules:
+                feedback += f"\n📝 规则: {extra_rules[:30]}{'...' if len(extra_rules) > 30 else ''}"
+            feedback += f"\n⏳ 图片将并发处理，请耐心等待..."
+            await event.send(event.chain_result([Plain(feedback)]))
         
         # 6. 扣费
         if deduction["source"] == "user":
@@ -1954,7 +2000,8 @@ class FigurineProPlugin(Star):
                         uid=uid,
                         gid=gid,
                         extra_rules=extra_rules,
-                        image_source=url
+                        image_source=url,
+                        hide_text=hide_llm_progress
                     )
                     
                     async with results_lock:
@@ -1995,22 +2042,23 @@ class FigurineProPlugin(Star):
             # 等待所有任务完成
             await asyncio.gather(*tasks)
             
-            # 发送完成汇总
-            quota_str = self._get_quota_str(deduction, uid)
-            summary = f"\n📊 并发批量处理完成\n"
-            summary += f"✅ 成功: {results['success']} 张\n"
-            summary += f"❌ 失败: {results['fail']} 张\n"
-            summary += f"💰 剩余次数: {quota_str}"
-            
-            # 如果有失败的，附加失败汇总
-            if failed_details:
-                summary += f"\n\n📋 失败图片汇总:"
-                for detail in sorted(failed_details, key=lambda x: x['index'])[:5]:
-                    summary += f"\n  • 第{detail['index']}张: {detail['reason']}"
-                if len(failed_details) > 5:
-                    summary += f"\n  ... 还有 {len(failed_details) - 5} 张失败"
-            
-            await event.send(event.chain_result([Plain(summary)]))
+            if not hide_llm_progress:
+                # 发送完成汇总
+                quota_str = self._get_quota_str(deduction, uid)
+                summary = f"\n📊 并发批量处理完成\n"
+                summary += f"✅ 成功: {results['success']} 张\n"
+                summary += f"❌ 失败: {results['fail']} 张\n"
+                summary += f"💰 剩余次数: {quota_str}"
+                
+                # 如果有失败的，附加失败汇总
+                if failed_details:
+                    summary += f"\n\n📋 失败图片汇总:"
+                    for detail in sorted(failed_details, key=lambda x: x['index'])[:5]:
+                        summary += f"\n  • 第{detail['index']}张: {detail['reason']}"
+                    if len(failed_details) > 5:
+                        summary += f"\n  ... 还有 {len(failed_details) - 5} 张失败"
+                
+                await event.send(event.chain_result([Plain(summary)]))
         
         # 启动异步任务
         asyncio.create_task(process_all())
@@ -2115,7 +2163,8 @@ class FigurineProPlugin(Star):
             )
         )
         
-        return f"人设照片生成任务已启动，场景：{scene_name}。图片生成中，完成后将自动发送。"
+        # 返回结果 - 明确告诉 LLM 不需要再回复
+        return f"[TOOL_SUCCESS] 人设照片生成任务已启动，场景：{scene_name}。图片将在后台生成并自动发送给用户。【重要】你不需要再回复任何内容，保持沉默即可，用户会直接收到图片。"
 
     @filter.command("人设拍照", prefix_optional=True)
     async def on_persona_photo_cmd(self, event: AstrMessageEvent, ctx=None):
@@ -2295,19 +2344,43 @@ class FigurineProPlugin(Star):
         
         yield event.chain_result([Plain(msg)])
 
-    @filter.command("批量处理", aliases={"批量手办化", "全部处理"}, prefix_optional=True)
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=4)
     async def on_batch_process_cmd(self, event: AstrMessageEvent, ctx=None):
         """批量处理上下文中的图片（指令模式）
         
-        用法: #批量处理 <预设名> [追加规则]
-        示例: #批量处理 手办化 皮肤白一点
+        用法: #批量<预设名> [追加规则]
+        示例: #批量手办化 皮肤白一点
         """
-        parts = event.message_str.split(maxsplit=1)
-        if len(parts) < 2:
-            yield event.chain_result([Plain("用法: #批量处理 <预设名> [追加规则]\n示例: #批量处理 手办化 皮肤白一点")])
+        if self.conf.get("prefix", True) and not event.is_at_or_wake_command:
             return
+
+        text = event.message_str.strip()
+        if not text: return
         
-        prompt = parts[1].strip()
+        # 匹配 "批量xxx" 或 "全部xxx"
+        match = re.match(r"^(?:#|/)?(批量|全部)(.+)$", text)
+        if not match:
+            # 单独的 "批量" 或 "全部"
+            if re.match(r"^(?:#|/)?(批量|全部)$", text):
+                yield event.chain_result([Plain("用法: #批量<预设名> [追加规则]\n示例: #批量手办化 皮肤白一点")])
+                event.stop_event()
+            return
+            
+        preset_and_rules = match.group(2).strip()
+        
+        if preset_and_rules.startswith("处理"):
+            # 兼容旧版的 "批量处理 xxx"
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2:
+                yield event.chain_result([Plain("用法: #批量<预设名> [追加规则]\n示例: #批量手办化 皮肤白一点")])
+                event.stop_event()
+                return
+            prompt = parts[1].strip()
+        else:
+            prompt = preset_and_rules
+            
+        # 阻止事件继续传递给 on_figurine_request
+        event.stop_event()
         
         # 获取上下文中的图片
         session_id = event.unified_msg_origin
@@ -2366,6 +2439,7 @@ class FigurineProPlugin(Star):
         # 处理每张图片
         success_count = 0
         fail_count = 0
+        failed_details = []
         
         for i, url in enumerate(all_image_urls, 1):
             try:
@@ -2386,13 +2460,19 @@ class FigurineProPlugin(Star):
                     total_tasks=total_images,
                     uid=uid,
                     gid=gid,
-                    extra_rules=extra_rules
+                    extra_rules=extra_rules,
+                    image_source=url
                 )
                 
                 if success:
                     success_count += 1
                 else:
                     fail_count += 1
+                    failed_details.append({
+                        "index": i,
+                        "reason": error_msg,
+                        "url_preview": url[:50] + "..." if len(url) > 50 else url
+                    })
                     if error_msg:
                         yield event.chain_result([Plain(f"❌ [{i}/{total_images}] {error_msg}")])
                 
@@ -2402,6 +2482,12 @@ class FigurineProPlugin(Star):
                     
             except Exception as e:
                 logger.error(f"Batch process image {i} error: {e}")
+                error_msg = self._translate_error_to_chinese(str(e))
+                failed_details.append({
+                    "index": i,
+                    "reason": error_msg,
+                    "url_preview": url[:50] + "..." if len(url) > 50 else url
+                })
                 yield event.chain_result([Plain(f"❌ [{i}/{total_images}] 处理异常: {e}")])
                 fail_count += 1
         
@@ -2411,4 +2497,12 @@ class FigurineProPlugin(Star):
         summary += f"✅ 成功: {success_count} 张\n"
         summary += f"❌ 失败: {fail_count} 张\n"
         summary += f"💰 剩余次数: {quota_str}"
+        
+        if failed_details:
+            summary += f"\n\n📋 失败图片汇总:"
+            for detail in failed_details[:5]:
+                summary += f"\n  • 第{detail['index']}张: {detail['reason']}"
+            if len(failed_details) > 5:
+                summary += f"\n  ... 还有 {len(failed_details) - 5} 张失败"
+                
         yield event.chain_result([Plain(summary)])

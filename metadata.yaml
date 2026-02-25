@@ -1,7 +1,7 @@
 name: astrbot_plugin_shoubanhua
 desc: 支持第三方所有OpenAI绘图格式和原生Google Gemini 终极缝合怪，文生图/图生图插件，支持LLM智能判断
 help: |
-  🎨 手办化插件 v2.0.0
+  🎨 手办化插件 v2.1.0
   
   新增功能：
   - LLM智能判断：自动识别文生图/图生图
@@ -12,6 +12,6 @@ help: |
   - #上下文状态 - 查看上下文状态
   - #清除上下文 - 清除当前会话上下文
   - #测试智能判断 <文本> - 测试智能判断功能
-version: v2.0.0
+version: v2.1.0
 author: shskjw
 repo: https://github.com/shskjw/astrbot_plugin_shoubanhua
