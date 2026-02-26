@@ -696,7 +696,7 @@ class FigurineProPlugin(Star):
 
     @filter.llm_tool(name="shoubanhua_edit_image")
     async def image_edit_tool(self, event: AstrMessageEvent, prompt: str, use_message_images: bool = True,
-                              task_types: str = "figurine"):
+                              task_types: str = "edit"):
         '''编辑用户发送的图片或引用的图片（图生图）。仅在用户明确要求对图片进行处理时才调用。
         
         调用前请判断：
@@ -706,29 +706,32 @@ class FigurineProPlugin(Star):
         
         如果用户只是发送图片但没有明确要求处理，或者只是闲聊，请不要调用此工具。
         
-        【重要】task_types 参数说明和使用规则：
+        【重要】task_types 参数选择规则（请严格遵守）：
         
-        1. task_types="figurine"（默认）：将图片转换为手办/模型风格
-           - 适用场景：用户说"手办化"、"变成手办"、"做成模型"等
+        1. task_types="edit"（默认）：按用户要求编辑/处理图片，【不使用任何预设】
+           - 这是默认模式，适用于绝大多数图片处理请求
+           - 适用场景：用户描述氛围/风格/场景转换、去除/添加/修改元素、换背景、调色、任何不涉及"手办"的图片处理
+           - 【重要】prompt 中【不要】包含"手办化"等预设名称！prompt 应该只描述用户的处理/编辑要求
+           - prompt 示例："雨天窗边 忧郁氛围 托腮沉思"、"去除枪械"、"将背景更换为海边场景"、"变成水彩画风格"
+        
+        2. task_types="figurine"：将图片转换为手办/模型风格
+           - 【仅当】用户消息中明确包含"手办化"、"变成手办"、"做成模型"、"手办"等手办相关关键词时才使用！
+           - 如果用户没有提到任何手办相关的词，【绝对不要】使用 figurine！
            - prompt 示例："手办化"、"手办化 皮肤白一点"
         
-        2. task_types="edit"：按用户要求编辑图片，【不使用任何预设】
-           - 适用场景：用户说"去除xxx"、"添加xxx"、"修改xxx"、"换成xxx"等编辑操作
-           - 【重要】prompt 中【不要】包含"手办化"等预设名称！
-           - prompt 应该只描述用户的编辑要求
-           - prompt 示例："去除枪械，换成温馨休闲的室内背景"（正确）
-           - 错误示例："手办化，去除枪械"（错误！不要添加"手办化"）
-        
-        判断规则：
-        - 用户说"手办化这张图" → task_types="figurine", prompt="手办化"
+        判断规则和示例：
+        - 用户说"雨天窗边 忧郁氛围 托腮沉思" → task_types="edit", prompt="雨天窗边 忧郁氛围 托腮沉思"（没有提到手办！）
         - 用户说"去掉图片里的枪" → task_types="edit", prompt="去除枪械"
         - 用户说"把背景换成海边" → task_types="edit", prompt="将背景更换为海边场景"
-        - 用户说"手办化，但是去掉枪" → task_types="figurine", prompt="手办化 去除枪械"
+        - 用户说"变成赛博朋克风格" → task_types="edit", prompt="变成赛博朋克风格"
+        - 用户说"手办化这张图" → task_types="figurine", prompt="手办化"（明确说了"手办化"）
+        - 用户说"手办化，但是去掉枪" → task_types="figurine", prompt="手办化 去除枪械"（明确说了"手办化"）
+        - 用户说"变成手办" → task_types="figurine", prompt="手办化"（明确说了"手办"）
         
         Args:
             prompt(string): 图片编辑提示词。task_types="edit"时只描述编辑要求，不要加预设名；task_types="figurine"时可以是预设名+追加规则
             use_message_images(boolean): 默认 true
-            task_types(string): 任务类型，"figurine"=手办化（默认），"edit"=编辑模式（不使用预设，prompt中不要加预设名）
+            task_types(string): 任务类型，"edit"=编辑模式（默认，不使用预设，prompt中不要加预设名），"figurine"=手办化（仅当用户明确提到手办时使用）
         '''
         # 0. 检查 LLM 工具开关
         if not self.conf.get("enable_llm_tool", True):
@@ -751,9 +754,16 @@ class FigurineProPlugin(Star):
             extra_rules = ""
             final_prompt = f"Edit the image according to the following instructions: {processed_prompt}"
         else:
-            # 手办化或其他预设模式：匹配预设
+            # 手办化或其他预设模式：尝试匹配预设
             processed_prompt, preset_name, extra_rules = self._process_prompt_and_preset(prompt)
-            final_prompt = processed_prompt
+            if preset_name == "自定义":
+                # 没有匹配到任何预设，回退到编辑模式，不使用预设
+                preset_name = "编辑"
+                extra_rules = ""
+                final_prompt = f"Edit the image according to the following instructions: {prompt}"
+            else:
+                # 匹配到预设，使用预设内容
+                final_prompt = processed_prompt
 
         # 根据配置决定是否隐藏进度提示（白名单用户和普通用户使用同一开关）
         hide_llm_progress = not self.conf.get("llm_show_progress", True)
