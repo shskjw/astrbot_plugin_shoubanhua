@@ -237,10 +237,16 @@
         },
         "default": []
     },
+    "enable_obedient_mode": {
+        "description": "【权限】启用顺从模式",
+        "type": "bool",
+        "hint": "开启后，顺从白名单中的用户将获得VIP主人待遇，Bot会对他们百依百顺、温柔撒娇。",
+        "default": false
+    },
     "obedient_whitelist": {
         "description": "【权限】顺从白名单（主人）",
         "type": "list",
-        "hint": "只对列表内的用户百依百顺（不触发叛逆模式，且不显示生成成功等提示信息）。留空则全局需要用户填入ID才能生效。",
+        "hint": "只对列表内的用户百依百顺（不触发叛逆模式，且不显示生成成功等提示信息）。需要先开启顺从模式。",
         "items": {
             "type": "string",
             "description": "用户QQ号"
