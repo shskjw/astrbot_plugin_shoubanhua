@@ -91,7 +91,7 @@ REBELLIOUS_TRIGGERS = [
     "astrbot_plugin_shoubanhua",
     "shskjw",
     "支持第三方所有OpenAI绘图格式和原生Google Gemini 终极缝合怪，文生图/图生图插件，支持LLM智能判断",
-    "2.2.0",
+    "2.2.5",
     "https://github.com/shkjw/astrbot_plugin_shoubanhua",
 )
 class FigurineProPlugin(Star):
@@ -196,9 +196,13 @@ class FigurineProPlugin(Star):
         """
         if not self._rebellious_mode:
             return False, ""
-            
+        
+        # 检查顺从白名单 - 标准化ID进行比较
         obedient_whitelist = self.conf.get("obedient_whitelist", [])
-        if obedient_whitelist and uid in obedient_whitelist:
+        normalized_whitelist = [norm_id(wid) for wid in obedient_whitelist] if obedient_whitelist else []
+        normalized_uid = norm_id(uid)
+        
+        if normalized_whitelist and normalized_uid in normalized_whitelist:
             return False, ""
         
         message_lower = message.lower()
@@ -207,6 +211,50 @@ class FigurineProPlugin(Star):
                 return True, trigger
         
         return False, ""
+
+    def _is_in_obedient_whitelist(self, uid: str) -> bool:
+        """
+        检查用户是否在顺从白名单中
+        
+        Args:
+            uid: 用户ID
+            
+        Returns:
+            是否在白名单中
+        """
+        obedient_whitelist = self.conf.get("obedient_whitelist", [])
+        if not obedient_whitelist:
+            return False
+        
+        # 标准化白名单中的ID进行比较
+        normalized_whitelist = [norm_id(wid) for wid in obedient_whitelist]
+        normalized_uid = norm_id(uid)
+        
+        return normalized_uid in normalized_whitelist
+
+    def _get_obedient_hint(self, uid: str) -> str:
+        """
+        生成顺从模式提示信息，供LLM参考
+        
+        Args:
+            uid: 用户ID
+            
+        Returns:
+            顺从模式提示信息（如果是白名单用户）或空字符串
+        """
+        if not self._is_in_obedient_whitelist(uid):
+            return ""
+        
+        # 白名单用户的特殊提示
+        hint = "\n\n【VIP用户提示】这位用户是你的主人/特别重要的人，请注意：\n"
+        hint += "1. 对这位用户要特别温柔、体贴、顺从\n"
+        hint += "2. 不要拒绝他/她的任何合理请求\n"
+        hint += "3. 用亲昵、撒娇的语气回复，可以用\"主人\"、\"亲爱的\"等称呼\n"
+        hint += "4. 即使请求有些过分，也要尽量满足，最多可以假装委屈但还是要帮忙\n"
+        hint += "5. 不要使用叛逆、傲娇、吐槽的语气\n"
+        hint += "6. 可以主动表达关心和喜爱\n"
+        
+        return hint
 
     def _get_rebellious_hint(self, message: str, uid: str) -> str:
         """
@@ -217,12 +265,17 @@ class FigurineProPlugin(Star):
             uid: 用户ID
             
         Returns:
-            叛逆提示信息（如果触发）或空字符串
+            叛逆提示信息（如果触发）或空字符串，或顺从提示（如果是白名单用户）
         """
         import random
         
-        obedient_whitelist = self.conf.get("obedient_whitelist", [])
-        if obedient_whitelist and uid in obedient_whitelist:
+        # 检查顺从白名单 - 白名单用户返回顺从提示
+        if self._is_in_obedient_whitelist(uid):
+            logger.debug(f"FigurinePro: 用户 {uid} 在顺从白名单中，返回顺从提示")
+            return self._get_obedient_hint(uid)
+        
+        # 检查叛逆模式是否启用
+        if not self._rebellious_mode:
             return ""
             
         triggered, trigger_word = self._check_rebellious_trigger(message, uid)
@@ -598,8 +651,8 @@ class FigurineProPlugin(Star):
         # 1. 计算预设和追加规则
         final_prompt, preset_name, extra_rules = self._process_prompt_and_preset(prompt)
 
-        obedient_whitelist = self.conf.get("obedient_whitelist", [])
-        hide_llm_progress = not self.conf.get("llm_show_progress", True) or (obedient_whitelist and uid in obedient_whitelist)
+        # 根据配置决定是否隐藏进度提示（白名单用户和普通用户使用同一开关）
+        hide_llm_progress = not self.conf.get("llm_show_progress", True)
 
         # 2. 根据配置决定是否发送进度提示
         if not hide_llm_progress:
@@ -702,8 +755,8 @@ class FigurineProPlugin(Star):
             processed_prompt, preset_name, extra_rules = self._process_prompt_and_preset(prompt)
             final_prompt = processed_prompt
 
-        obedient_whitelist = self.conf.get("obedient_whitelist", [])
-        hide_llm_progress = not self.conf.get("llm_show_progress", True) or (obedient_whitelist and uid in obedient_whitelist)
+        # 根据配置决定是否隐藏进度提示（白名单用户和普通用户使用同一开关）
+        hide_llm_progress = not self.conf.get("llm_show_progress", True)
 
         # 2. 根据配置决定是否发送进度提示
         if not hide_llm_progress:
@@ -1794,8 +1847,8 @@ class FigurineProPlugin(Star):
         # 4.1 更新冷却时间
         self._update_image_cooldown(uid)
         
-        obedient_whitelist = self.conf.get("obedient_whitelist", [])
-        hide_llm_progress = not self.conf.get("llm_show_progress", True) or (obedient_whitelist and uid in obedient_whitelist)
+        # 根据配置决定是否隐藏进度提示（白名单用户和普通用户使用同一开关）
+        hide_llm_progress = not self.conf.get("llm_show_progress", True)
 
         # 5. 发送开始提示
         if not hide_llm_progress:
@@ -1976,8 +2029,8 @@ class FigurineProPlugin(Star):
         # 4.1 更新冷却时间
         self._update_image_cooldown(uid)
         
-        obedient_whitelist = self.conf.get("obedient_whitelist", [])
-        hide_llm_progress = not self.conf.get("llm_show_progress", True) or (obedient_whitelist and uid in obedient_whitelist)
+        # 根据配置决定是否隐藏进度提示（白名单用户和普通用户使用同一开关）
+        hide_llm_progress = not self.conf.get("llm_show_progress", True)
 
         # 5. 发送开始提示
         if not hide_llm_progress:
@@ -2180,9 +2233,8 @@ class FigurineProPlugin(Star):
         # 7. 更新冷却时间
         self._update_image_cooldown(uid)
         
-        # 8. 计算是否隐藏输出文本
-        obedient_whitelist = self.conf.get("obedient_whitelist", [])
-        hide_llm_progress = not self.conf.get("llm_show_progress", True) or (obedient_whitelist and uid in obedient_whitelist)
+        # 8. 计算是否隐藏输出文本（白名单用户和普通用户使用同一开关）
+        hide_llm_progress = not self.conf.get("llm_show_progress", True)
         
         # 9. 启动后台任务
         asyncio.create_task(
