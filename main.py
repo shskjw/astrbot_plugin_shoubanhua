@@ -91,7 +91,7 @@ REBELLIOUS_TRIGGERS = [
     "astrbot_plugin_shoubanhua",
     "shskjw",
     "支持第三方所有OpenAI绘图格式和原生Google Gemini 终极缝合怪，文生图/图生图插件，支持LLM智能判断",
-    "2.2.5",
+    "2.2.6",
     "https://github.com/shkjw/astrbot_plugin_shoubanhua",
 )
 class FigurineProPlugin(Star):
@@ -183,13 +183,14 @@ class FigurineProPlugin(Star):
         
         return random.choice(excuses)
 
-    def _check_rebellious_trigger(self, message: str, uid: str) -> Tuple[bool, str]:
+    def _check_rebellious_trigger(self, message: str, uid: str, event=None) -> Tuple[bool, str]:
         """
         检查消息是否触发叛逆模式
         
         Args:
             message: 用户消息
             uid: 用户ID
+            event: 消息事件（用于检测管理员身份）
             
         Returns:
             (是否触发, 触发的关键词)
@@ -197,12 +198,8 @@ class FigurineProPlugin(Star):
         if not self._rebellious_mode:
             return False, ""
         
-        # 检查顺从白名单 - 标准化ID进行比较
-        obedient_whitelist = self.conf.get("obedient_whitelist", [])
-        normalized_whitelist = [norm_id(wid) for wid in obedient_whitelist] if obedient_whitelist else []
-        normalized_uid = norm_id(uid)
-        
-        if normalized_whitelist and normalized_uid in normalized_whitelist:
+        # 检查顺从白名单（含管理员）
+        if self._is_in_obedient_whitelist(uid, event):
             return False, ""
         
         message_lower = message.lower()
@@ -212,19 +209,31 @@ class FigurineProPlugin(Star):
         
         return False, ""
 
-    def _is_in_obedient_whitelist(self, uid: str) -> bool:
+    def _is_in_obedient_whitelist(self, uid: str, event=None) -> bool:
         """
-        检查用户是否在顺从白名单中
+        检查用户是否在顺从白名单中（管理员自动视为顺从白名单成员）
         
         Args:
             uid: 用户ID
+            event: 消息事件（用于检测管理员身份）
             
         Returns:
             是否在白名单中
         """
+        # 管理员自动视为顺从白名单成员
+        if event is not None and self.is_admin(event):
+            return True
+        
         obedient_whitelist = self.conf.get("obedient_whitelist", [])
         if not obedient_whitelist:
             return False
+            
+        # 兼容配置项为字符串的情况（以逗号分隔）
+        if isinstance(obedient_whitelist, str):
+            obedient_whitelist = [x.strip() for x in obedient_whitelist.split(',') if x.strip()]
+        elif not isinstance(obedient_whitelist, list):
+            # 将单个对象转换为列表
+            obedient_whitelist = [str(obedient_whitelist)]
         
         # 标准化白名单中的ID进行比较
         normalized_whitelist = [norm_id(wid) for wid in obedient_whitelist]
@@ -232,21 +241,31 @@ class FigurineProPlugin(Star):
         
         return normalized_uid in normalized_whitelist
 
-    def _get_obedient_hint(self, uid: str) -> str:
+    def _get_obedient_hint(self, uid: str, event=None) -> str:
         """
         生成顺从模式提示信息，供LLM参考
         
         Args:
             uid: 用户ID
+            event: 消息事件（用于检测管理员身份）
             
         Returns:
             顺从模式提示信息（如果是白名单用户）或空字符串
         """
-        if not self._is_in_obedient_whitelist(uid):
+        if not self._is_in_obedient_whitelist(uid, event):
             return ""
+            
+        user_name = ""
+        if event is not None and hasattr(event, "get_sender_name"):
+            try:
+                user_name = event.get_sender_name()
+            except Exception:
+                pass
+                
+        name_str = f"（{user_name}）" if user_name else ""
         
         # 白名单用户的特殊提示
-        hint = "\n\n【VIP用户提示】这位用户是你的主人/特别重要的人，请注意：\n"
+        hint = f"\n\n【VIP用户提示】这位用户{name_str}是你的主人/特别重要的人，请注意：\n"
         hint += "1. 对这位用户要特别温柔、体贴、顺从\n"
         hint += "2. 不要拒绝他/她的任何合理请求\n"
         hint += "3. 用亲昵、撒娇的语气回复，可以用\"主人\"、\"亲爱的\"等称呼\n"
@@ -256,29 +275,30 @@ class FigurineProPlugin(Star):
         
         return hint
 
-    def _get_rebellious_hint(self, message: str, uid: str) -> str:
+    def _get_rebellious_hint(self, message: str, uid: str, event=None) -> str:
         """
         生成叛逆提示信息，供LLM参考
         
         Args:
             message: 用户消息
             uid: 用户ID
+            event: 消息事件（用于检测管理员身份）
             
         Returns:
             叛逆提示信息（如果触发）或空字符串，或顺从提示（如果是白名单用户）
         """
         import random
         
-        # 检查顺从白名单 - 白名单用户返回顺从提示
-        if self._is_in_obedient_whitelist(uid):
-            logger.debug(f"FigurinePro: 用户 {uid} 在顺从白名单中，返回顺从提示")
-            return self._get_obedient_hint(uid)
+        # 检查顺从白名单（含管理员）- 白名单用户返回顺从提示
+        if self._is_in_obedient_whitelist(uid, event):
+            logger.debug(f"FigurinePro: 用户 {uid} 在顺从白名单中（或为管理员），返回顺从提示")
+            return self._get_obedient_hint(uid, event)
         
         # 检查叛逆模式是否启用
         if not self._rebellious_mode:
             return ""
             
-        triggered, trigger_word = self._check_rebellious_trigger(message, uid)
+        triggered, trigger_word = self._check_rebellious_trigger(message, uid, event)
         
         if not triggered:
             # 即使没有触发关键词，也有一定概率触发叛逆模式
@@ -680,7 +700,7 @@ class FigurineProPlugin(Star):
 
         # 6. 立刻返回给 LLM - 明确告诉 LLM 不需要再回复
         # 添加叛逆提示（如果有）
-        rebellious_hint = self._get_rebellious_hint(prompt, uid)
+        rebellious_hint = self._get_rebellious_hint(prompt, uid, event)
         
         if rebellious_hint:
             # 有叛逆提示时，让 LLM 可以用叛逆语气回复
@@ -807,7 +827,7 @@ class FigurineProPlugin(Star):
 
         # 返回结果 - 明确告诉 LLM 不需要再回复
         # 添加叛逆提示（如果有）
-        rebellious_hint = self._get_rebellious_hint(prompt, uid)
+        rebellious_hint = self._get_rebellious_hint(prompt, uid, event)
         
         if rebellious_hint:
             # 有叛逆提示时，让 LLM 可以用叛逆语气回复
