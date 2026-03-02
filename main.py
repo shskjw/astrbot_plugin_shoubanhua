@@ -1112,7 +1112,7 @@ class FigurineProPlugin(Star):
 
     @filter.llm_tool(name="shoubanhua_edit_image")
     async def image_edit_tool(self, event: AstrMessageEvent, prompt: str, use_message_images: bool = True,
-                              task_types: str = "edit", count: int = 1, context_image_count: int = 0):
+                              task_types: str = "edit", count: int = 1, merge_multiple_images: bool = False):
         '''编辑用户发送的图片或引用的图片（图生图）。仅在用户明确要求对图片进行处理时才调用。
         
         调用前请判断：
@@ -1122,9 +1122,9 @@ class FigurineProPlugin(Star):
         
         如果用户只是发送图片但没有明确要求处理，或者只是闲聊，请不要调用此工具。
         
-        【多图合并处理】当用户要求"把上面两张图片..."、"结合这几张图..."、"参考第一张修改第二张"等时：
-        - 将 context_image_count 设置为用户提到的图片数量（例如 2）
-        - 工具会自动从聊天记录中提取最近的指定数量的图片，一起发送给大模型处理。
+        【多图处理规则】当用户提供/引用了多张图片时：
+        - 默认情况 (merge_multiple_images=false)：会将这多张图片拆开，【分别、独立地】生成每一张图片。适用于用户一次性发多张图片想分别转化的场景。
+        - 只有当用户明确要求"把这几张图融合"、"参考第一张修改第二张"等合并需求时：将 merge_multiple_images 设置为 true。这会将多图作为一个整体发给模型。
         
         【批量生成不同版本】当用户要求"多来点"、"多来几张"、"不少于X张"、"来X张不同版本"时：
         - 设置 count 参数为用户要求的数量
@@ -1147,21 +1147,17 @@ class FigurineProPlugin(Star):
            - prompt 示例："手办化"、"手办化 皮肤白一点"
         
         判断规则和示例：
-        - 用户说"雨天窗边 忧郁氛围 托腮沉思" → task_types="edit", prompt="雨天窗边 忧郁氛围 托腮沉思"（没有提到手办！）
+        - 用户说"雨天窗边 忧郁氛围 托腮沉思" → task_types="edit", prompt="雨天窗边 忧郁氛围 托腮沉思"
         - 用户说"去掉图片里的枪" → task_types="edit", prompt="去除枪械"
-        - 用户说"把背景换成海边" → task_types="edit", prompt="将背景更换为海边场景"
-        - 用户说"变成赛博朋克风格" → task_types="edit", prompt="变成赛博朋克风格"
-        - 用户说"手办化这张图" → task_types="figurine", prompt="手办化"（明确说了"手办化"）
-        - 用户说"手办化，但是去掉枪" → task_types="figurine", prompt="手办化 去除枪械"（明确说了"手办化"）
-        - 用户说"变成手办" → task_types="figurine", prompt="手办化"（明确说了"手办"）
-        - 用户说"手办化 多来几张" → task_types="figurine", prompt="手办化", count=3（要求多个版本）
-        - 用户说"处理这张图 不少于5张" → task_types="edit", prompt="处理要求", count=5（要求多个版本）
+        - 用户说"手办化这张图" → task_types="figurine", prompt="手办化"
+        - 用户说"手办化，但是去掉枪" → task_types="figurine", prompt="手办化 去除枪械"
         
         Args:
             prompt(string): 图片编辑提示词。task_types="edit"时只描述编辑要求，不要加预设名；task_types="figurine"时可以是预设名+追加规则
             use_message_images(boolean): 默认 true
             task_types(string): 任务类型，"edit"=编辑模式（默认，不使用预设，prompt中不要加预设名），"figurine"=手办化（仅当用户明确提到手办时使用）
             count(int): 生成不同版本的数量，默认1张，最大10张。当用户要求"多来点"、"多来几张"时设置为3-5张。
+            merge_multiple_images(boolean): 如果有多张图片，是否合并为同一请求（默认为False即分别处理）。
         '''
         # 0. 检查 LLM 工具开关
         if not self.conf.get("enable_llm_tool", True):
@@ -1198,6 +1194,90 @@ class FigurineProPlugin(Star):
         # 根据配置决定是否隐藏进度提示（白名单用户和普通用户使用同一开关）
         hide_llm_progress = not self.conf.get("llm_show_progress", True)
 
+        # 3. 提取图片
+        images = []
+        if use_message_images:
+            bot_id = self._get_bot_id(event)
+            images = await self.img_mgr.extract_images_from_event(event, ignore_id=bot_id, context=self.context)
+
+        # 检查上下文图片
+        if not images:
+            session_id = event.unified_msg_origin
+            image_sources = await self._collect_images_from_context(session_id, count=self._context_rounds)
+            
+            all_urls = []
+            for _, urls in image_sources:
+                for url in urls:
+                    if url not in all_urls:
+                        all_urls.append(url)
+            
+            urls_to_fetch = []
+            if all_urls:
+                if merge_multiple_images:
+                    urls_to_fetch = all_urls[-3:] # 最多合并3张
+                else:
+                    urls_to_fetch = [all_urls[-1]] # 默认取最近1张
+            
+            if urls_to_fetch:
+                for url in urls_to_fetch:
+                    img_bytes = await self.img_mgr.load_bytes(url)
+                    if img_bytes:
+                        images.append(img_bytes)
+
+        if not images:
+            # 不要重复发送错误消息，只返回给 LLM
+            return "[TOOL_FAILED] 未检测到图片。请让用户发送或引用包含图片的消息后再试。【重要】不要再次调用此工具，直接用自然语言告诉用户需要提供图片。"
+
+        # 4. 限制批量生成数量
+        count = max(1, min(count, 10))  # 限制在1-10之间
+        gid = norm_id(event.get_group_id())
+
+        # ==== 分支：分别批量处理多张图片 ====
+        if len(images) > 1 and not merge_multiple_images:
+            total_images = len(images)
+            total_cost = total_images * count
+            deduction = await self._check_quota(event, uid, gid, total_cost)
+            if not deduction["allowed"]:
+                return f"❌ 次数不足。分别处理 {total_images} 张图片(每张{count}个版本)需要 {total_cost} 次。{deduction['msg']}"
+            
+            self._update_image_cooldown(uid)
+            
+            # 发送进度提示
+            if not hide_llm_progress:
+                preset_display = "自定义" if task_types.lower() == "edit" or preset_name in ["自定义", "编辑"] else preset_name
+                template = self.conf.get("generating_msg_template", "🎨 收到请求，正在生成 [{preset}]...")
+                feedback = template.replace("{preset}", preset_display)
+                if count > 1:
+                    feedback += f"\n⏳ 将分别处理 {total_images} 张图片，每张生成 {count} 个版本..."
+                else:
+                    feedback += f"\n⏳ 将分别处理 {total_images} 张图片..."
+                await event.send(event.chain_result([Plain(feedback)]))
+                
+            # 分别对每张图片启动生成任务
+            for img in images:
+                if count == 1:
+                    asyncio.create_task(
+                        self._run_background_task(event, [img], final_prompt, preset_name, deduction, uid, gid, count, extra_rules, hide_text=hide_llm_progress)
+                    )
+                else:
+                    asyncio.create_task(
+                        self._run_batch_image_to_image(event, [img], final_prompt, preset_name, deduction, uid, gid, count, extra_rules, hide_llm_progress)
+                    )
+                    
+            rebellious_hint = self._get_rebellious_hint(prompt, uid, event)
+            if rebellious_hint:
+                return f"任务已受理，预设：{preset_name}，共 {total_images} 张图片分别处理。" + rebellious_hint
+            else:
+                return f"[TOOL_SUCCESS] 多图分别处理任务已启动，共 {total_images} 张。你不需要再回复任何内容，保持沉默即可。"
+
+        # ==== 分支：普通单次处理（单图或合并多图） ====
+        total_cost = count
+        deduction = await self._check_quota(event, uid, gid, total_cost)
+        if not deduction["allowed"]:
+            if count > 1:
+                return f"❌ 次数不足。生成 {count} 个版本需要 {total_cost} 次。{deduction['msg']}"
+            return deduction["msg"]
+
         # 2. 根据配置决定是否发送进度提示
         if not hide_llm_progress:
             preset_display = "自定义" if task_types.lower() == "edit" or preset_name in ["自定义", "编辑"] else preset_name
@@ -1210,56 +1290,6 @@ class FigurineProPlugin(Star):
                     feedback += f" (共 {count} 个版本)"
                 
             await event.send(event.chain_result([Plain(feedback)]))
-
-        # 3. 提取图片
-        images = []
-        if use_message_images:
-            bot_id = self._get_bot_id(event)
-            images = await self.img_mgr.extract_images_from_event(event, ignore_id=bot_id, context=self.context)
-
-        # 检查上下文图片
-        if context_image_count > 0 or not images:
-            session_id = event.unified_msg_origin
-            image_sources = await self._collect_images_from_context(session_id, count=self._context_rounds)
-            
-            all_urls = []
-            for _, urls in image_sources:
-                for url in urls:
-                    if url not in all_urls:
-                        all_urls.append(url)
-            
-            needed = context_image_count if context_image_count > 0 else 1
-            urls_to_fetch = all_urls[-needed:] if all_urls else []
-            
-            if urls_to_fetch:
-                fetched_images = []
-                for url in urls_to_fetch:
-                    img_bytes = await self.img_mgr.load_bytes(url)
-                    if img_bytes:
-                        fetched_images.append(img_bytes)
-                
-                if context_image_count > 0:
-                    # 将上下文图片作为参考图垫在前面
-                    images = fetched_images + images
-                elif not images:
-                    # 只有当当前没有图片时，才使用最近的一张上下文图片
-                    images = fetched_images
-
-        if not images:
-            # 不要重复发送错误消息，只返回给 LLM
-            return "[TOOL_FAILED] 未检测到图片。请让用户发送或引用包含图片的消息后再试。【重要】不要再次调用此工具，直接用自然语言告诉用户需要提供图片。"
-
-        # 4. 限制批量生成数量
-        count = max(1, min(count, 10))  # 限制在1-10之间
-
-        # 5. 检查配额（批量生成需要足够的次数）
-        gid = norm_id(event.get_group_id())
-        total_cost = count
-        deduction = await self._check_quota(event, uid, gid, total_cost)
-        if not deduction["allowed"]:
-            if count > 1:
-                return f"❌ 次数不足。生成 {count} 个版本需要 {total_cost} 次。{deduction['msg']}"
-            return deduction["msg"]
 
         # 6. 更新图片生成冷却时间
         self._update_image_cooldown(uid)
