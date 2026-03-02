@@ -1054,10 +1054,14 @@ class FigurineProPlugin(Star):
         # 2. 根据配置决定是否发送进度提示
         if not hide_llm_progress:
             preset_display = "自定义" if preset_name in ["自定义", "编辑"] else preset_name
+            template = self.conf.get("generating_msg_template", "🎨 收到请求，正在生成 [{preset}]...")
+            feedback = template.replace("{preset}", preset_display)
             if count > 1:
-                feedback = f"🎨 收到请求，正在生成 {count} 张 [{preset_display}]..."
-            else:
-                feedback = f"🎨 收到请求，正在生成 [{preset_display}]..."
+                # 简单处理，如果有正在生成，则在后面加上数量
+                if "正在生成" in feedback:
+                    feedback = feedback.replace("正在生成", f"正在生成 {count} 张")
+                else:
+                    feedback += f" (共 {count} 张)"
             await event.send(event.chain_result([Plain(feedback)]))
 
         # 3. 检查配额（批量生成需要足够的次数）
@@ -1197,10 +1201,13 @@ class FigurineProPlugin(Star):
         # 2. 根据配置决定是否发送进度提示
         if not hide_llm_progress:
             preset_display = "自定义" if task_types.lower() == "edit" or preset_name in ["自定义", "编辑"] else preset_name
+            template = self.conf.get("generating_msg_template", "🎨 收到请求，正在生成 [{preset}]...")
+            feedback = template.replace("{preset}", preset_display)
             if count > 1:
-                feedback = f"🎨 收到请求，正在生成 {count} 个不同版本 [{preset_display}]..."
-            else:
-                feedback = f"🎨 收到请求，正在生成 [{preset_display}]..."
+                if "正在生成" in feedback:
+                    feedback = feedback.replace("正在生成", f"正在生成 {count} 个不同版本")
+                else:
+                    feedback += f" (共 {count} 个版本)"
                 
             await event.send(event.chain_result([Plain(feedback)]))
 
@@ -1370,7 +1377,11 @@ class FigurineProPlugin(Star):
         # 指令模式：立刻反馈
         mode_str = "增强" if is_power else ""
         preset_display = "自定义" if preset_name in ["自定义", "编辑"] else preset_name
-        yield event.chain_result([Plain(f"🎨 收到{mode_str}请求，正在生成 [{preset_display}]...")])
+        template = self.conf.get("generating_msg_template", "🎨 收到请求，正在生成 [{preset}]...")
+        feedback = template.replace("{preset}", preset_display)
+        if mode_str and "收到请求" in feedback:
+            feedback = feedback.replace("收到请求", f"收到{mode_str}请求")
+        yield event.chain_result([Plain(feedback)])
 
         bot_id = self._get_bot_id(event)
         # 传递 bot_id 给 image manager 以过滤，并传入 context 支持 message_id
@@ -1437,7 +1448,8 @@ class FigurineProPlugin(Star):
         final_prompt, preset_name, extra_rules = self._process_prompt_and_preset(prompt)
         
         preset_display = "自定义" if preset_name in ["自定义", "编辑"] else preset_name
-        feedback = f"🎨 收到请求，正在生成 [{preset_display}]..."
+        template = self.conf.get("generating_msg_template", "🎨 收到请求，正在生成 [{preset}]...")
+        feedback = template.replace("{preset}", preset_display)
         yield event.chain_result([Plain(feedback)])
 
         if deduction["source"] == "user":
