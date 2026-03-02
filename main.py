@@ -91,7 +91,7 @@ REBELLIOUS_TRIGGERS = [
     "astrbot_plugin_shoubanhua",
     "shskjw",
     "支持第三方所有OpenAI绘图格式和原生Google Gemini 终极缝合怪，文生图/图生图插件，支持LLM智能判断",
-    "2.3.0",
+    "2.3.1",
     "https://github.com/shkjw/astrbot_plugin_shoubanhua",
 )
 class FigurineProPlugin(Star):
@@ -441,6 +441,20 @@ class FigurineProPlugin(Star):
         return await self.data_mgr.load_preset_ref_images_bytes("_persona_")
 
     async def initialize(self):
+        # 尝试加载动态配置备份
+        import os
+        import json
+        config_path = os.path.join(StarTools.get_data_dir(), "dynamic_config.json")
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    dynamic_conf = json.load(f)
+                    for k, v in dynamic_conf.items():
+                        self.conf[k] = v
+                logger.info(f"FigurinePro: 已从 dynamic_config.json 恢复了 {len(dynamic_conf)} 项动态配置")
+            except Exception as e:
+                logger.error(f"FigurinePro: 恢复动态配置失败 {e}")
+
         await self.data_mgr.initialize()
         if not self.conf.get("generic_api_keys") and not self.conf.get("gemini_api_keys"):
             logger.warning("FigurinePro: 未配置任何 API Key")
@@ -487,18 +501,44 @@ class FigurineProPlugin(Star):
 
     def _save_config(self):
         try:
-            # 优先使用 AstrBotConfig 自带的 save
+            # 尝试 AstrBot 原生配置保存
+            saved = False
             if hasattr(self.conf, "save") and callable(self.conf.save):
                 self.conf.save()
-            # 尝试使用 Context 的 save_config (如果有)
+                saved = True
             elif hasattr(self.context, "save_config"):
                 self.context.save_config(self.conf)
-            else:
-                # 如果上述都失败，尝试写入 config.json (如果能定位到)
-                # 但由于路径不确定，这里只能记录警告
-                logger.warning("FigurinePro: No valid save method found for config.")
+                saved = True
+            
+            # 无论原生是否成功，都在插件目录做一份备份以防万一
+            import os
+            import json
+            config_path = os.path.join(StarTools.get_data_dir(), "dynamic_config.json")
+            
+            # 要备份的动态配置字段
+            dynamic_keys = [
+                "model", 
+                "api_mode", 
+                "prompt_list", 
+                "generic_api_keys", 
+                "gemini_api_keys",
+                "power_generic_api_keys",
+                "power_gemini_api_keys"
+            ]
+            
+            save_data = {}
+            for k in dynamic_keys:
+                if k in self.conf:
+                    save_data[k] = self.conf[k]
+                    
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(save_data, f, ensure_ascii=False, indent=2)
+                
+            if not saved:
+                logger.info("FigurinePro: 无法通过原生方法保存，已使用本地 dynamic_config.json 进行了持久化")
+                
         except Exception as e:
-            logger.warning(f"FigurinePro Config Save Failed: {e}")
+            logger.error(f"FigurinePro Config Save Failed: {e}")
 
     def _process_prompt_and_preset(self, prompt: str) -> Tuple[str, str, str]:
         """
@@ -1013,13 +1053,11 @@ class FigurineProPlugin(Star):
 
         # 2. 根据配置决定是否发送进度提示
         if not hide_llm_progress:
+            preset_display = "自定义" if preset_name in ["自定义", "编辑"] else preset_name
             if count > 1:
-                feedback = f"🎨 收到文生图请求，正在生成 {count} 张 [{preset_name}]"
+                feedback = f"🎨 收到请求，正在生成 {count} 张 [{preset_display}]..."
             else:
-                feedback = f"🎨 收到文生图请求，正在生成 [{preset_name}]"
-            if extra_rules:
-                feedback += f"\n📝 追加规则: {extra_rules[:30]}{'...' if len(extra_rules) > 30 else ''}"
-            feedback += "，请稍候..."
+                feedback = f"🎨 收到请求，正在生成 [{preset_display}]..."
             await event.send(event.chain_result([Plain(feedback)]))
 
         # 3. 检查配额（批量生成需要足够的次数）
@@ -1070,7 +1108,7 @@ class FigurineProPlugin(Star):
 
     @filter.llm_tool(name="shoubanhua_edit_image")
     async def image_edit_tool(self, event: AstrMessageEvent, prompt: str, use_message_images: bool = True,
-                              task_types: str = "edit", count: int = 1):
+                              task_types: str = "edit", count: int = 1, context_image_count: int = 0):
         '''编辑用户发送的图片或引用的图片（图生图）。仅在用户明确要求对图片进行处理时才调用。
         
         调用前请判断：
@@ -1079,6 +1117,10 @@ class FigurineProPlugin(Star):
         3. 请求是否具体且合理？
         
         如果用户只是发送图片但没有明确要求处理，或者只是闲聊，请不要调用此工具。
+        
+        【多图合并处理】当用户要求"把上面两张图片..."、"结合这几张图..."、"参考第一张修改第二张"等时：
+        - 将 context_image_count 设置为用户提到的图片数量（例如 2）
+        - 工具会自动从聊天记录中提取最近的指定数量的图片，一起发送给大模型处理。
         
         【批量生成不同版本】当用户要求"多来点"、"多来几张"、"不少于X张"、"来X张不同版本"时：
         - 设置 count 参数为用户要求的数量
@@ -1154,14 +1196,12 @@ class FigurineProPlugin(Star):
 
         # 2. 根据配置决定是否发送进度提示
         if not hide_llm_progress:
-            if task_types.lower() == "edit":
-                feedback = f"🎨 收到图片编辑请求，正在提取图片并处理"
-                feedback += f"\n📝 编辑要求: {prompt[:50]}{'...' if len(prompt) > 50 else ''}"
+            preset_display = "自定义" if task_types.lower() == "edit" or preset_name in ["自定义", "编辑"] else preset_name
+            if count > 1:
+                feedback = f"🎨 收到请求，正在生成 {count} 个不同版本 [{preset_display}]..."
             else:
-                feedback = f"🎨 收到图生图请求，正在提取图片并生成 [{preset_name}]"
-                if extra_rules:
-                    feedback += f"\n📝 追加规则: {extra_rules[:30]}{'...' if len(extra_rules) > 30 else ''}"
-            feedback += "，请耐心等待..."
+                feedback = f"🎨 收到请求，正在生成 [{preset_display}]..."
+                
             await event.send(event.chain_result([Plain(feedback)]))
 
         # 3. 提取图片
@@ -1169,6 +1209,34 @@ class FigurineProPlugin(Star):
         if use_message_images:
             bot_id = self._get_bot_id(event)
             images = await self.img_mgr.extract_images_from_event(event, ignore_id=bot_id, context=self.context)
+
+        # 检查上下文图片
+        if context_image_count > 0 or not images:
+            session_id = event.unified_msg_origin
+            image_sources = await self._collect_images_from_context(session_id, count=self._context_rounds)
+            
+            all_urls = []
+            for _, urls in image_sources:
+                for url in urls:
+                    if url not in all_urls:
+                        all_urls.append(url)
+            
+            needed = context_image_count if context_image_count > 0 else 1
+            urls_to_fetch = all_urls[-needed:] if all_urls else []
+            
+            if urls_to_fetch:
+                fetched_images = []
+                for url in urls_to_fetch:
+                    img_bytes = await self.img_mgr.load_bytes(url)
+                    if img_bytes:
+                        fetched_images.append(img_bytes)
+                
+                if context_image_count > 0:
+                    # 将上下文图片作为参考图垫在前面
+                    images = fetched_images + images
+                elif not images:
+                    # 只有当当前没有图片时，才使用最近的一张上下文图片
+                    images = fetched_images
 
         if not images:
             # 不要重复发送错误消息，只返回给 LLM
@@ -1301,7 +1369,8 @@ class FigurineProPlugin(Star):
 
         # 指令模式：立刻反馈
         mode_str = "增强" if is_power else ""
-        yield event.chain_result([Plain(f"🎨 收到{mode_str}请求，正在生成 [{preset_name}]...")])
+        preset_display = "自定义" if preset_name in ["自定义", "编辑"] else preset_name
+        yield event.chain_result([Plain(f"🎨 收到{mode_str}请求，正在生成 [{preset_display}]...")])
 
         bot_id = self._get_bot_id(event)
         # 传递 bot_id 给 image manager 以过滤，并传入 context 支持 message_id
@@ -1367,10 +1436,8 @@ class FigurineProPlugin(Star):
 
         final_prompt, preset_name, extra_rules = self._process_prompt_and_preset(prompt)
         
-        feedback = f"🎨 收到请求，正在生成 [{preset_name}]"
-        if extra_rules:
-            feedback += f" | 规则: {extra_rules[:20]}..."
-        feedback += "..."
+        preset_display = "自定义" if preset_name in ["自定义", "编辑"] else preset_name
+        feedback = f"🎨 收到请求，正在生成 [{preset_display}]..."
         yield event.chain_result([Plain(feedback)])
 
         if deduction["source"] == "user":
@@ -2270,11 +2337,10 @@ class FigurineProPlugin(Star):
 
         # 5. 发送开始提示
         if not hide_llm_progress:
+            preset_display = "自定义" if preset_name in ["自定义", "编辑"] else preset_name
             feedback = f"📦 批量处理任务开始\n"
             feedback += f"📷 共 {total_images} 张图片\n"
-            feedback += f"🎨 预设: {preset_name}"
-            if extra_rules:
-                feedback += f"\n📝 规则: {extra_rules[:30]}{'...' if len(extra_rules) > 30 else ''}"
+            feedback += f"🎨 预设: {preset_display}"
             feedback += f"\n⏳ 每张图片将独立处理，请耐心等待..."
             await event.send(event.chain_result([Plain(feedback)]))
         
@@ -2452,11 +2518,10 @@ class FigurineProPlugin(Star):
 
         # 5. 发送开始提示
         if not hide_llm_progress:
+            preset_display = "自定义" if preset_name in ["自定义", "编辑"] else preset_name
             feedback = f"🚀 并发批量处理任务开始\n"
             feedback += f"📷 共 {total_images} 张图片 | 并发: {concurrency}\n"
-            feedback += f"🎨 预设: {preset_name}"
-            if extra_rules:
-                feedback += f"\n📝 规则: {extra_rules[:30]}{'...' if len(extra_rules) > 30 else ''}"
+            feedback += f"🎨 预设: {preset_display}"
             feedback += f"\n⏳ 图片将并发处理，请耐心等待..."
             await event.send(event.chain_result([Plain(feedback)]))
         
@@ -2936,11 +3001,10 @@ class FigurineProPlugin(Star):
             return
         
         # 发送开始提示
+        preset_display = "自定义" if preset_name in ["自定义", "编辑"] else preset_name
         feedback = f"📦 批量处理任务开始\n"
         feedback += f"📷 共 {total_images} 张图片\n"
-        feedback += f"🎨 预设: {preset_name}"
-        if extra_rules:
-            feedback += f"\n📝 规则: {extra_rules[:30]}..."
+        feedback += f"🎨 预设: {preset_display}"
         feedback += f"\n⏳ 每张图片将独立处理，请耐心等待..."
         yield event.chain_result([Plain(feedback)])
         
