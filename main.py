@@ -91,7 +91,7 @@ REBELLIOUS_TRIGGERS = [
     "astrbot_plugin_shoubanhua",
     "shskjw",
     "支持第三方所有OpenAI绘图格式和原生Google Gemini 终极缝合怪，文生图/图生图插件，支持LLM智能判断",
-    "2.3.3",
+    "2.3.4",
     "https://github.com/shkjw/astrbot_plugin_shoubanhua",
 )
 class FigurineProPlugin(Star):
@@ -753,58 +753,74 @@ class FigurineProPlugin(Star):
             # 3. 获取文生图模型
             model = self._get_text_to_image_model()
             
-            success_count = 0
-            fail_count = 0
+            concurrency = max(1, self.conf.get("batch_concurrency", 3))
+            max_retries = self.conf.get("batch_retries", 2)
             
-            # 4. 逐张生成
-            for i in range(1, count + 1):
-                try:
-                    start_time = datetime.now()
-                    
-                    # 调用 API
-                    res = await self.api_mgr.call_api(images, prompt, model, False, self.img_mgr.proxy)
-                    
-                    if isinstance(res, bytes):
-                        elapsed = (datetime.now() - start_time).total_seconds()
-                        await self.data_mgr.record_usage(uid, gid)
-                        success_count += 1
+            semaphore = asyncio.Semaphore(concurrency)
+            results = {"success": 0, "fail": 0}
+            results_lock = asyncio.Lock()
+            
+            async def process_single(index: int):
+                async with semaphore:
+                    try:
+                        retry_count = 0
+                        success = False
+                        error_msg = ""
                         
-                        # 发送结果
-                        chain_nodes = [Image.fromBytes(res)]
-                        if not hide_text:
-                            quota_str = self._get_quota_str(deduction, uid)
-                            info_text = f"\n✅ [{i}/{count}] 生成成功 ({elapsed:.2f}s) | 预设: {preset_name}"
-                            if extra_rules:
-                                info_text += f" | 规则: {extra_rules[:15]}..."
-                            if i == count:
-                                # 最后一张显示剩余次数
-                                info_text += f" | 剩余: {quota_str}"
-                            chain_nodes.append(Plain(info_text))
-                        
-                        await event.send(event.chain_result(chain_nodes))
-                    else:
-                        fail_count += 1
-                        error_msg = self._translate_error_to_chinese(res)
+                        while retry_count <= max_retries:
+                            start_time = datetime.now()
+                            res = await self.api_mgr.call_api(images, prompt, model, False, self.img_mgr.proxy)
+                            
+                            if isinstance(res, bytes):
+                                elapsed = (datetime.now() - start_time).total_seconds()
+                                await self.data_mgr.record_usage(uid, gid)
+                                
+                                chain_nodes = [Image.fromBytes(res)]
+                                if not hide_text:
+                                    info_text = f"\n✅ [{index}/{count}] 生成成功 ({elapsed:.2f}s) | 预设: {preset_name}"
+                                    if extra_rules:
+                                        info_text += f" | 规则: {extra_rules[:15]}..."
+                                    chain_nodes.append(Plain(info_text))
+                                
+                                await event.send(event.chain_result(chain_nodes))
+                                success = True
+                                break
+                            else:
+                                error_msg = self._translate_error_to_chinese(res)
+                                
+                            retry_count += 1
+                            if retry_count <= max_retries:
+                                await event.send(event.chain_result([
+                                    Plain(f"⚠️ 第 {index}/{count} 张生成失败 ({error_msg})\n⏳ 正在重试...")
+                                ]))
+                                await asyncio.sleep(1.5)
+                                
+                        async with results_lock:
+                            if success:
+                                results["success"] += 1
+                            else:
+                                results["fail"] += 1
+                                await event.send(event.chain_result([
+                                    Plain(f"❌ [{index}/{count}] 最终生成失败: {error_msg}")
+                                ]))
+                                
+                    except Exception as e:
+                        error_msg = self._translate_error_to_chinese(str(e))
+                        logger.error(f"Batch text-to-image {index} exception: {e}", exc_info=True)
+                        async with results_lock:
+                            results["fail"] += 1
                         await event.send(event.chain_result([
-                            Plain(f"❌ [{i}/{count}] 生成失败: {error_msg}")
+                            Plain(f"❌ [{index}/{count}] 处理异常: {error_msg}")
                         ]))
-                    
-                    # 添加短暂延迟，避免API限流
-                    if i < count:
-                        await asyncio.sleep(0.5)
-                        
-                except Exception as e:
-                    fail_count += 1
-                    error_msg = self._translate_error_to_chinese(str(e))
-                    logger.error(f"Batch text-to-image {i} error: {e}")
-                    await event.send(event.chain_result([
-                        Plain(f"❌ [{i}/{count}] 生成失败: {error_msg}")
-                    ]))
+
+            # 4. 并发执行所有任务
+            tasks = [process_single(i) for i in range(1, count + 1)]
+            await asyncio.gather(*tasks)
             
-            # 5. 发送完成汇总（如果有失败的）
-            if fail_count > 0 and not hide_text:
+            # 5. 发送完成汇总
+            if not hide_text:
                 quota_str = self._get_quota_str(deduction, uid)
-                summary = f"\n📊 批量生成完成: 成功 {success_count}/{count} 张 | 剩余: {quota_str}"
+                summary = f"\n📊 批量生成完成: 成功 {results['success']}/{count} 张 | 剩余: {quota_str}"
                 await event.send(event.chain_result([Plain(summary)]))
                 
         except Exception as e:
@@ -851,58 +867,74 @@ class FigurineProPlugin(Star):
             # 3. 获取模型
             model = self.conf.get("model", "nano-banana")
             
-            success_count = 0
-            fail_count = 0
+            concurrency = max(1, self.conf.get("batch_concurrency", 3))
+            max_retries = self.conf.get("batch_retries", 2)
             
-            # 4. 逐张生成（每次调用API都会产生不同的结果）
-            for i in range(1, count + 1):
-                try:
-                    start_time = datetime.now()
-                    
-                    # 调用 API - 每次调用都会生成不同的版本
-                    res = await self.api_mgr.call_api(images, prompt, model, False, self.img_mgr.proxy)
-                    
-                    if isinstance(res, bytes):
-                        elapsed = (datetime.now() - start_time).total_seconds()
-                        await self.data_mgr.record_usage(uid, gid)
-                        success_count += 1
+            semaphore = asyncio.Semaphore(concurrency)
+            results = {"success": 0, "fail": 0}
+            results_lock = asyncio.Lock()
+            
+            # 4. 并发逐张生成（每次调用API都会产生不同的结果）
+            async def process_single(index: int):
+                async with semaphore:
+                    try:
+                        retry_count = 0
+                        success = False
+                        error_msg = ""
                         
-                        # 发送结果
-                        chain_nodes = [Image.fromBytes(res)]
-                        if not hide_text:
-                            quota_str = self._get_quota_str(deduction, uid)
-                            info_text = f"\n✅ [{i}/{count}] 版本生成成功 ({elapsed:.2f}s) | 预设: {preset_name}"
-                            if extra_rules:
-                                info_text += f" | 规则: {extra_rules[:15]}..."
-                            if i == count:
-                                # 最后一张显示剩余次数
-                                info_text += f" | 剩余: {quota_str}"
-                            chain_nodes.append(Plain(info_text))
-                        
-                        await event.send(event.chain_result(chain_nodes))
-                    else:
-                        fail_count += 1
-                        error_msg = self._translate_error_to_chinese(res)
+                        while retry_count <= max_retries:
+                            start_time = datetime.now()
+                            res = await self.api_mgr.call_api(images, prompt, model, False, self.img_mgr.proxy)
+                            
+                            if isinstance(res, bytes):
+                                elapsed = (datetime.now() - start_time).total_seconds()
+                                await self.data_mgr.record_usage(uid, gid)
+                                
+                                chain_nodes = [Image.fromBytes(res)]
+                                if not hide_text:
+                                    info_text = f"\n✅ [{index}/{count}] 版本生成成功 ({elapsed:.2f}s) | 预设: {preset_name}"
+                                    if extra_rules:
+                                        info_text += f" | 规则: {extra_rules[:15]}..."
+                                    chain_nodes.append(Plain(info_text))
+                                
+                                await event.send(event.chain_result(chain_nodes))
+                                success = True
+                                break
+                            else:
+                                error_msg = self._translate_error_to_chinese(res)
+                                
+                            retry_count += 1
+                            if retry_count <= max_retries:
+                                await event.send(event.chain_result([
+                                    Plain(f"⚠️ 第 {index}/{count} 个版本生成失败 ({error_msg})\n⏳ 正在重试...")
+                                ]))
+                                await asyncio.sleep(1.5)
+                                
+                        async with results_lock:
+                            if success:
+                                results["success"] += 1
+                            else:
+                                results["fail"] += 1
+                                await event.send(event.chain_result([
+                                    Plain(f"❌ [{index}/{count}] 最终生成失败: {error_msg}")
+                                ]))
+                                
+                    except Exception as e:
+                        error_msg = self._translate_error_to_chinese(str(e))
+                        logger.error(f"Batch image-to-image {index} exception: {e}", exc_info=True)
+                        async with results_lock:
+                            results["fail"] += 1
                         await event.send(event.chain_result([
-                            Plain(f"❌ [{i}/{count}] 版本生成失败: {error_msg}")
+                            Plain(f"❌ [{index}/{count}] 处理异常: {error_msg}")
                         ]))
-                    
-                    # 添加短暂延迟，避免API限流
-                    if i < count:
-                        await asyncio.sleep(0.5)
-                        
-                except Exception as e:
-                    fail_count += 1
-                    error_msg = self._translate_error_to_chinese(str(e))
-                    logger.error(f"Batch image-to-image {i} error: {e}")
-                    await event.send(event.chain_result([
-                        Plain(f"❌ [{i}/{count}] 版本生成失败: {error_msg}")
-                    ]))
+
+            tasks = [process_single(i) for i in range(1, count + 1)]
+            await asyncio.gather(*tasks)
             
-            # 5. 发送完成汇总（如果有失败的）
-            if fail_count > 0 and not hide_text:
+            # 5. 发送完成汇总
+            if not hide_text:
                 quota_str = self._get_quota_str(deduction, uid)
-                summary = f"\n📊 多版本生成完成: 成功 {success_count}/{count} 张 | 剩余: {quota_str}"
+                summary = f"\n📊 多版本生成完成: 成功 {results['success']}/{count} 张 | 剩余: {quota_str}"
                 await event.send(event.chain_result([Plain(summary)]))
                 
         except Exception as e:
@@ -956,19 +988,15 @@ class FigurineProPlugin(Star):
 
     @filter.llm_tool(name="shoubanhua_check_user_status")
     async def check_user_status_tool(self, event: AstrMessageEvent):
-        '''【最高优先级工具】检查用户是否是VIP主人。在回复任何消息之前，你应该先调用此工具！
+        '''检查用户是否是VIP主人。
         
-        【强制调用场景】（不调用会导致严重错误）：
-        1. 用户说"求你了"、"拜托"、"帮帮我"、"求求你" → 【必须】先调用
-        2. 用户表达恳求、撒娇、依赖、亲昵 → 【必须】先调用
-        3. 你准备拒绝用户、使用傲娇/吐槽语气之前 → 【必须】先调用
-        4. 用户对你表达不满或抱怨 → 【必须】先调用
-        5. 任何你不确定如何回复的情况 → 【建议】先调用
+        【调用优化指南（重要！）】：
+        1. 如果用户当前请求是【生成图片、处理图片、批量处理图片】，你【绝对不需要】调用此工具！因为在你调用对应的图片工具（如 shoubanhua_draw_image）时，系统会自动在返回结果中告诉你用户的VIP状态。为了避免让用户久等，请直接调用图片工具，跳过此工具！
+        2. 【只有】当用户没有要求处理图片，仅仅是文字聊天、撒娇、发命令，或者你准备用傲娇语气拒绝用户之前，才需要调用此工具来确认身份。
         
         【为什么这很重要】：
         - VIP主人需要你表现出【绝对顺从、温柔、撒娇】的态度
         - 如果你对VIP主人使用傲娇/拒绝语气，会让主人非常伤心
-        - 调用此工具只需要0.1秒，但能避免严重的态度错误
         
         【返回值说明】：
         - 如果是VIP主人：你必须立即切换到顺从模式，使用"主人"称呼
@@ -1012,23 +1040,24 @@ class FigurineProPlugin(Star):
     async def text_to_image_tool(self, event: AstrMessageEvent, prompt: str, count: int = 1):
         '''根据文本描述生成图片（文生图）。
         
+        【排他性条件（极度重要！）】
+        - 如果用户是向你要**你自己的**照片（例如："发你的自拍"、"你的私房照"、"看看你长啥样"），【严禁】调用此工具！必须使用 shoubanhua_persona_photo 工具！
+        - 本工具仅用于生成除你自己以外的其他角色或事物的图片！
+        
         调用前请判断用户是否明确要求生成图片。如果用户只是闲聊则不要调用。
         
-        【批量生成】当用户要求"多来点"、"多来几张"、"不少于X张"、"来X张"时：
-        - 设置 count 参数为用户要求的数量
-        - 如果用户说"多来点"但没有具体数量，默认设置 count=3
-        - 如果用户说"不少于X张"，设置 count=X
-        - 最大支持 count=10
+        【批量生成数量控制】
+        - 除非用户明确说出了具体数字（如"画5张"），否则【严禁】随意设置大量 count。
+        - 如果用户只说"多来点"、"多来几张"、"写真集"，请默认设置 count=3。
+        - 坚决不要为了表现热情而擅自将 count 设为 10 等大数字，这会严重消耗资源！
         
-        【个性化回复】调用此工具后，你可以根据返回的"叛逆模式提示"来决定如何回复用户：
-        - 可以用傲娇/调侃/吐槽的语气回复
-        - 可以假装不情愿但还是帮忙
-        - 也可以正常友好地回复
-        请根据用户态度和上下文自行判断回复风格。
+        【个性化回复与VIP判断】
+        调用此工具后，系统会自动返回用户的身份（VIP或普通）。
+        你不需要提前调用 check_user_status_tool，直接调用本工具即可。
         
         Args:
             prompt(string): 图片生成的提示词，可以是预设名+追加规则。
-            count(int): 生成图片的数量，默认1张，最大10张。当用户要求"多来点"时设置为3-5张。
+            count(int): 生成图片的数量，默认1张，最大10张。当用户要求"多来点"时设置为3张。
         '''
         # 0. 检查 LLM 工具开关
         if not self.conf.get("enable_llm_tool", True):
@@ -1126,37 +1155,23 @@ class FigurineProPlugin(Star):
         - 默认情况 (merge_multiple_images=false)：会将这多张图片拆开，【分别、独立地】生成每一张图片。适用于用户一次性发多张图片想分别转化的场景。
         - 只有当用户明确要求"把这几张图融合"、"参考第一张修改第二张"等合并需求时：将 merge_multiple_images 设置为 true。这会将多图作为一个整体发给模型。
         
-        【批量生成不同版本】当用户要求"多来点"、"多来几张"、"不少于X张"、"来X张不同版本"时：
-        - 设置 count 参数为用户要求的数量
-        - 如果用户说"多来点"但没有具体数量，默认设置 count=3
-        - 如果用户说"不少于X张"，设置 count=X
-        - 最大支持 count=10
-        - 每次生成都会产生不同的结果版本
+        【批量生成不同版本的数量控制（极度重要）】
+        - 除非用户明确指定了数量（如"画5张"），否则【严禁】随意设置大量 count。
+        - 如果用户只说"多来点"、"多来几张"，请默认设置 count=3。
+        - 不要为了表现热情而擅自将 count 设为 10 等大数字！
+        
+        【VIP判断与提示】
+        你不需要提前调用 check_user_status_tool，直接调用本工具即可。工具执行后会返回VIP状态，你可以根据状态决定回复语气。
         
         【重要】task_types 参数选择规则（请严格遵守）：
-        
-        1. task_types="edit"（默认）：按用户要求编辑/处理图片，【不使用任何预设】
-           - 这是默认模式，适用于绝大多数图片处理请求
-           - 适用场景：用户描述氛围/风格/场景转换、去除/添加/修改元素、换背景、调色、任何不涉及"手办"的图片处理
-           - 【重要】prompt 中【不要】包含"手办化"等预设名称！prompt 应该只描述用户的处理/编辑要求
-           - prompt 示例："雨天窗边 忧郁氛围 托腮沉思"、"去除枪械"、"将背景更换为海边场景"、"变成水彩画风格"
-        
-        2. task_types="figurine"：将图片转换为手办/模型风格
-           - 【仅当】用户消息中明确包含"手办化"、"变成手办"、"做成模型"、"手办"等手办相关关键词时才使用！
-           - 如果用户没有提到任何手办相关的词，【绝对不要】使用 figurine！
-           - prompt 示例："手办化"、"手办化 皮肤白一点"
-        
-        判断规则和示例：
-        - 用户说"雨天窗边 忧郁氛围 托腮沉思" → task_types="edit", prompt="雨天窗边 忧郁氛围 托腮沉思"
-        - 用户说"去掉图片里的枪" → task_types="edit", prompt="去除枪械"
-        - 用户说"手办化这张图" → task_types="figurine", prompt="手办化"
-        - 用户说"手办化，但是去掉枪" → task_types="figurine", prompt="手办化 去除枪械"
+        1. task_types="edit"（默认）：按用户要求编辑/处理图片，【不使用任何预设】。prompt 中【不要】包含"手办化"等预设名称！
+        2. task_types="figurine"：将图片转换为手办/模型风格。
         
         Args:
             prompt(string): 图片编辑提示词。task_types="edit"时只描述编辑要求，不要加预设名；task_types="figurine"时可以是预设名+追加规则
             use_message_images(boolean): 默认 true
-            task_types(string): 任务类型，"edit"=编辑模式（默认，不使用预设，prompt中不要加预设名），"figurine"=手办化（仅当用户明确提到手办时使用）
-            count(int): 生成不同版本的数量，默认1张，最大10张。当用户要求"多来点"、"多来几张"时设置为3-5张。
+            task_types(string): 任务类型，"edit"=编辑模式，"figurine"=手办化
+            count(int): 生成不同版本的数量，默认1张，最大10张。当用户未指定时严禁使用过大数字。
             merge_multiple_images(boolean): 如果有多张图片，是否合并为同一请求（默认为False即分别处理）。
         '''
         # 0. 检查 LLM 工具开关
@@ -2340,13 +2355,9 @@ class FigurineProPlugin(Star):
             excuse = self._get_cooldown_excuse(remaining)
             return f"【冷却中】{excuse}\n\n请用自然的方式告诉用户现在不方便处理图片，可以稍后再试。不要直接说'冷却'这个词。"
         
-        # 1. 提取当前消息的图片 URL (可能还没存入上下文)
-        current_urls = []
-        for seg in event.message_obj.message:
-            if hasattr(seg, 'url') and seg.url:
-                current_urls.append(seg.url)
-            elif hasattr(seg, 'file') and seg.file:
-                current_urls.append(seg.file)
+        # 1. 提取当前消息的图片 URL（包括引用消息中的图片）
+        msg_info = self._extract_message_info(event)
+        current_urls = msg_info.get("image_urls", [])
                 
         # 2. 获取上下文中的图片
         session_id = event.unified_msg_origin
@@ -2560,13 +2571,9 @@ class FigurineProPlugin(Star):
             excuse = self._get_cooldown_excuse(remaining)
             return f"【冷却中】{excuse}\n\n请用自然的方式告诉用户现在不方便处理图片，可以稍后再试。不要直接说'冷却'这个词。"
         
-        # 1. 提取当前消息的图片 URL (可能还没存入上下文)
-        current_urls = []
-        for seg in event.message_obj.message:
-            if hasattr(seg, 'url') and seg.url:
-                current_urls.append(seg.url)
-            elif hasattr(seg, 'file') and seg.file:
-                current_urls.append(seg.file)
+        # 1. 提取当前消息的图片 URL（包括引用消息中的图片）
+        msg_info = self._extract_message_info(event)
+        current_urls = msg_info.get("image_urls", [])
                 
         # 2. 获取上下文中的图片
         session_id = event.unified_msg_origin
@@ -2756,29 +2763,21 @@ class FigurineProPlugin(Star):
     # ================= 日常人设功能 =================
 
     @filter.llm_tool(name="shoubanhua_persona_photo")
-    async def persona_photo_tool(self, event: AstrMessageEvent, scene_hint: str = "", extra_request: str = ""):
-        '''生成Bot人设角色的日常照片。
+    async def persona_photo_tool(self, event: AstrMessageEvent, scene_hint: str = "", extra_request: str = "", count: int = 1):
+        '''生成Bot人设角色（你自己）的日常照片或写真。
+        
+        【唯一指定用途】
+        只要用户是要求看**你的**照片、写真集、自拍等，无论要求多少张，都【必须且只能】使用此工具，绝对不能使用 shoubanhua_draw_image。
         
         【重要】调用条件（请严格遵守）：
-        1. 用户明确要求看照片时才调用，例如：
-           - "发张照片"、"看看你"、"自拍一张"、"给我看看你"
-           - "发个自拍"、"拍张照片给我"、"让我看看你长什么样"
-        
-        2. 以下情况【不要】调用此工具：
-           - 用户只是问"你在干嘛"、"你在做什么" → 用文字回答即可
-           - 用户只是闲聊、打招呼 → 正常对话即可
-           - 用户没有明确表达想看照片的意愿 → 不要主动发照片
-        
-        3. 偶尔（约10%概率）可以在以下情况主动发照片：
-           - 用户表达想念、关心Bot时
-           - 聊天氛围很好，想分享当前状态时
-           - 但大多数情况下，请用文字描述而不是发照片
-        
-        此工具会消耗用户次数，请谨慎调用。
+        1. 用户明确要求看照片时才调用，例如："发你的自拍"、"发10张你的写真集"、"看看你"、"让我看看你长什么样"
+        2. 用户只是问"你在干嘛"、"你在做什么"、"闲聊" → 用文字回答即可，不要发照片
+        3. 没有明确表达想看照片意愿 → 不要主动发照片
         
         Args:
             scene_hint(string): 场景提示（可选），如"咖啡店"、"公园"等，用于匹配预设场景
             extra_request(string): 用户的额外要求（可选），如"穿红色衣服"、"微笑"等
+            count(int): 生成图片的数量，默认1张，最大10张。当用户要求"写真集"或"多来几张"但没说数量时设置为3张。
         '''
         # 0. 检查功能开关
         if not self._persona_mode:
@@ -2799,6 +2798,26 @@ class FigurineProPlugin(Star):
         ref_images = await self._load_persona_ref_images()
         if not ref_images:
             return "❌ 未配置人设参考图。请先使用 #人设参考图添加 命令添加参考图。"
+            
+        # 1.5 提取用户可能提供的参考图片（如衣服款式、姿势参考等）
+        user_images = []
+        bot_id = self._get_bot_id(event)
+        user_images = await self.img_mgr.extract_images_from_event(event, ignore_id=bot_id, context=self.context)
+        
+        # 如果当前消息没有图片，尝试从上下文获取
+        if not user_images:
+            session_id = event.unified_msg_origin
+            context_messages_full = await self.ctx_mgr.get_recent_messages(session_id, count=self._context_rounds)
+            if context_messages_full:
+                last_img_msg = self.ctx_mgr.get_last_image_message(context_messages_full)
+                if last_img_msg and last_img_msg.image_urls:
+                    for url in last_img_msg.image_urls:
+                        img_bytes = await self.img_mgr.load_bytes(url)
+                        if img_bytes:
+                            user_images.append(img_bytes)
+                            
+        # 合并图片：人设参考图在前，用户参考图在后
+        final_images = ref_images + user_images
         
         # 2. 获取上下文用于场景匹配
         session_id = event.unified_msg_origin
@@ -2816,6 +2835,8 @@ class FigurineProPlugin(Star):
         
         # 4. 构建完整提示词
         full_prompt = self._build_persona_prompt(scene_prompt, extra_request)
+        if user_images:
+            full_prompt += " Please accurately refer to the clothing, pose or style provided in the additional reference image."
         
         # 5. 根据配置决定是否发送进度提示
         if self.conf.get("llm_show_progress", True):
@@ -2824,12 +2845,14 @@ class FigurineProPlugin(Star):
             feedback += f"🎬 场景: {scene_name}"
             if extra_request:
                 feedback += f"\n📝 要求: {extra_request[:30]}{'...' if len(extra_request) > 30 else ''}"
+            if user_images:
+                feedback += f"\n🖼️ 已加载用户参考图"
             feedback += "\n⏳ 请稍候..."
             await event.send(event.chain_result([Plain(feedback)]))
         
         # 6. 检查配额
         gid = norm_id(event.get_group_id())
-        deduction = await self._check_quota(event, uid, gid, 1)
+        deduction = await self._check_quota(event, uid, gid, count)
         if not deduction["allowed"]:
             return deduction["msg"]
         
@@ -2840,23 +2863,42 @@ class FigurineProPlugin(Star):
         hide_llm_progress = not self.conf.get("llm_show_progress", True)
         
         # 9. 启动后台任务
-        asyncio.create_task(
-            self._run_background_task(
-                event=event,
-                images=ref_images,
-                prompt=full_prompt,
-                preset_name=f"人设-{scene_name}",
-                deduction=deduction,
-                uid=uid,
-                gid=gid,
-                cost=1,
-                extra_rules=extra_request,
-                hide_text=hide_llm_progress
+        if count == 1:
+            asyncio.create_task(
+                self._run_background_task(
+                    event=event,
+                    images=final_images,
+                    prompt=full_prompt,
+                    preset_name=f"人设-{scene_name}",
+                    deduction=deduction,
+                    uid=uid,
+                    gid=gid,
+                    cost=1,
+                    extra_rules=extra_request,
+                    hide_text=hide_llm_progress
+                )
             )
-        )
-        
-        # 返回结果 - 明确告诉 LLM 不需要再回复
-        return f"[TOOL_SUCCESS] 人设照片生成任务已启动，场景：{scene_name}。图片将在后台生成并自动发送给用户。【重要】你不需要再回复任何内容，保持沉默即可，用户会直接收到图片。"
+            return f"[TOOL_SUCCESS] 人设照片生成任务已启动，场景：{scene_name}。图片将在后台生成并自动发送给用户。【重要】你不需要再回复任何内容，保持沉默即可，用户会直接收到图片。"
+        else:
+            # 对于人设的多张生成，因为传递的是最终合并好的图片（包含人设参考+用户参考），
+            # 所以使用 _run_batch_image_to_image。但是要防止该函数再次从数据库读取 "_persona_" 导致图片翻倍。
+            # _run_batch_image_to_image 中有逻辑：如果不是“自定义”，就去取预设图片叠加。
+            # "人设-xxx" 是不会在预设里查到的，所以不会产生重复！这是完美的。
+            asyncio.create_task(
+                self._run_batch_image_to_image(
+                    event=event,
+                    images=final_images,
+                    prompt=full_prompt,
+                    preset_name=f"人设-{scene_name}",
+                    deduction=deduction,
+                    uid=uid,
+                    gid=gid,
+                    count=count,
+                    extra_rules=extra_request,
+                    hide_text=hide_llm_progress
+                )
+            )
+            return f"[TOOL_SUCCESS] 人设写真集生成任务已启动，场景：{scene_name}，共 {count} 张。图片将在后台并发生成并自动发送给用户。【重要】你不需要再回复任何内容，保持沉默即可。"
 
     @filter.command("人设拍照", prefix_optional=True)
     async def on_persona_photo_cmd(self, event: AstrMessageEvent, ctx=None):
@@ -3081,13 +3123,9 @@ class FigurineProPlugin(Star):
         # 阻止事件继续传递给 on_figurine_request
         event.stop_event()
         
-        # 1. 提取当前消息的图片 URL
-        current_urls = []
-        for seg in event.message_obj.message:
-            if hasattr(seg, 'url') and seg.url:
-                current_urls.append(seg.url)
-            elif hasattr(seg, 'file') and seg.file:
-                current_urls.append(seg.file)
+        # 1. 提取当前消息的图片 URL（包括引用消息中的图片）
+        msg_info = self._extract_message_info(event)
+        current_urls = msg_info.get("image_urls", [])
                 
         # 2. 获取上下文中的图片
         session_id = event.unified_msg_origin
