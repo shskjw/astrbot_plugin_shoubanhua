@@ -91,7 +91,7 @@ REBELLIOUS_TRIGGERS = [
     "astrbot_plugin_shoubanhua",
     "shskjw",
     "支持第三方所有OpenAI绘图格式和原生Google Gemini 终极缝合怪，文生图/图生图插件，支持LLM智能判断",
-    "2.3.2",
+    "2.3.3",
     "https://github.com/shkjw/astrbot_plugin_shoubanhua",
 )
 class FigurineProPlugin(Star):
@@ -2324,6 +2324,10 @@ class FigurineProPlugin(Star):
             prompt(string): 图片处理的提示词，可以是预设名+追加规则，如"手办化 皮肤白一点"
             max_images(int): 最多处理的图片数量，默认10张
         '''
+        # 0. 读取配置中的限制
+        conf_max_images = self.conf.get("batch_max_images", 10)
+        max_images = min(max_images, conf_max_images) if max_images > 0 else conf_max_images
+
         # 0. 检查 LLM 工具开关
         if not self.conf.get("enable_llm_tool", True):
             return "❌ LLM 工具已禁用，请使用指令模式调用此功能。"
@@ -2336,25 +2340,45 @@ class FigurineProPlugin(Star):
             excuse = self._get_cooldown_excuse(remaining)
             return f"【冷却中】{excuse}\n\n请用自然的方式告诉用户现在不方便处理图片，可以稍后再试。不要直接说'冷却'这个词。"
         
-        # 1. 获取上下文中的图片
+        # 1. 提取当前消息的图片 URL (可能还没存入上下文)
+        current_urls = []
+        for seg in event.message_obj.message:
+            if hasattr(seg, 'url') and seg.url:
+                current_urls.append(seg.url)
+            elif hasattr(seg, 'file') and seg.file:
+                current_urls.append(seg.file)
+                
+        # 2. 获取上下文中的图片
         session_id = event.unified_msg_origin
         image_sources = await self._collect_images_from_context(session_id, count=self._context_rounds)
         
-        if not image_sources:
+        if not image_sources and not current_urls:
             return "❌ 未在上下文中找到图片。请先发送图片，然后再使用批量处理功能。"
         
-        # 2. 收集所有图片URL（去重）
+        # 3. 收集所有图片URL（去重，优先获取最新图片）
         all_image_urls = []
         seen_urls = set()
-        for msg_id, urls in image_sources:
+        
+        # 先添加当前消息的图片
+        for url in current_urls:
+            if url not in seen_urls:
+                all_image_urls.append(url)
+                seen_urls.add(url)
+                
+        # 倒序遍历上下文（从最新消息开始）
+        for msg_id, urls in reversed(image_sources):
+            # 一条消息内的图片按正常顺序遍历
             for url in urls:
                 if url not in seen_urls:
                     all_image_urls.append(url)
                     seen_urls.add(url)
         
-        # 限制数量
+        # 限制数量（保留最新的 max_images 张）
         if max_images > 0:
             all_image_urls = all_image_urls[:max_images]
+            
+        # 提取完毕后将列表反转，以符合用户的正常阅读和发送顺序（从旧到新处理）
+        all_image_urls.reverse()
         
         total_images = len(all_image_urls)
         if total_images == 0:
@@ -2397,6 +2421,7 @@ class FigurineProPlugin(Star):
             success_count = 0
             fail_count = 0
             failed_details = []  # 记录失败详情
+            max_retries = self.conf.get("batch_retries", 2)
             
             for i, url in enumerate(all_image_urls, 1):
                 try:
@@ -2417,20 +2442,35 @@ class FigurineProPlugin(Star):
                         ]))
                         continue
                     
-                    # 处理单张图片
-                    success, error_msg = await self._run_single_batch_task(
-                        event=event,
-                        image_bytes=img_bytes,
-                        prompt=final_prompt,
-                        preset_name=preset_name,
-                        task_index=i,
-                        total_tasks=total_images,
-                        uid=uid,
-                        gid=gid,
-                        extra_rules=extra_rules,
-                        image_source=url,
-                        hide_text=hide_llm_progress
-                    )
+                    # 处理单张图片（带重试机制）
+                    retry_count = 0
+                    success = False
+                    error_msg = ""
+                    
+                    while retry_count <= max_retries:
+                        success, error_msg = await self._run_single_batch_task(
+                            event=event,
+                            image_bytes=img_bytes,
+                            prompt=final_prompt,
+                            preset_name=preset_name,
+                            task_index=i,
+                            total_tasks=total_images,
+                            uid=uid,
+                            gid=gid,
+                            extra_rules=extra_rules,
+                            image_source=url,
+                            hide_text=hide_llm_progress
+                        )
+                        
+                        if success:
+                            break
+                            
+                        retry_count += 1
+                        if retry_count <= max_retries:
+                            await event.send(event.chain_result([
+                                Plain(f"⚠️ 第 {i}/{total_images} 张图片生成失败 ({error_msg})\n⏳ 正在进行第 {retry_count} 次重试...")
+                            ]))
+                            await asyncio.sleep(1.5)
                     
                     if success:
                         success_count += 1
@@ -2443,7 +2483,7 @@ class FigurineProPlugin(Star):
                         })
                         # 发送单条失败提示
                         await event.send(event.chain_result([
-                            Plain(f"❌ 第 {i}/{total_images} 张图片处理失败\n📍 原因: {error_msg}")
+                            Plain(f"❌ 第 {i}/{total_images} 张图片最终处理失败\n📍 原因: {error_msg}")
                         ]))
                     
                     # 添加短暂延迟，避免API限流
@@ -2460,7 +2500,7 @@ class FigurineProPlugin(Star):
                     })
                     fail_count += 1
                     await event.send(event.chain_result([
-                        Plain(f"❌ 第 {i}/{total_images} 张图片处理失败\n📍 原因: {error_msg}")
+                        Plain(f"❌ 第 {i}/{total_images} 张图片处理异常\n📍 原因: {error_msg}")
                     ]))
             
             if not hide_llm_progress:
@@ -2502,6 +2542,12 @@ class FigurineProPlugin(Star):
             max_images(int): 最多处理的图片数量，默认10张
             concurrency(int): 并发数量，默认3（同时处理3张图片）
         '''
+        # 读取配置中的限制，强制覆盖 LLM 参数
+        conf_max_images = self.conf.get("batch_max_images", 10)
+        conf_concurrency = self.conf.get("batch_concurrency", 3)
+        max_images = min(max_images, conf_max_images) if max_images > 0 else conf_max_images
+        concurrency = max(1, conf_concurrency)
+
         # 0. 检查 LLM 工具开关
         if not self.conf.get("enable_llm_tool", True):
             return "❌ LLM 工具已禁用，请使用指令模式调用此功能。"
@@ -2514,28 +2560,44 @@ class FigurineProPlugin(Star):
             excuse = self._get_cooldown_excuse(remaining)
             return f"【冷却中】{excuse}\n\n请用自然的方式告诉用户现在不方便处理图片，可以稍后再试。不要直接说'冷却'这个词。"
         
-        # 限制并发数
-        concurrency = max(1, min(concurrency, 5))
-        
-        # 1. 获取上下文中的图片
+        # 1. 提取当前消息的图片 URL (可能还没存入上下文)
+        current_urls = []
+        for seg in event.message_obj.message:
+            if hasattr(seg, 'url') and seg.url:
+                current_urls.append(seg.url)
+            elif hasattr(seg, 'file') and seg.file:
+                current_urls.append(seg.file)
+                
+        # 2. 获取上下文中的图片
         session_id = event.unified_msg_origin
         image_sources = await self._collect_images_from_context(session_id, count=self._context_rounds)
         
-        if not image_sources:
+        if not image_sources and not current_urls:
             return "❌ 未在上下文中找到图片。请先发送图片，然后再使用批量处理功能。"
         
-        # 2. 收集所有图片URL（去重）
+        # 3. 收集所有图片URL（去重，优先获取最新图片）
         all_image_urls = []
         seen_urls = set()
-        for msg_id, urls in image_sources:
+        
+        # 先添加当前消息的图片
+        for url in current_urls:
+            if url not in seen_urls:
+                all_image_urls.append(url)
+                seen_urls.add(url)
+                
+        # 倒序遍历上下文（从最新消息开始）
+        for msg_id, urls in reversed(image_sources):
             for url in urls:
                 if url not in seen_urls:
                     all_image_urls.append(url)
                     seen_urls.add(url)
         
-        # 限制数量
+        # 限制数量（保留最新的 max_images 张）
         if max_images > 0:
             all_image_urls = all_image_urls[:max_images]
+            
+        # 反转列表以正常顺序处理
+        all_image_urls.reverse()
         
         total_images = len(all_image_urls)
         if total_images == 0:
@@ -2578,6 +2640,7 @@ class FigurineProPlugin(Star):
         results = {"success": 0, "fail": 0}
         failed_details = []
         results_lock = asyncio.Lock()
+        max_retries = self.conf.get("batch_retries", 2)
         
         async def process_single(index: int, url: str):
             async with semaphore:
@@ -2599,20 +2662,35 @@ class FigurineProPlugin(Star):
                         ]))
                         return
                     
-                    # 处理单张图片
-                    success, error_msg = await self._run_single_batch_task(
-                        event=event,
-                        image_bytes=img_bytes,
-                        prompt=final_prompt,
-                        preset_name=preset_name,
-                        task_index=index,
-                        total_tasks=total_images,
-                        uid=uid,
-                        gid=gid,
-                        extra_rules=extra_rules,
-                        image_source=url,
-                        hide_text=hide_llm_progress
-                    )
+                    # 处理单张图片（带重试机制）
+                    retry_count = 0
+                    success = False
+                    error_msg = ""
+                    
+                    while retry_count <= max_retries:
+                        success, error_msg = await self._run_single_batch_task(
+                            event=event,
+                            image_bytes=img_bytes,
+                            prompt=final_prompt,
+                            preset_name=preset_name,
+                            task_index=index,
+                            total_tasks=total_images,
+                            uid=uid,
+                            gid=gid,
+                            extra_rules=extra_rules,
+                            image_source=url,
+                            hide_text=hide_llm_progress
+                        )
+                        
+                        if success:
+                            break
+                            
+                        retry_count += 1
+                        if retry_count <= max_retries:
+                            await event.send(event.chain_result([
+                                Plain(f"⚠️ 第 {index}/{total_images} 张图片生成失败 ({error_msg})\n⏳ 正在进行第 {retry_count} 次重试...")
+                            ]))
+                            await asyncio.sleep(1.5)
                     
                     async with results_lock:
                         if success:
@@ -2625,7 +2703,7 @@ class FigurineProPlugin(Star):
                                 "url_preview": url[:50] + "..." if len(url) > 50 else url
                             })
                             await event.send(event.chain_result([
-                                Plain(f"❌ 第 {index}/{total_images} 张图片处理失败\n📍 原因: {error_msg}")
+                                Plain(f"❌ 第 {index}/{total_images} 张图片最终处理失败\n📍 原因: {error_msg}")
                             ]))
                             
                 except Exception as e:
@@ -2639,7 +2717,7 @@ class FigurineProPlugin(Star):
                             "url_preview": url[:50] + "..." if len(url) > 50 else url
                         })
                     await event.send(event.chain_result([
-                        Plain(f"❌ 第 {index}/{total_images} 张图片处理失败\n📍 原因: {error_msg}")
+                        Plain(f"❌ 第 {index}/{total_images} 张图片处理异常\n📍 原因: {error_msg}")
                     ]))
         
         async def process_all():
@@ -3003,18 +3081,34 @@ class FigurineProPlugin(Star):
         # 阻止事件继续传递给 on_figurine_request
         event.stop_event()
         
-        # 获取上下文中的图片
+        # 1. 提取当前消息的图片 URL
+        current_urls = []
+        for seg in event.message_obj.message:
+            if hasattr(seg, 'url') and seg.url:
+                current_urls.append(seg.url)
+            elif hasattr(seg, 'file') and seg.file:
+                current_urls.append(seg.file)
+                
+        # 2. 获取上下文中的图片
         session_id = event.unified_msg_origin
         image_sources = await self._collect_images_from_context(session_id, count=self._context_rounds)
         
-        if not image_sources:
+        if not image_sources and not current_urls:
             yield event.chain_result([Plain("❌ 未在上下文中找到图片。请先发送图片，然后再使用批量处理功能。")])
             return
         
-        # 收集所有图片URL
+        # 3. 收集所有图片URL（去重，优先获取最新图片）
         all_image_urls = []
         seen_urls = set()
-        for msg_id, urls in image_sources:
+        
+        # 先添加当前消息的图片
+        for url in current_urls:
+            if url not in seen_urls:
+                all_image_urls.append(url)
+                seen_urls.add(url)
+                
+        # 倒序遍历上下文
+        for msg_id, urls in reversed(image_sources):
             for url in urls:
                 if url not in seen_urls:
                     all_image_urls.append(url)
@@ -3022,7 +3116,11 @@ class FigurineProPlugin(Star):
         
         # 限制数量
         max_images = self.conf.get("batch_max_images", 10)
-        all_image_urls = all_image_urls[:max_images]
+        if max_images > 0:
+            all_image_urls = all_image_urls[:max_images]
+            
+        # 反转列表以正常顺序处理
+        all_image_urls.reverse()
         
         total_images = len(all_image_urls)
         if total_images == 0:
@@ -3042,12 +3140,14 @@ class FigurineProPlugin(Star):
             yield event.chain_result([Plain(f"❌ 次数不足。批量处理 {total_images} 张图片需要 {total_cost} 次。\n{deduction['msg']}")])
             return
         
+        concurrency = max(1, self.conf.get("batch_concurrency", 3))
+
         # 发送开始提示
         preset_display = "自定义" if preset_name in ["自定义", "编辑"] else preset_name
         feedback = f"📦 批量处理任务开始\n"
-        feedback += f"📷 共 {total_images} 张图片\n"
+        feedback += f"📷 共 {total_images} 张图片 | 并发: {concurrency}\n"
         feedback += f"🎨 预设: {preset_display}"
-        feedback += f"\n⏳ 每张图片将独立处理，请耐心等待..."
+        feedback += f"\n⏳ 图片将并发处理，请耐心等待..."
         yield event.chain_result([Plain(feedback)])
         
         # 扣费
@@ -3056,73 +3156,109 @@ class FigurineProPlugin(Star):
         elif deduction["source"] == "group":
             await self.data_mgr.decrease_group_count(gid, total_cost)
         
-        # 处理每张图片
-        success_count = 0
-        fail_count = 0
+        # 使用信号量控制并发
+        semaphore = asyncio.Semaphore(concurrency)
+        results = {"success": 0, "fail": 0}
         failed_details = []
+        results_lock = asyncio.Lock()
+        max_retries = self.conf.get("batch_retries", 2)
         
-        for i, url in enumerate(all_image_urls, 1):
-            try:
-                # 下载图片
-                img_bytes = await self.img_mgr.load_bytes(url)
-                if not img_bytes:
-                    yield event.chain_result([Plain(f"❌ [{i}/{total_images}] 图片下载失败")])
-                    fail_count += 1
-                    continue
-                
-                # 处理单张图片
-                success, error_msg = await self._run_single_batch_task(
-                    event=event,
-                    image_bytes=img_bytes,
-                    prompt=final_prompt,
-                    preset_name=preset_name,
-                    task_index=i,
-                    total_tasks=total_images,
-                    uid=uid,
-                    gid=gid,
-                    extra_rules=extra_rules,
-                    image_source=url
-                )
-                
-                if success:
-                    success_count += 1
-                else:
-                    fail_count += 1
-                    failed_details.append({
-                        "index": i,
-                        "reason": error_msg,
-                        "url_preview": url[:50] + "..." if len(url) > 50 else url
-                    })
-                    if error_msg:
-                        yield event.chain_result([Plain(f"❌ [{i}/{total_images}] {error_msg}")])
-                
-                # 添加短暂延迟
-                if i < total_images:
-                    await asyncio.sleep(0.5)
+        async def process_single(index: int, url: str):
+            async with semaphore:
+                try:
+                    # 下载图片
+                    img_bytes = await self.img_mgr.load_bytes(url)
+                    if not img_bytes:
+                        error_msg = "图片下载失败，可能是链接已过期或网络问题"
+                        async with results_lock:
+                            results["fail"] += 1
+                            failed_details.append({
+                                "index": index,
+                                "reason": error_msg,
+                                "url_preview": url[:50] + "..." if len(url) > 50 else url
+                            })
+                        await event.send(event.chain_result([
+                            Plain(f"❌ 第 {index}/{total_images} 张图片处理失败\n📍 原因: {error_msg}")
+                        ]))
+                        return
                     
-            except Exception as e:
-                logger.error(f"Batch process image {i} error: {e}")
-                error_msg = self._translate_error_to_chinese(str(e))
-                failed_details.append({
-                    "index": i,
-                    "reason": error_msg,
-                    "url_preview": url[:50] + "..." if len(url) > 50 else url
-                })
-                yield event.chain_result([Plain(f"❌ [{i}/{total_images}] 处理异常: {e}")])
-                fail_count += 1
+                    # 处理单张图片（带重试机制）
+                    retry_count = 0
+                    success = False
+                    error_msg = ""
+                    
+                    while retry_count <= max_retries:
+                        success, error_msg = await self._run_single_batch_task(
+                            event=event,
+                            image_bytes=img_bytes,
+                            prompt=final_prompt,
+                            preset_name=preset_name,
+                            task_index=index,
+                            total_tasks=total_images,
+                            uid=uid,
+                            gid=gid,
+                            extra_rules=extra_rules,
+                            image_source=url,
+                            hide_text=False
+                        )
+                        
+                        if success:
+                            break
+                            
+                        retry_count += 1
+                        if retry_count <= max_retries:
+                            await event.send(event.chain_result([
+                                Plain(f"⚠️ 第 {index}/{total_images} 张图片生成失败 ({error_msg})\n⏳ 正在进行第 {retry_count} 次重试...")
+                            ]))
+                            await asyncio.sleep(1.5)
+                    
+                    async with results_lock:
+                        if success:
+                            results["success"] += 1
+                        else:
+                            results["fail"] += 1
+                            failed_details.append({
+                                "index": index,
+                                "reason": error_msg,
+                                "url_preview": url[:50] + "..." if len(url) > 50 else url
+                            })
+                            await event.send(event.chain_result([
+                                Plain(f"❌ 第 {index}/{total_images} 张图片最终处理失败\n📍 原因: {error_msg}")
+                            ]))
+                            
+                except Exception as e:
+                    error_msg = self._translate_error_to_chinese(str(e))
+                    logger.error(f"Batch process image {index} exception: {e}", exc_info=True)
+                    async with results_lock:
+                        results["fail"] += 1
+                        failed_details.append({
+                            "index": index,
+                            "reason": error_msg,
+                            "url_preview": url[:50] + "..." if len(url) > 50 else url
+                        })
+                    await event.send(event.chain_result([
+                        Plain(f"❌ 第 {index}/{total_images} 张图片处理异常\n📍 原因: {error_msg}")
+                    ]))
         
-        # 发送完成汇总
-        quota_str = self._get_quota_str(deduction, uid)
-        summary = f"\n📊 批量处理完成\n"
-        summary += f"✅ 成功: {success_count} 张\n"
-        summary += f"❌ 失败: {fail_count} 张\n"
-        summary += f"💰 剩余次数: {quota_str}"
-        
-        if failed_details:
-            summary += f"\n\n📋 失败图片汇总:"
-            for detail in failed_details[:5]:
-                summary += f"\n  • 第{detail['index']}张: {detail['reason']}"
-            if len(failed_details) > 5:
-                summary += f"\n  ... 还有 {len(failed_details) - 5} 张失败"
-                
-        yield event.chain_result([Plain(summary)])
+        async def process_all():
+            tasks = [process_single(i, url) for i, url in enumerate(all_image_urls, 1)]
+            await asyncio.gather(*tasks)
+            
+            # 发送完成汇总
+            quota_str = self._get_quota_str(deduction, uid)
+            summary = f"\n📊 批量处理完成\n"
+            summary += f"✅ 成功: {results['success']} 张\n"
+            summary += f"❌ 失败: {results['fail']} 张\n"
+            summary += f"💰 剩余次数: {quota_str}"
+            
+            if failed_details:
+                summary += f"\n\n📋 失败图片汇总:"
+                for detail in sorted(failed_details, key=lambda x: x['index'])[:5]:
+                    summary += f"\n  • 第{detail['index']}张: {detail['reason']}"
+                if len(failed_details) > 5:
+                    summary += f"\n  ... 还有 {len(failed_details) - 5} 张失败"
+            
+            await event.send(event.chain_result([Plain(summary)]))
+
+        # 启动异步任务
+        asyncio.create_task(process_all())

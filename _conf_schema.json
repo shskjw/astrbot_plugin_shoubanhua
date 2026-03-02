@@ -392,6 +392,12 @@
         "hint": "并发批量处理时同时处理的图片数量。",
         "default": 3
     },
+    "batch_retries": {
+        "description": "【批量】失败重试次数",
+        "type": "int",
+        "hint": "批量处理中单张图片生成失败时自动重试的次数。设为0则不重试。",
+        "default": 2
+    },
     "enable_preset_ref_images": {
         "description": "【预设】启用预设参考图",
         "type": "bool",
