@@ -77,25 +77,46 @@ class ApiManager:
                 # 优先 2: 检查 tool_calls (Function Calling 格式)
                 if "tool_calls" in message and isinstance(message["tool_calls"], list):
                     for tool in message["tool_calls"]:
-                        # 尝试1: 直接解析 arguments 里的 url/https
                         func_args = tool.get("function", {}).get("arguments", "")
-                        if "http" in func_args:
-                            urls = re.findall(r"(https?://[^\s<>\"'()\[\]]+)", func_args)
-                            if urls: return urls[0].strip()
-
-                        # 尝试2: 查找 base64
-                        if "base64" in func_args:
-                            b64_match = re.search(r'(data:image\/[a-zA-Z]+;base64,[a-zA-Z0-9+/=]+)', func_args)
-                            if b64_match:
-                                return b64_match.group(1)
-
+                        
+                        # 尝试0: 解析 JSON，某些模型会把结构放在深处
                         try:
                             args = json.loads(func_args)
                             # 常见的参数名: url, image_url, images, file_url
                             for k in ["url", "image_url", "file_url", "link", "b64_json", "image", "data", "image_data"]:
                                 if k in args: return args[k]
+                            
+                            # 尝试深度遍历寻找 base64 或 url
+                            # 有的API返回 {"response": {"url": "..."}}
+                            def find_url(d):
+                                if isinstance(d, dict):
+                                    for k, v in d.items():
+                                        if k in ["url", "image_url", "b64_json", "image", "data", "link"]:
+                                            if isinstance(v, str): return v
+                                        res = find_url(v)
+                                        if res: return res
+                                elif isinstance(d, list):
+                                    for item in d:
+                                        res = find_url(item)
+                                        if res: return res
+                                return None
+                            
+                            deep_url = find_url(args)
+                            if deep_url: return deep_url
                         except:
                             pass
+
+                        # 尝试1: 字符串正则直接解析 url/https
+                        if "http" in func_args:
+                            urls = re.findall(r"(https?://[^\s<>\"'()\[\]\\]+)", func_args)
+                            if urls: return urls[0].strip()
+
+                        # 尝试2: 字符串正则查找 base64
+                        if "base64" in func_args:
+                            b64_match = re.search(r'(data:image\/[\w\-\+\.]+(?:;base64)?,[\w\-\+\/=\s]+)', func_args)
+                            if b64_match:
+                                found_b64 = b64_match.group(1).replace("\n", "").replace("\r", "").replace(" ", "").replace("\\", "")
+                                return found_b64
 
                 # 优先 3: 标准 content
                 if "content" in message:
@@ -546,7 +567,21 @@ class ApiManager:
                             if c0.get("message", {}).get("content"):
                                 diag_msg = f"API返回了文本而非图片: {c0['message']['content'][:200]}"
                     
-                    return f"API请求成功但{diag_msg}。Raw: {str(res_data)[:200]}..."
+                    # 终极 fallback，检查是否是那种直接放在外层的 tool_calls / images 遗漏
+                    raw_str = str(res_data)
+                    b64_match = re.search(r'(data:image\/[\w\-\+\.]+(?:;base64)?,[\w\-\+\/=\s]{100,})', raw_str)
+                    if b64_match:
+                        logger.warning("在报错分支的终极fallback中找到了base64，已挽救")
+                        found = b64_match.group(1).replace("\\n", "").replace("\\r", "").replace(" ", "").replace("\\", "")
+                        return found
+
+                    # 再次放宽限制：如果在 raw_str 里面发现长段的纯 base64 (没有 data:image 前缀)，也尝试挽救
+                    pure_b64_match = re.search(r'"([A-Za-z0-9+/]{1000,}={0,2})"', raw_str)
+                    if pure_b64_match:
+                        logger.warning("在报错分支的终极fallback中找到了纯base64，已挽救")
+                        return f"data:image/png;base64,{pure_b64_match.group(1)}"
+
+                    return f"API请求成功但{diag_msg}。Raw: {str(res_data)[:300]}..."
 
                 # 如果是 Base64 直接返回 Bytes
                 if img_url.startswith("data:"):

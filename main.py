@@ -2213,13 +2213,14 @@ class FigurineProPlugin(Star):
 
     # ================= 批量处理图片功能 =================
 
-    async def _collect_images_from_context(self, session_id: str, count: int = 10) -> List[Tuple[str, List[str]]]:
+    async def _collect_images_from_context(self, session_id: str, count: int = 10, include_bot: bool = False) -> List[Tuple[str, List[str]]]:
         """
         从上下文中收集图片
 
         Args:
             session_id: 会话ID
             count: 获取的消息数量
+            include_bot: 是否包含Bot发出的图片
 
         Returns:
             [(消息ID, [图片URL列表]), ...]
@@ -2228,7 +2229,9 @@ class FigurineProPlugin(Star):
 
         result = []
         for msg in messages:
-            if msg.has_image and msg.image_urls and not msg.is_bot:
+            if msg.has_image and msg.image_urls:
+                if not include_bot and msg.is_bot:
+                    continue
                 result.append((msg.msg_id, msg.image_urls))
 
         return result
@@ -2347,6 +2350,130 @@ class FigurineProPlugin(Star):
             error_msg = self._translate_error_to_chinese(str(e))
             logger.error(f"Batch task {task_index} exception: {e}", exc_info=True)
             return False, error_msg
+
+    @filter.command("打包PDF", aliases={"图片转PDF", "合成PDF"}, prefix_optional=True)
+    async def on_pack_pdf_cmd(self, event: AstrMessageEvent, ctx=None):
+        """将上下文或当前消息中的图片打包为PDF（不生成新图，纯打包）"""
+        
+        # 1. 提取当前消息的图片（包括引用）
+        bot_id = self._get_bot_id(event)
+        images_bytes = await self.img_mgr.extract_images_from_event(event, ignore_id=bot_id, context=self.context)
+
+        # 2. 如果当前消息没有图片，尝试从上下文获取（包含Bot发出的图片，比如刚生成好的图）
+        if not images_bytes:
+            session_id = event.unified_msg_origin
+            image_sources = await self._collect_images_from_context(session_id, count=20, include_bot=True)
+            
+            all_urls = []
+            seen_urls = set()
+            for msg_id, urls in reversed(image_sources):
+                for url in urls:
+                    if url not in seen_urls:
+                        all_urls.append(url)
+                        seen_urls.add(url)
+                        
+            all_urls.reverse()
+            
+            # 下载上下文中提取到的所有图片
+            for url in all_urls:
+                try:
+                    img_b = await self.img_mgr.load_bytes(url)
+                    if img_b:
+                        images_bytes.append(img_b)
+                except Exception as e:
+                    logger.error(f"打包PDF时下载图片失败: {e}")
+
+        if not images_bytes:
+            yield event.chain_result([Plain("❌ 未检测到图片。请发送图片或在有图片的上下文中调用。")])
+            return
+            
+        yield event.chain_result([Plain(f"📦 正在将 {len(images_bytes)} 张图片打包为 PDF，请稍候...")])
+        
+        try:
+            pdf_bytes = self.img_mgr.images_to_pdf(images_bytes)
+            if pdf_bytes:
+                import uuid
+                import os
+                from astrbot.core.message.components import File
+                filename = f"images_packed_{uuid.uuid4().hex[:6]}.pdf"
+                tmp_path = os.path.join(self.data_mgr.data_dir, filename)
+                with open(tmp_path, "wb") as f:
+                    f.write(pdf_bytes)
+                yield event.chain_result([File(tmp_path), Plain(f"\n✅ 成功将 {len(images_bytes)} 张图片打包为 PDF")])
+            else:
+                yield event.chain_result([Plain("❌ 打包 PDF 失败，可能图片格式不支持。")])
+        except Exception as e:
+            logger.error(f"打包 PDF 异常: {e}")
+            yield event.chain_result([Plain(f"❌ 打包 PDF 发生异常: {e}")])
+
+    @filter.llm_tool(name="shoubanhua_pack_images_to_pdf")
+    async def pack_images_to_pdf_tool(self, event: AstrMessageEvent, max_images: int = 10):
+        '''将上下文中的图片（包括Bot之前生成的图片）直接打包成一个PDF文件发送给用户。注意：此工具【不会】修改图片，【不会】生成新图，仅仅是把已有的图片原样打包。
+
+        调用前请严格判断：
+        1. 用户是否明确要求"把刚才的图打包成PDF"、"合成PDF"、"把这些图片做成PDF"？
+        2. 如果用户要求"把这些图片手办化/处理后再打包"，请使用 `shoubanhua_batch_process` 工具并设置 output_as_pdf=True！
+        3. 这个工具只负责【纯打包】。
+
+        Args:
+            max_images(int): 最多打包的图片数量，默认10张，可以根据用户需求调整。
+        '''
+        # 1. 提取当前消息的图片（包括引用）
+        bot_id = self._get_bot_id(event)
+        images_bytes = await self.img_mgr.extract_images_from_event(event, ignore_id=bot_id, context=self.context)
+
+        # 2. 如果当前消息没有图片，尝试从上下文获取（包含Bot发出的图片）
+        if not images_bytes:
+            session_id = event.unified_msg_origin
+            # 扩大搜索范围以确保能找到足够的图
+            image_sources = await self._collect_images_from_context(session_id, count=30, include_bot=True)
+            
+            all_urls = []
+            seen_urls = set()
+            
+            for msg_id, urls in reversed(image_sources):
+                for url in urls:
+                    if url not in seen_urls:
+                        all_urls.append(url)
+                        seen_urls.add(url)
+                        
+            # 限制数量
+            if max_images > 0:
+                all_urls = all_urls[:max_images]
+                
+            all_urls.reverse()
+            
+            # 下载上下文中提取到的所有图片
+            for url in all_urls:
+                try:
+                    img_b = await self.img_mgr.load_bytes(url)
+                    if img_b:
+                        images_bytes.append(img_b)
+                except Exception as e:
+                    logger.error(f"打包PDF时下载图片失败: {e}")
+
+        if not images_bytes:
+            return "❌ 未检测到图片。请让用户先发送图片，或者在有图片的上下文中调用。"
+            
+        await event.send(event.chain_result([Plain(f"📦 正在将 {len(images_bytes)} 张图片打包为 PDF，请稍候...")]))
+        
+        try:
+            pdf_bytes = self.img_mgr.images_to_pdf(images_bytes)
+            if pdf_bytes:
+                import uuid
+                import os
+                from astrbot.core.message.components import File
+                filename = f"images_packed_{uuid.uuid4().hex[:6]}.pdf"
+                tmp_path = os.path.join(self.data_mgr.data_dir, filename)
+                with open(tmp_path, "wb") as f:
+                    f.write(pdf_bytes)
+                await event.send(event.chain_result([File(tmp_path), Plain(f"\n✅ 成功将 {len(images_bytes)} 张图片打包为 PDF")]))
+                return "[TOOL_SUCCESS] 已成功将图片打包为PDF并发送给了用户。你不需要再回复任何内容，保持沉默即可。"
+            else:
+                return "打包 PDF 失败，可能图片格式不支持。"
+        except Exception as e:
+            logger.error(f"打包 PDF 异常: {e}")
+            return f"打包 PDF 发生异常: {e}"
 
     @filter.llm_tool(name="shoubanhua_batch_process")
     async def batch_process_tool(self, event: AstrMessageEvent, prompt: str, max_images: int = 10, output_as_pdf: bool = False):
@@ -2585,28 +2712,31 @@ class FigurineProPlugin(Star):
                         Plain(f"❌ 第 {i}/{total_images} 张图片处理异常\n📍 原因: {error_msg}")
                     ]))
 
-            if output_as_pdf and pdf_result_images:
-                try:
-                    pdf_bytes_result = self.img_mgr.images_to_pdf(pdf_result_images)
-                    if pdf_bytes_result:
-                        import uuid
-                        filename = f"batch_output_{uuid.uuid4().hex[:6]}.pdf"
-                        # astrbot 的文件组件支持直接发字节(通过File类)，但在标准组件中未必完善，
-                        # 这里我们将其写入到临时目录或者缓存里再发送
-                        import os
-                        from astrbot.core.message.components import File
-                        tmp_path = os.path.join(self.data_mgr.data_dir, filename)
-                        with open(tmp_path, "wb") as f:
-                            f.write(pdf_bytes_result)
-                        await event.send(event.chain_result([File(tmp_path)]))
-                        
-                        summary = f"\n📊 批量处理完成，已打包为 PDF\n"
-                        summary += f"✅ 成功: {success_count} 张\n"
-                        summary += f"❌ 失败: {fail_count} 张"
-                        await event.send(event.chain_result([Plain(summary)]))
-                except Exception as e:
-                    logger.error(f"打包 PDF 失败: {e}")
-                    await event.send(event.chain_result([Plain(f"❌ 打包 PDF 失败: {e}")]))
+            if output_as_pdf:
+                if pdf_result_images:
+                    try:
+                        pdf_bytes_result = self.img_mgr.images_to_pdf(pdf_result_images)
+                        if pdf_bytes_result:
+                            import uuid
+                            filename = f"batch_output_{uuid.uuid4().hex[:6]}.pdf"
+                            # astrbot 的文件组件支持直接发字节(通过File类)，但在标准组件中未必完善，
+                            # 这里我们将其写入到临时目录或者缓存里再发送
+                            import os
+                            from astrbot.core.message.components import File
+                            tmp_path = os.path.join(self.data_mgr.data_dir, filename)
+                            with open(tmp_path, "wb") as f:
+                                f.write(pdf_bytes_result)
+                            await event.send(event.chain_result([File(tmp_path)]))
+                            
+                            summary = f"\n📊 批量处理完成，已打包为 PDF\n"
+                            summary += f"✅ 成功: {success_count} 张\n"
+                            summary += f"❌ 失败: {fail_count} 张"
+                            await event.send(event.chain_result([Plain(summary)]))
+                    except Exception as e:
+                        logger.error(f"打包 PDF 失败: {e}")
+                        await event.send(event.chain_result([Plain(f"❌ 打包 PDF 失败: {e}")]))
+                else:
+                    await event.send(event.chain_result([Plain("❌ 抱歉，所有图片生成均失败，无法打包为 PDF。")]))
             elif not hide_llm_progress:
                 # 发送完成汇总
                 quota_str = self._get_quota_str(deduction, uid)
@@ -2875,28 +3005,31 @@ class FigurineProPlugin(Star):
             # 等待所有任务完成
             await asyncio.gather(*tasks)
 
-            if output_as_pdf and pdf_result_images_dict:
-                try:
-                    # 按原有顺序重组图片
-                    ordered_images = [pdf_result_images_dict[k] for k in sorted(pdf_result_images_dict.keys())]
-                    pdf_bytes_result = self.img_mgr.images_to_pdf(ordered_images)
-                    if pdf_bytes_result:
-                        import uuid
-                        import os
-                        from astrbot.core.message.components import File
-                        filename = f"batch_output_concurrent_{uuid.uuid4().hex[:6]}.pdf"
-                        tmp_path = os.path.join(self.data_mgr.data_dir, filename)
-                        with open(tmp_path, "wb") as f:
-                            f.write(pdf_bytes_result)
-                        await event.send(event.chain_result([File(tmp_path)]))
-                        
-                        summary = f"\n📊 并发批量处理完成，已打包为 PDF\n"
-                        summary += f"✅ 成功: {results['success']} 张\n"
-                        summary += f"❌ 失败: {results['fail']} 张"
-                        await event.send(event.chain_result([Plain(summary)]))
-                except Exception as e:
-                    logger.error(f"打包 PDF 失败: {e}")
-                    await event.send(event.chain_result([Plain(f"❌ 打包 PDF 失败: {e}")]))
+            if output_as_pdf:
+                if pdf_result_images_dict:
+                    try:
+                        # 按原有顺序重组图片
+                        ordered_images = [pdf_result_images_dict[k] for k in sorted(pdf_result_images_dict.keys())]
+                        pdf_bytes_result = self.img_mgr.images_to_pdf(ordered_images)
+                        if pdf_bytes_result:
+                            import uuid
+                            import os
+                            from astrbot.core.message.components import File
+                            filename = f"batch_output_concurrent_{uuid.uuid4().hex[:6]}.pdf"
+                            tmp_path = os.path.join(self.data_mgr.data_dir, filename)
+                            with open(tmp_path, "wb") as f:
+                                f.write(pdf_bytes_result)
+                            await event.send(event.chain_result([File(tmp_path)]))
+                            
+                            summary = f"\n📊 并发批量处理完成，已打包为 PDF\n"
+                            summary += f"✅ 成功: {results['success']} 张\n"
+                            summary += f"❌ 失败: {results['fail']} 张"
+                            await event.send(event.chain_result([Plain(summary)]))
+                    except Exception as e:
+                        logger.error(f"打包 PDF 失败: {e}")
+                        await event.send(event.chain_result([Plain(f"❌ 打包 PDF 失败: {e}")]))
+                else:
+                    await event.send(event.chain_result([Plain("❌ 抱歉，所有图片生成均失败，无法打包为 PDF。")]))
             elif not hide_llm_progress:
                 # 发送完成汇总
                 quota_str = self._get_quota_str(deduction, uid)
