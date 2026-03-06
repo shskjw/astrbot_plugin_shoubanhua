@@ -91,6 +91,89 @@ class ImageManager:
         if not user_id.isdigit(): return None
         return await self._download_image(f"https://q1.qlogo.cn/g?b=qq&nk={user_id}&s=640")
 
+    def images_to_pdf(self, images_bytes: List[bytes]) -> bytes:
+        """将多张图片字节打包为单个 PDF"""
+        import io
+        from PIL import Image as PILImage
+        
+        if not images_bytes:
+            return b""
+            
+        pil_images = []
+        for img_bytes in images_bytes:
+            try:
+                img = PILImage.open(io.BytesIO(img_bytes)).convert("RGB")
+                pil_images.append(img)
+            except Exception as e:
+                logger.error(f"Error opening image for PDF: {e}")
+                
+        if not pil_images:
+            return b""
+            
+        out = io.BytesIO()
+        if len(pil_images) == 1:
+            pil_images[0].save(out, format="PDF", resolution=100.0)
+        else:
+            pil_images[0].save(out, format="PDF", resolution=100.0, save_all=True, append_images=pil_images[1:])
+        
+        return out.getvalue()
+        
+    def pdf_to_images(self, pdf_bytes: bytes) -> List[bytes]:
+        """将 PDF 字节解析为图片列表（每页一张）"""
+        try:
+            import fitz # PyMuPDF
+        except ImportError:
+            raise ImportError("请先安装 PyMuPDF 库以支持解析 PDF：在终端运行 pip install PyMuPDF")
+            
+        images = []
+        try:
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            for page in doc:
+                pix = page.get_pixmap(dpi=150)
+                images.append(pix.tobytes("png"))
+        except Exception as e:
+            raise Exception(f"解析 PDF 失败: {e}")
+            
+        return images
+
+    async def extract_pdfs_from_event(self, event: AstrMessageEvent) -> List[bytes]:
+        """从消息中提取 PDF 文件"""
+        tasks = []
+        for seg in event.message_obj.message:
+            seg_class = type(seg).__name__
+            # 兼容 AstrBot 的 File/Document 等文件组件
+            if seg_class in ['File', 'Document', 'Record']:
+                url = getattr(seg, 'url', None)
+                file = getattr(seg, 'file', None)
+                name = getattr(seg, 'name', '').lower()
+                
+                is_pdf = False
+                if name.endswith('.pdf'):
+                    is_pdf = True
+                elif url and '.pdf' in url.lower():
+                    is_pdf = True
+                elif file and '.pdf' in str(file).lower():
+                    is_pdf = True
+                    
+                if is_pdf:
+                    if url:
+                        tasks.append(self.load_bytes(url))
+                    elif file:
+                        tasks.append(self.load_bytes(file))
+                        
+        if not tasks:
+            return []
+            
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        pdf_bytes = []
+        for res in results:
+            if isinstance(res, bytes):
+                pdf_bytes.append(res)
+            elif isinstance(res, Exception):
+                logger.warning(f"PDF extraction error: {res}")
+                
+        return pdf_bytes
+
     async def extract_images_from_event(self, event: AstrMessageEvent, ignore_id: str = None, context=None) -> List[bytes]:
         """从消息事件中提取所有图片 - 并发加速"""
         tasks = []

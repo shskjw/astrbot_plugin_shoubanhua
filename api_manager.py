@@ -362,9 +362,11 @@ class ApiManager:
             
             msgs = [{"role": "user", "content": content_list}]
             
+            use_stream = self.config.get("use_stream", False)
+            
             # [性能优化] 显式设置 max_tokens
             # 如果不设置，某些中转接口可能会等待或者分配过大的 Tokens 空间，增加延迟
-            pl = {"model": model, "messages": msgs, "stream": False, "max_tokens": 4096}
+            pl = {"model": model, "messages": msgs, "stream": use_stream, "max_tokens": 4096}
             payload.update(pl)
 
             # 针对 Gemini 系模型的 OpenAI 兼容层特殊处理

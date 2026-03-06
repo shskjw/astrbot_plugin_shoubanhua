@@ -68,13 +68,13 @@
     "model": {
         "description": "【通用】默认模型名称",
         "type": "string",
-        "hint": "当前默认使用的模型ID（需在模型列表中存在）。可通过 #切换模型 指令修改。",
+        "hint": "当前默认使用的模型ID。即使不在模型列表中也可直接填入。",
         "default": "nano-banana"
     },
     "text_to_image_model": {
         "description": "【通用】文生图专用模型",
         "type": "string",
-        "hint": "文生图功能使用的模型ID。留空则使用默认模型。",
+        "hint": "文生图功能使用的模型ID。即使不在模型列表中也可直接填入。留空则使用默认模型。",
         "default": ""
     },
     "image_resolution": {
