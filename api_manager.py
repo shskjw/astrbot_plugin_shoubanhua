@@ -106,17 +106,22 @@ class ApiManager:
                         except:
                             pass
 
-                        # 尝试1: 字符串正则直接解析 url/https
-                        if "http" in func_args:
-                            urls = re.findall(r"(https?://[^\s<>\"'()\[\]\\]+)", func_args)
-                            if urls: return urls[0].strip()
-
-                        # 尝试2: 字符串正则查找 base64
+                        # 尝试1: 字符串正则查找 base64 (优先找base64，因为它最明确)
                         if "base64" in func_args:
                             b64_match = re.search(r'(data:image\/[\w\-\+\.]+(?:;base64)?,[\w\-\+\/=\s]+)', func_args)
                             if b64_match:
                                 found_b64 = b64_match.group(1).replace("\n", "").replace("\r", "").replace(" ", "").replace("\\", "")
                                 return found_b64
+                                
+                        # 尝试2: 纯 base64 无前缀
+                        pure_b64_match = re.search(r'"([A-Za-z0-9+/]{1000,}={0,2})"', func_args)
+                        if pure_b64_match:
+                            return f"data:image/png;base64,{pure_b64_match.group(1)}"
+
+                        # 尝试3: 字符串正则直接解析 url/https
+                        if "http" in func_args:
+                            urls = re.findall(r"(https?://[^\s<>\"'()\[\]\\]+)", func_args)
+                            if urls: return urls[0].strip()
 
                 # 优先 3: 标准 content
                 if "content" in message:
@@ -514,6 +519,22 @@ class ApiManager:
                     return json.dumps(res_data["error"], ensure_ascii=False)
 
                 img_url = self.extract_image_url(res_data)
+                
+                # 终极 fallback，检查是否是那种直接放在外层的 tool_calls / images 遗漏
+                if not img_url:
+                    raw_str = str(res_data)
+                    b64_match = re.search(r'(data:image\/[\w\-\+\.]+(?:;base64)?,[\w\-\+\/=\s]{100,})', raw_str)
+                    if b64_match:
+                        logger.warning("在报错分支的终极fallback中找到了base64，已挽救")
+                        img_url = b64_match.group(1).replace("\\n", "").replace("\\r", "").replace(" ", "").replace("\\", "")
+
+                if not img_url:
+                    raw_str = str(res_data)
+                    pure_b64_match = re.search(r'"([A-Za-z0-9+/]{1000,}={0,2})"', raw_str)
+                    if pure_b64_match:
+                        logger.warning("在报错分支的终极fallback中找到了纯base64，已挽救")
+                        img_url = f"data:image/png;base64,{pure_b64_match.group(1)}"
+
                 if not img_url:
                     # Gemini 特殊错误诊断 (原生 API)
                     if "candidates" in res_data and res_data["candidates"]:
@@ -566,20 +587,6 @@ class ApiManager:
                             c0 = res_data["choices"][0]
                             if c0.get("message", {}).get("content"):
                                 diag_msg = f"API返回了文本而非图片: {c0['message']['content'][:200]}"
-                    
-                    # 终极 fallback，检查是否是那种直接放在外层的 tool_calls / images 遗漏
-                    raw_str = str(res_data)
-                    b64_match = re.search(r'(data:image\/[\w\-\+\.]+(?:;base64)?,[\w\-\+\/=\s]{100,})', raw_str)
-                    if b64_match:
-                        logger.warning("在报错分支的终极fallback中找到了base64，已挽救")
-                        found = b64_match.group(1).replace("\\n", "").replace("\\r", "").replace(" ", "").replace("\\", "")
-                        return found
-
-                    # 再次放宽限制：如果在 raw_str 里面发现长段的纯 base64 (没有 data:image 前缀)，也尝试挽救
-                    pure_b64_match = re.search(r'"([A-Za-z0-9+/]{1000,}={0,2})"', raw_str)
-                    if pure_b64_match:
-                        logger.warning("在报错分支的终极fallback中找到了纯base64，已挽救")
-                        return f"data:image/png;base64,{pure_b64_match.group(1)}"
 
                     return f"API请求成功但{diag_msg}。Raw: {str(res_data)[:300]}..."
 

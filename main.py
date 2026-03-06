@@ -2453,12 +2453,18 @@ class FigurineProPlugin(Star):
                     logger.error(f"打包PDF时下载图片失败: {e}")
 
         if not images_bytes:
-            return "❌ 未检测到图片。请让用户先发送图片，或者在有图片的上下文中调用。"
+            # 给大模型一个特殊的提示，告诉它可能图片还在生成中
+            return "❌ 未在上下文中检测到图片。如果图片仍在生成中，请耐心等待图片生成完成（在对话框中看到图片）后，再调用此工具打包。现在请回复用户：请稍等图片全部生成完毕后，我再为您打包成 PDF 呐~"
             
-        await event.send(event.chain_result([Plain(f"📦 正在将 {len(images_bytes)} 张图片打包为 PDF，请稍候...")]))
+        # 过滤无效图片
+        valid_images_bytes = [b for b in images_bytes if b and len(b) > 0]
+        if not valid_images_bytes:
+            return "❌ 提取到的图片数据无效，打包失败。"
+
+        await event.send(event.chain_result([Plain(f"📦 正在将最近的 {len(valid_images_bytes)} 张图片打包为 PDF，请稍候...")]))
         
         try:
-            pdf_bytes = self.img_mgr.images_to_pdf(images_bytes)
+            pdf_bytes = self.img_mgr.images_to_pdf(valid_images_bytes)
             if pdf_bytes:
                 import uuid
                 import os

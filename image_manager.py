@@ -69,7 +69,21 @@ class ImageManager:
         loop = asyncio.get_running_loop()
 
         try:
-            if Path(src).is_file():
+            # 过滤空字符串或纯空格
+            src = str(src).strip()
+            if not src:
+                return None
+
+            # 判断是否是本地文件路径（兼容Windows环境，但忽略超长字符串因为可能是base64）
+            is_local_file = False
+            if len(src) < 512 and not src.startswith("http") and not src.startswith("base64://"):
+                try:
+                    if Path(src).is_file():
+                        is_local_file = True
+                except:
+                    pass
+
+            if is_local_file:
                 # 文件IO放入线程池
                 raw = await loop.run_in_executor(None, Path(src).read_bytes)
             elif src.startswith("http"):
