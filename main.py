@@ -2368,7 +2368,7 @@ class FigurineProPlugin(Star):
             seen_urls = set()
             for msg_id, urls in reversed(image_sources):
                 for url in urls:
-                    if url not in seen_urls:
+                    if url and url not in seen_urls: # 增加空URL过滤
                         all_urls.append(url)
                         seen_urls.add(url)
                         
@@ -2377,20 +2377,24 @@ class FigurineProPlugin(Star):
             # 下载上下文中提取到的所有图片
             for url in all_urls:
                 try:
+                    if not url: continue
                     img_b = await self.img_mgr.load_bytes(url)
                     if img_b:
                         images_bytes.append(img_b)
                 except Exception as e:
-                    logger.error(f"打包PDF时下载图片失败: {e}")
+                    logger.error(f"打包PDF时下载图片失败 {url[:20]}: {e}")
 
-        if not images_bytes:
-            yield event.chain_result([Plain("❌ 未检测到图片。请发送图片或在有图片的上下文中调用。")])
+        # 过滤无效图片
+        valid_images_bytes = [b for b in images_bytes if b and len(b) > 0]
+
+        if not valid_images_bytes:
+            yield event.chain_result([Plain("❌ 未检测到有效的图片。请发送图片或在有图片的上下文中调用。")])
             return
             
-        yield event.chain_result([Plain(f"📦 正在将 {len(images_bytes)} 张图片打包为 PDF，请稍候...")])
+        yield event.chain_result([Plain(f"📦 正在将 {len(valid_images_bytes)} 张图片打包为 PDF，请稍候...")])
         
         try:
-            pdf_bytes = self.img_mgr.images_to_pdf(images_bytes)
+            pdf_bytes = self.img_mgr.images_to_pdf(valid_images_bytes)
             if pdf_bytes:
                 import uuid
                 import os
@@ -2433,7 +2437,7 @@ class FigurineProPlugin(Star):
             
             for msg_id, urls in reversed(image_sources):
                 for url in urls:
-                    if url not in seen_urls:
+                    if url and url not in seen_urls: # 增加空 URL 过滤
                         all_urls.append(url)
                         seen_urls.add(url)
                         
@@ -2446,11 +2450,12 @@ class FigurineProPlugin(Star):
             # 下载上下文中提取到的所有图片
             for url in all_urls:
                 try:
+                    if not url: continue
                     img_b = await self.img_mgr.load_bytes(url)
                     if img_b:
                         images_bytes.append(img_b)
                 except Exception as e:
-                    logger.error(f"打包PDF时下载图片失败: {e}")
+                    logger.error(f"打包PDF时下载图片失败 {url[:20]}: {e}")
 
         if not images_bytes:
             # 给大模型一个特殊的提示，告诉它可能图片还在生成中

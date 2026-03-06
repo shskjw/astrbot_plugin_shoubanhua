@@ -83,15 +83,20 @@ class ImageManager:
                 except:
                     pass
 
-            if is_local_file:
-                # 文件IO放入线程池
-                raw = await loop.run_in_executor(None, Path(src).read_bytes)
-            elif src.startswith("http"):
+            if src.startswith("http"):
                 # 网络IO本身就是异步
                 raw = await self._download_image(src)
             elif src.startswith("base64://"):
                 # Base64解码放入线程池
                 raw = await loop.run_in_executor(None, base64.b64decode, src[9:])
+            elif is_local_file:
+                # 文件IO放入线程池
+                raw = await loop.run_in_executor(None, Path(src).read_bytes)
+            else:
+                # GSUID Core 可能会传进来纯文件名 (file_unique) 等情况
+                # 或者路径无效
+                logger.warning(f"无法识别的图片来源或本地文件不存在: {src[:50]}...")
+                return None
 
             if raw:
                 # 图片处理(PIL)放入线程池，防止阻塞
