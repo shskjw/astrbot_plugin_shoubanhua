@@ -429,12 +429,16 @@ class ApiManager:
                             
                             lines = resp_text.splitlines()
                             valid_stream = False
+                            extracted_images = []
+                            extracted_data_arr = []
                             
                             for line in lines:
                                 line = line.strip()
                                 if line.startswith("data: ") and line != "data: [DONE]":
                                     try:
-                                        chunk = json.loads(line[6:])
+                                        chunk_str = line[6:]
+                                        if not chunk_str: continue
+                                        chunk = json.loads(chunk_str)
                                         valid_stream = True
                                         if "choices" in chunk and chunk["choices"]:
                                             delta = chunk["choices"][0].get("delta", {})
@@ -452,6 +456,12 @@ class ApiManager:
                                                     
                                                     if "function" in tc and "arguments" in tc["function"]:
                                                         tool_calls_buffer[idx] += tc["function"]["arguments"]
+                                        
+                                        # 3. 捕获非标准/跨界的图片字段（部分中转站会将生图直接放在chunk外层）
+                                        if "images" in chunk and isinstance(chunk["images"], list):
+                                            extracted_images.extend(chunk["images"])
+                                        if "data" in chunk and isinstance(chunk["data"], list):
+                                            extracted_data_arr.extend(chunk["data"])
                                     except:
                                         pass
                             
@@ -466,8 +476,14 @@ class ApiManager:
                                         msg_obj["tool_calls"].append({
                                             "function": {"arguments": tool_calls_buffer[idx]}
                                         })
+                                        
+                                # 将其他提取到的数据并入
+                                if extracted_images:
+                                    msg_obj["images"] = extracted_images
                                 
                                 res_data = {"choices": [{"message": msg_obj, "finish_reason": "stop"}]}
+                                if extracted_data_arr:
+                                    res_data["data"] = extracted_data_arr
                             else:
                                  return f"数据解析失败: 看起来是流式数据但无法解析. 内容: {resp_text[:100]}..."
                         else:
@@ -517,7 +533,11 @@ class ApiManager:
                         if isinstance(content, str) and not content.strip():
                             if finish_reason == "content_filter":
                                 return "❌ 生成被拦截: 触发了安全过滤 (content_filter)。建议修改 Prompt 或重试。"
-                            return f"API 返回内容为空字符串。finish_reason: {finish_reason}。"
+                            
+                            # 有些模型生成成功也是返回空字符串，但是会有 tool_calls
+                            if "tool_calls" not in msg or not msg["tool_calls"]:
+                                # 特殊判断：如果已经是 tool_calls 返回并且提取失败了才报空，如果有 b64_json 也算成功
+                                return f"API 返回内容为空字符串。finish_reason: {finish_reason}。"
 
                     # 尝试提取文本内容作为错误信息提示
                     diag_msg = "未找到图片数据"
