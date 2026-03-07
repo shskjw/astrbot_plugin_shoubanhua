@@ -499,6 +499,8 @@ class ApiManager:
                                 if tool_calls_buffer:
                                     msg_obj["tool_calls"] = []
                                     for idx in sorted(tool_calls_buffer.keys()):
+                                        # 针对 OneAPI 类的模型：流式传回来的 arguments 可能是碎片，拼接后可能不是合法的JSON
+                                        # 但后续的 extract_image_url 可以容忍非法 JSON 并进行正则提取
                                         msg_obj["tool_calls"].append({
                                             "function": {"arguments": tool_calls_buffer[idx]}
                                         })
@@ -510,9 +512,35 @@ class ApiManager:
                                 res_data = {"choices": [{"message": msg_obj, "finish_reason": "stop"}]}
                                 if extracted_data_arr:
                                     res_data["data"] = extracted_data_arr
+                                
+                                # 如果虽然是流式，但是既没有内容也没有工具调用也没有图片，且原始返回里有错误信息
+                                if not full_content and not tool_calls_buffer and not extracted_images and not extracted_data_arr:
+                                    # 再次检查是不是把 error 藏在流里了
+                                    for line in lines:
+                                        if '"error"' in line:
+                                            try:
+                                                chunk = json.loads(line.replace("data: ", "").strip())
+                                                if "error" in chunk:
+                                                    return json.dumps(chunk["error"], ensure_ascii=False)
+                                            except: pass
                             else:
                                  return f"数据解析失败: 看起来是流式数据但无法解析. 内容: {resp_text[:100]}..."
                         else:
+                            # 终极兜底：如果连 data: 都没有，但包含图片base64，尝试强行挽救
+                            b64_match = re.search(r'(data:image\/[\w\-\+\.]+(?:;base64)?,[\w\-\+\/=\s]{100,})', resp_text)
+                            if b64_match:
+                                logger.warning("在非JSON/非标准流解析失败分支中找到了base64，已挽救")
+                                res_data = {} # 置空，走后续兜底逻辑
+                                img_url = b64_match.group(1).replace("\\n", "").replace("\\r", "").replace(" ", "").replace("\\", "")
+                                if img_url.startswith("data:"):
+                                    return base64.b64decode(img_url.split(",")[-1])
+                                    
+                            pure_b64_match = re.search(r'"([A-Za-z0-9+/]{1000,}={0,2})"', resp_text)
+                            if pure_b64_match:
+                                logger.warning("在非JSON/非标准流解析失败分支中找到了纯base64，已挽救")
+                                img_url = f"data:image/png;base64,{pure_b64_match.group(1)}"
+                                return base64.b64decode(img_url.split(",")[-1])
+                            
                             return f"数据解析失败: 返回内容不是 JSON. 内容: {resp_text[:100]}..."
 
                 if "error" in res_data:
@@ -561,8 +589,11 @@ class ApiManager:
                         msg = choice.get("message", {})
                         content = msg.get("content")
                         
-                        # 1. content 为 None
-                        if content is None:
+                        # 检查是否有 tool_calls 并且我们在前面的提取阶段提取失败了
+                        has_tools = "tool_calls" in msg and bool(msg["tool_calls"])
+                        
+                        # 1. content 为 None 且没有 tool_calls
+                        if content is None and not has_tools:
                             refusal = msg.get("refusal")
                             if refusal: return f"生成请求被拒绝: {refusal}"
                             
@@ -571,22 +602,23 @@ class ApiManager:
                             logger.warning(f"OpenAI API content is None: {choice_str}")
                             return f"API 返回内容为空。finish_reason: {finish_reason}。\nDEBUG: {choice_str[:200]}..."
                         
-                        # 2. content 为空字符串
-                        if isinstance(content, str) and not content.strip():
+                        # 2. content 为空字符串 且没有 tool_calls
+                        if isinstance(content, str) and not content.strip() and not has_tools:
                             if finish_reason == "content_filter":
                                 return "❌ 生成被拦截: 触发了安全过滤 (content_filter)。建议修改 Prompt 或重试。"
                             
-                            # 有些模型生成成功也是返回空字符串，但是会有 tool_calls
-                            if "tool_calls" not in msg or not msg["tool_calls"]:
-                                # 特殊判断：如果已经是 tool_calls 返回并且提取失败了才报空，如果有 b64_json 也算成功
-                                return f"API 返回内容为空字符串。finish_reason: {finish_reason}。"
+                            # 特殊判断：如果已经是 tool_calls 返回并且提取失败了才报空，如果有 b64_json 也算成功
+                            return f"API 返回内容为空字符串。finish_reason: {finish_reason}。"
 
                     # 尝试提取文本内容作为错误信息提示
                     diag_msg = "未找到图片数据"
                     if "choices" in res_data and res_data["choices"]:
                             c0 = res_data["choices"][0]
-                            if c0.get("message", {}).get("content"):
-                                diag_msg = f"API返回了文本而非图片: {c0['message']['content'][:200]}"
+                            msg = c0.get("message", {})
+                            if msg.get("content"):
+                                diag_msg = f"API返回了文本而非图片: {msg['content'][:200]}"
+                            elif "tool_calls" in msg:
+                                diag_msg = f"API返回了工具调用但无法解析出图片。请重试或检查接口。"
 
                     return f"API请求成功但{diag_msg}。Raw: {str(res_data)[:300]}..."
 
