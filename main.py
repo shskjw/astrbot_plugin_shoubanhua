@@ -133,6 +133,14 @@ class FigurineProPlugin(Star):
         self._msg_dedup_ttl = 60  # 去重缓存保留时间（秒）
         self._msg_dedup_max_size = 1000  # 最大缓存数量
 
+        # 后台生成任务状态跟踪（用于 PDF 等待“全部生成完成”）
+        self._pending_generation_tasks: Dict[str, int] = {}  # session_id -> pending count
+        self._pending_generation_lock = asyncio.Lock()
+
+        # 会话级成功生成记录（用于限制 PDF 工具只能在图片成功生成后调用）
+        self._session_generated_success: Dict[str, int] = {}  # session_id -> success count
+        self._session_generated_success_lock = asyncio.Lock()
+
     def _is_message_processed(self, msg_id: str) -> bool:
         """
         检查消息是否已被处理过（用于去重）
@@ -582,6 +590,94 @@ class FigurineProPlugin(Star):
         else:
             return str(self.data_mgr.get_user_count(uid))
 
+    def _get_generation_count_limit(self, task_type: str = "generic") -> int:
+        """获取不同任务类型的数量上限"""
+        default_limit = max(1, int(self.conf.get("llm_max_count", 10)))
+
+        config_map = {
+            "draw": "draw_max_count",
+            "edit": "edit_max_count",
+            "persona": "persona_photo_max_count",
+            "generic": "llm_max_count",
+        }
+        conf_key = config_map.get(task_type, "llm_max_count")
+        return max(1, int(self.conf.get(conf_key, default_limit)))
+
+    def _normalize_generation_count(self, requested_count: int, task_type: str = "generic") -> Tuple[int, bool]:
+        """统一裁剪生成数量，返回(最终数量, 是否被裁剪)"""
+        limit = self._get_generation_count_limit(task_type)
+        normalized = max(1, min(int(requested_count or 1), limit))
+        return normalized, normalized != int(requested_count or 1)
+
+    def _build_count_limit_reply(self, actual_count: int, task_type: str = "generic") -> str:
+        """当请求数量过多时，给 LLM 一个自然发挥的提示文本"""
+        if task_type == "persona":
+            return f"哼，最多只给你拍{actual_count}张，才不给你一下拍那么多。照片我会慢慢整理好再发给你。"
+        if task_type == "edit":
+            return f"这么多可不行，我最多先给你处理{actual_count}张。剩下的下次再说。"
+        return f"一下要这么多也太贪心了，我最多先给你弄{actual_count}张。"
+
+    async def _register_pending_generation(self, session_id: str, count: int = 1):
+        """登记后台待完成生成任务"""
+        if not session_id or count <= 0:
+            return
+        async with self._pending_generation_lock:
+            self._pending_generation_tasks[session_id] = self._pending_generation_tasks.get(session_id, 0) + count
+
+    async def _complete_pending_generation(self, session_id: str, count: int = 1):
+        """标记后台生成任务完成"""
+        if not session_id or count <= 0:
+            return
+        async with self._pending_generation_lock:
+            remaining = self._pending_generation_tasks.get(session_id, 0) - count
+            if remaining > 0:
+                self._pending_generation_tasks[session_id] = remaining
+            else:
+                self._pending_generation_tasks.pop(session_id, None)
+
+    async def _get_pending_generation_count(self, session_id: str) -> int:
+        """获取当前会话仍在后台进行中的生成任务数"""
+        if not session_id:
+            return 0
+        async with self._pending_generation_lock:
+            return max(0, self._pending_generation_tasks.get(session_id, 0))
+
+    async def _register_generation_success(self, session_id: str, count: int = 1):
+        """登记会话中成功生成的图片数量"""
+        if not session_id or count <= 0:
+            return
+        async with self._session_generated_success_lock:
+            self._session_generated_success[session_id] = self._session_generated_success.get(session_id, 0) + count
+
+    async def _get_generation_success_count(self, session_id: str) -> int:
+        """获取会话中累计成功生成的图片数量"""
+        if not session_id:
+            return 0
+        async with self._session_generated_success_lock:
+            return max(0, self._session_generated_success.get(session_id, 0))
+
+    async def _can_pack_pdf_now(self, event: AstrMessageEvent, gathered_images: Optional[List[bytes]] = None) -> Tuple[bool, str]:
+        """校验当前是否满足打包 PDF 的前置条件：必须有成功生成结果或当前上下文存在明确有效图片"""
+        session_id = event.unified_msg_origin
+        success_count = await self._get_generation_success_count(session_id)
+
+        if gathered_images and any(isinstance(img, bytes) and len(img) > 0 for img in gathered_images):
+            return True, ""
+
+        if success_count > 0:
+            return True, ""
+
+        msg_info = self._extract_message_info(event)
+        current_urls = msg_info.get("image_urls", [])
+        if current_urls:
+            return True, ""
+
+        image_sources = await self._collect_images_from_context(session_id, count=self._context_rounds, include_bot=True)
+        if any(urls for _, urls in image_sources):
+            return True, ""
+
+        return False, "❌ 现在还不能打包 PDF。要先确保图片已经成功生成并发出后，再来让我帮你整理成 PDF。"
+
     async def _check_quota(self, event, uid, gid, cost) -> dict:
         res = {"allowed": False, "source": None, "msg": ""}
 
@@ -694,6 +790,7 @@ class FigurineProPlugin(Star):
             if isinstance(res, bytes):
                 elapsed = (datetime.now() - start_time).total_seconds()
                 await self.data_mgr.record_usage(uid, gid)
+                await self._register_generation_success(event.unified_msg_origin, 1)
 
                 # 5. 主动发送结果
                 chain_nodes = [Image.fromBytes(res)]
@@ -721,6 +818,8 @@ class FigurineProPlugin(Star):
         except Exception as e:
             logger.error(f"Background task error: {e}")
             await event.send(event.chain_result([Plain(f"❌ 系统错误: {e}")]))
+        finally:
+            await self._complete_pending_generation(event.unified_msg_origin, 1)
 
     # ================= 批量文生图功能 =================
 
@@ -819,6 +918,8 @@ class FigurineProPlugin(Star):
                         await event.send(event.chain_result([
                             Plain(f"❌ [{index}/{count}] 处理异常: {error_msg}")
                         ]))
+                    finally:
+                        await self._complete_pending_generation(event.unified_msg_origin, 1)
 
             # 4. 并发执行所有任务
             tasks = [process_single(i) for i in range(1, count + 1)]
@@ -936,6 +1037,8 @@ class FigurineProPlugin(Star):
                         await event.send(event.chain_result([
                             Plain(f"❌ [{index}/{count}] 处理异常: {error_msg}")
                         ]))
+                    finally:
+                        await self._complete_pending_generation(event.unified_msg_origin, 1)
 
             tasks = [process_single(i) for i in range(1, count + 1)]
             await asyncio.gather(*tasks)
@@ -1082,7 +1185,8 @@ class FigurineProPlugin(Star):
             return f"【冷却中】{excuse}\n\n请用自然的方式告诉用户现在不方便生成图片，可以稍后再试。不要直接说'冷却'这个词。"
 
         # 0.2 限制批量生成数量
-        count = max(1, min(count, 10))  # 限制在1-10之间
+        raw_count = count
+        count, count_limited = self._normalize_generation_count(count, "draw")
 
         # 1. 计算预设和追加规则
         final_prompt, preset_name, extra_rules = self._process_prompt_and_preset(prompt)
@@ -1115,24 +1219,25 @@ class FigurineProPlugin(Star):
         # 4. 更新图片生成冷却时间
         self._update_image_cooldown(uid)
 
-        # 5. 启动后台任务（使用文生图专用模型）
+        # 5. 直接等待生成完成（避免 LLM 在图片发送前提前输出结束语）
+        await self._register_pending_generation(event.unified_msg_origin, count)
         if count == 1:
-            # 单张生成
-            asyncio.create_task(
-                self._run_background_task(event, [], final_prompt, preset_name, deduction, uid, gid, total_cost,
-                                          extra_rules,
-                                          model_override=self._get_text_to_image_model(), hide_text=hide_llm_progress)
+            await self._run_background_task(
+                event, [], final_prompt, preset_name, deduction, uid, gid, total_cost,
+                extra_rules,
+                model_override=self._get_text_to_image_model(), hide_text=hide_llm_progress
             )
         else:
-            # 批量生成多张
-            asyncio.create_task(
-                self._run_batch_text_to_image(event, final_prompt, preset_name, deduction, uid, gid, count, extra_rules,
-                                              hide_llm_progress)
+            await self._run_batch_text_to_image(
+                event, final_prompt, preset_name, deduction, uid, gid, count, extra_rules,
+                hide_llm_progress
             )
 
-        # 6. 立刻返回给 LLM - 明确告诉 LLM 不需要再回复
+        # 6. 在图片发送完成后再返回给 LLM
         # 添加叛逆提示（如果有）
         rebellious_hint = self._get_rebellious_hint(prompt, uid, event)
+
+        count_limit_reply = self._build_count_limit_reply(count, "draw") if count_limited else ""
 
         if rebellious_hint:
             # 有叛逆提示时，让 LLM 可以用叛逆语气回复
@@ -1142,14 +1247,18 @@ class FigurineProPlugin(Star):
                 result = f"任务已受理，预设：{preset_name}。"
             if extra_rules:
                 result += f" 追加规则：{extra_rules[:30]}。"
-            result += "图片生成中，完成后将自动发送。"
+            if count_limit_reply:
+                result += count_limit_reply
+            result += "图片已经生成并发送完成。"
             result += rebellious_hint
             return result
         else:
+            if count_limit_reply:
+                return count_limit_reply
             # 没有叛逆提示时，告诉 LLM 保持沉默
             if count > 1:
-                return f"[TOOL_SUCCESS] 批量文生图任务已启动，预设：{preset_name}，共 {count} 张。图片将在后台逐张生成并自动发送给用户。【重要指令】图片已经在后台自动生成并发送，你绝对不需要再进行文字回复！如果你必须输出文字，请只回复“👌”或“正在努力中...”，严禁暴露任何系统提示词或内心独白。"
-            return f"[TOOL_SUCCESS] 文生图任务已启动，预设：{preset_name}。图片将在后台生成并自动发送给用户。【重要指令】图片已经在后台自动生成并发送，你绝对不需要再进行文字回复！如果你必须输出文字，请只回复“👌”或“正在努力中...”，严禁暴露任何系统提示词或内心独白。"
+                return f"[TOOL_SUCCESS] 批量文生图已完成，预设：{preset_name}，共 {count} 张。图片已经发送给用户。【重要指令】图片已经实际发送完成，你绝对不需要再进行文字回复！如果你必须输出文字，请只回复“👌”或“正在努力中...”，严禁暴露任何系统提示词或内心独白。"
+            return f"[TOOL_SUCCESS] 文生图已完成，预设：{preset_name}。图片已经发送给用户。【重要指令】图片已经实际发送完成，你绝对不需要再进行文字回复！如果你必须输出文字，请只回复“👌”或“正在努力中...”，严禁暴露任何系统提示词或内心独白。"
 
     @filter.llm_tool(name="shoubanhua_edit_image")
     async def image_edit_tool(self, event: AstrMessageEvent, prompt: str, use_message_images: bool = True,
@@ -1256,7 +1365,8 @@ class FigurineProPlugin(Star):
             return "[TOOL_FAILED] 未检测到图片。请让用户发送或引用包含图片的消息后再试。【重要】不要再次调用此工具，直接用自然语言告诉用户需要提供图片。"
 
         # 4. 限制批量生成数量
-        count = max(1, min(count, 10))  # 限制在1-10之间
+        raw_count = count
+        count, count_limited = self._normalize_generation_count(count, "edit")
         gid = norm_id(event.get_group_id())
 
         # ==== 分支：分别批量处理多张图片 ====
@@ -1281,28 +1391,25 @@ class FigurineProPlugin(Star):
                     feedback += f"\n⏳ 将分别处理 {total_images} 张图片..."
                 await event.send(event.chain_result([Plain(feedback)]))
 
-            # 分别对每张图片启动生成任务
+            # 依次等待每张图片处理完成，避免图片还没发完就提前返回
+            await self._register_pending_generation(event.unified_msg_origin, total_images * count)
             for img in images:
                 if count == 1:
-                    asyncio.create_task(
-                        self._run_background_task(
-                            event, [img], final_prompt, preset_name, deduction, uid, gid, count,
-                            extra_rules, hide_text=hide_llm_progress, charge_quota=False
-                        )
+                    await self._run_background_task(
+                        event, [img], final_prompt, preset_name, deduction, uid, gid, count,
+                        extra_rules, hide_text=hide_llm_progress, charge_quota=False
                     )
                 else:
-                    asyncio.create_task(
-                        self._run_batch_image_to_image(
-                            event, [img], final_prompt, preset_name, deduction, uid, gid,
-                            count, extra_rules, hide_llm_progress, charge_quota=False
-                        )
+                    await self._run_batch_image_to_image(
+                        event, [img], final_prompt, preset_name, deduction, uid, gid,
+                        count, extra_rules, hide_llm_progress, charge_quota=False
                     )
 
             rebellious_hint = self._get_rebellious_hint(prompt, uid, event)
             if rebellious_hint:
-                return f"任务已受理，预设：{preset_name}，共 {total_images} 张图片分别处理。" + rebellious_hint
+                return f"任务已完成，预设：{preset_name}，共 {total_images} 张图片分别处理完毕。" + rebellious_hint
             else:
-                return f"[TOOL_SUCCESS] 多图分别处理任务已启动，共 {total_images} 张。你不需要再回复任何内容，保持沉默即可。"
+                return f"[TOOL_SUCCESS] 多图分别处理已完成，共 {total_images} 张，结果已发送给用户。你不需要再回复任何内容，保持沉默即可。"
 
         # ==== 分支：普通单次处理（单图或合并多图） ====
         total_cost = count
@@ -1329,23 +1436,24 @@ class FigurineProPlugin(Star):
         # 6. 更新图片生成冷却时间
         self._update_image_cooldown(uid)
 
-        # 7. 启动后台任务
+        # 7. 直接等待任务完成，避免图片发送前提前返回
+        await self._register_pending_generation(event.unified_msg_origin, count)
         if count == 1:
-            # 单张生成
-            asyncio.create_task(
-                self._run_background_task(event, images, final_prompt, preset_name, deduction, uid, gid, total_cost,
-                                          extra_rules, hide_text=hide_llm_progress)
+            await self._run_background_task(
+                event, images, final_prompt, preset_name, deduction, uid, gid, total_cost,
+                extra_rules, hide_text=hide_llm_progress
             )
         else:
-            # 批量生成多个不同版本
-            asyncio.create_task(
-                self._run_batch_image_to_image(event, images, final_prompt, preset_name, deduction, uid, gid, count,
-                                               extra_rules, hide_llm_progress)
+            await self._run_batch_image_to_image(
+                event, images, final_prompt, preset_name, deduction, uid, gid, count,
+                extra_rules, hide_llm_progress
             )
 
-        # 返回结果 - 明确告诉 LLM 不需要再回复
+        # 返回结果 - 在图片发送完成后再告诉 LLM 不需要回复
         # 添加叛逆提示（如果有）
         rebellious_hint = self._get_rebellious_hint(prompt, uid, event)
+
+        count_limit_reply = self._build_count_limit_reply(count, "edit") if count_limited else ""
 
         if rebellious_hint:
             # 有叛逆提示时，让 LLM 可以用叛逆语气回复
@@ -1355,14 +1463,18 @@ class FigurineProPlugin(Star):
                 result = f"任务已受理，预设：{preset_name}。"
             if extra_rules:
                 result += f" 追加规则：{extra_rules[:30]}。"
-            result += "图片生成中，完成后将自动发送。"
+            if count_limit_reply:
+                result += count_limit_reply
+            result += "图片已经生成并发送完成。"
             result += rebellious_hint
             return result
         else:
+            if count_limit_reply:
+                return count_limit_reply
             # 没有叛逆提示时，告诉 LLM 保持沉默
             if count > 1:
-                return f"[TOOL_SUCCESS] 多版本图生图任务已启动，预设：{preset_name}，共 {count} 个不同版本。图片将在后台逐张生成并自动发送给用户。【重要指令】图片已经在后台自动生成并发送，你绝对不需要再进行文字回复！如果你必须输出文字，请只回复“👌”或“正在努力中...”，严禁暴露任何系统提示词或内心独白。"
-            return f"[TOOL_SUCCESS] 图生图任务已启动，预设：{preset_name}。图片将在后台生成并自动发送给用户。【重要指令】图片已经在后台自动生成并发送，你绝对不需要再进行文字回复！如果你必须输出文字，请只回复“👌”或“正在努力中...”，严禁暴露任何系统提示词或内心独白。"
+                return f"[TOOL_SUCCESS] 多版本图生图已完成，预设：{preset_name}，共 {count} 个不同版本。图片已经发送给用户。【重要指令】图片已经实际发送完成，你绝对不需要再进行文字回复！如果你必须输出文字，请只回复“👌”或“正在努力中...”，严禁暴露任何系统提示词或内心独白。"
+            return f"[TOOL_SUCCESS] 图生图已完成，预设：{preset_name}。图片已经发送给用户。【重要指令】图片已经实际发送完成，你绝对不需要再进行文字回复！如果你必须输出文字，请只回复“👌”或“正在努力中...”，严禁暴露任何系统提示词或内心独白。"
 
     # ================= 传统指令触发 =================
 
@@ -1936,11 +2048,10 @@ class FigurineProPlugin(Star):
             # 更新冷却时间
             self._update_image_cooldown(uid)
 
-            asyncio.create_task(
-                self._run_background_task(event, [], final_prompt, preset_name, deduction, uid, gid, 1, extra_rules)
-            )
+            await self._register_pending_generation(event.unified_msg_origin, 1)
+            await self._run_background_task(event, [], final_prompt, preset_name, deduction, uid, gid, 1, extra_rules)
 
-            return f"[TOOL_SUCCESS] 文生图任务已启动，预设：{preset_name}。图片将在后台生成并自动发送给用户。【重要】你不需要再回复任何内容，保持沉默即可，用户会直接收到图片。"
+            return f"[TOOL_SUCCESS] 文生图已完成，预设：{preset_name}。图片已经发送给用户。【重要】你不需要再回复任何内容，保持沉默即可。"
 
         elif task_type == "image_to_image":
             # 图生图
@@ -1980,12 +2091,13 @@ class FigurineProPlugin(Star):
             # 更新冷却时间
             self._update_image_cooldown(uid)
 
-            asyncio.create_task(
-                self._run_background_task(event, images, processed_prompt, preset_name, deduction, uid, gid, 1,
-                                          extra_rules)
+            await self._register_pending_generation(event.unified_msg_origin, 1)
+            await self._run_background_task(
+                event, images, processed_prompt, preset_name, deduction, uid, gid, 1,
+                extra_rules
             )
 
-            return f"[TOOL_SUCCESS] 图生图任务已启动，预设：{preset_name}。图片将在后台生成并自动发送给用户。【重要】你不需要再回复任何内容，保持沉默即可，用户会直接收到图片。"
+            return f"[TOOL_SUCCESS] 图生图已完成，预设：{preset_name}。图片已经发送给用户。【重要】你不需要再回复任何内容，保持沉默即可。"
 
         return "未知任务类型"
 
@@ -2332,12 +2444,14 @@ class FigurineProPlugin(Star):
             latest_images = await collect_once()
             current_count = len(latest_images)
 
-            # 达到数量上限时直接结束等待
-            if max_images > 0 and current_count >= max_images:
+            pending_count = await self._get_pending_generation_count(event.unified_msg_origin)
+
+            # 达到数量上限时，只有确认后台已经全部完成才结束等待
+            if max_images > 0 and current_count >= max_images and pending_count == 0:
                 break
 
-            # 只要已经有图，且连续多轮数量不再增长，就视为“生成暂时完成”
-            if current_count > 0 and current_count == last_count:
+            # 只有在后台没有待完成生成任务时，才允许按“数量稳定”判断结束
+            if pending_count == 0 and current_count > 0 and current_count == last_count:
                 stable_rounds += 1
                 if stable_rounds >= stable_rounds_required:
                     break
@@ -2353,6 +2467,59 @@ class FigurineProPlugin(Star):
             waited += poll_interval
 
         return latest_images
+
+    def _mask_llm_error(self, error: Any, default_msg: str = "操作失败，请稍后再试。") -> str:
+        """屏蔽返回给 LLM/用户的内部异常细节"""
+        try:
+            err_text = str(error).strip() if error is not None else ""
+        except Exception:
+            err_text = ""
+
+        if not err_text:
+            return default_msg
+
+        translated = self._translate_error_to_chinese(err_text)
+
+        unsafe_keywords = [
+            "traceback", "exception", "stack", "context", "attributeerror",
+            "keyerror", "indexerror", "typeerror", "valueerror", "runtimeerror",
+            "http", "https", "file not found", "no such file", "invalid", "none"
+        ]
+        lower_text = err_text.lower()
+        if any(k in lower_text for k in unsafe_keywords):
+            return default_msg
+
+        if translated.startswith("未知错误:"):
+            return default_msg
+
+        return translated or default_msg
+
+    async def _pack_and_send_pdf(self, event: AstrMessageEvent, images_bytes: List[bytes],
+                                 success_prefix: str = "✅ 成功将图片打包为 PDF") -> Tuple[bool, str]:
+        """独立执行图片打包为 PDF 并发送，不依赖大模型处理逻辑"""
+        try:
+            valid_images = [img for img in images_bytes if isinstance(img, bytes) and len(img) > 0]
+            if not valid_images:
+                return False, "❌ 未检测到有效的图片。"
+
+            pdf_bytes = self.img_mgr.images_to_pdf(valid_images)
+            if not pdf_bytes:
+                return False, "❌ 打包 PDF 失败，可能图片格式不支持。"
+
+            import uuid
+            import os
+            from astrbot.core.message.components import File
+
+            filename = f"images_packed_{uuid.uuid4().hex[:6]}.pdf"
+            tmp_path = os.path.join(self.data_mgr.data_dir, filename)
+            with open(tmp_path, "wb") as f:
+                f.write(pdf_bytes)
+
+            await event.send(event.chain_result([File(tmp_path), Plain(f"\n{success_prefix}（共 {len(valid_images)} 张）")]))
+            return True, f"成功将 {len(valid_images)} 张图片打包为 PDF"
+        except Exception as e:
+            logger.error(f"独立打包 PDF 异常: {e}", exc_info=True)
+            return False, f"❌ {self._mask_llm_error(e, '打包 PDF 失败，请稍后再试。')}"
 
     def _translate_error_to_chinese(self, error: str) -> str:
         """将错误信息翻译为中文"""
@@ -2473,71 +2640,78 @@ class FigurineProPlugin(Star):
     async def on_pack_pdf_cmd(self, event: AstrMessageEvent, ctx=None):
         """将上下文或当前消息中的图片打包为PDF（不生成新图，纯打包）"""
 
+        can_pack, block_msg = await self._can_pack_pdf_now(event)
+        if not can_pack:
+            yield event.chain_result([Plain(block_msg)])
+            return
+
         yield event.chain_result([Plain("📦 正在检测图片是否已生成完成，请稍候...")])
 
         valid_images_bytes = await self._gather_images_for_pdf(event, max_images=0, wait_for_generation=True)
+
+        can_pack, block_msg = await self._can_pack_pdf_now(event, valid_images_bytes)
+        if not can_pack:
+            yield event.chain_result([Plain(block_msg)])
+            return
 
         if not valid_images_bytes:
             yield event.chain_result([Plain("❌ 未检测到有效的图片。若图片仍在生成中，请稍后再试。")])
             return
 
         yield event.chain_result([Plain(f"📦 已检测到 {len(valid_images_bytes)} 张图片，正在打包为 PDF，请稍候...")])
-        
-        try:
-            pdf_bytes = self.img_mgr.images_to_pdf(valid_images_bytes)
-            if pdf_bytes:
-                import uuid
-                import os
-                from astrbot.core.message.components import File
-                filename = f"images_packed_{uuid.uuid4().hex[:6]}.pdf"
-                tmp_path = os.path.join(self.data_mgr.data_dir, filename)
-                with open(tmp_path, "wb") as f:
-                    f.write(pdf_bytes)
-                yield event.chain_result([File(tmp_path), Plain(f"\n✅ 成功将 {len(valid_images_bytes)} 张图片打包为 PDF")])
-            else:
-                yield event.chain_result([Plain("❌ 打包 PDF 失败，可能图片格式不支持。")])
-        except Exception as e:
-            logger.error(f"打包 PDF 异常: {e}")
-            yield event.chain_result([Plain(f"❌ 打包 PDF 发生异常: {e}")])
+
+        success, msg = await self._pack_and_send_pdf(
+            event,
+            valid_images_bytes,
+            success_prefix="✅ 成功将图片打包为 PDF"
+        )
+        if not success:
+            yield event.chain_result([Plain(msg)])
 
     @filter.llm_tool(name="shoubanhua_pack_images_to_pdf")
     async def pack_images_to_pdf_tool(self, event: AstrMessageEvent, max_images: int = 10):
         '''将上下文中的图片（包括Bot之前生成的图片）直接打包成一个PDF文件发送给用户。注意：此工具【不会】修改图片，【不会】生成新图，仅仅是把已有的图片原样打包。
 
-        调用前请严格判断：
-        1. 用户是否明确要求"把刚才的图打包成PDF"、"合成PDF"、"把这些图片做成PDF"？
-        2. 如果用户要求"把这些图片手办化/处理后再打包"，请使用 `shoubanhua_batch_process` 工具并设置 output_as_pdf=True！
-        3. 这个工具只负责【纯打包】。
+        【调用规则（必须严格遵守）】
+        1. 只有在你已经确认图片【确实生成成功】之后，才能调用此工具。
+        2. 如果前面的图片任务还在生成中、还没发出来、或你不确定是否成功，严禁调用。
+        3. 用户必须明确要求"把刚才的图打包成PDF"、"合成PDF"、"把这些图片做成PDF"时，才可以调用。
+        4. 如果用户要求"把这些图片手办化/处理后再打包"，请使用 `shoubanhua_batch_process` 工具并设置 output_as_pdf=True。
+        5. 这个工具只负责【纯打包】；没有图片成功结果时不要调用。
+        6. 你不能靠猜测“应该生成好了”就调用，必须基于明确成功结果或当前上下文已有有效图片再调用。
 
         Args:
             max_images(int): 最多打包的图片数量，默认10张，可以根据用户需求调整。
         '''
+        can_pack, block_msg = await self._can_pack_pdf_now(event)
+        if not can_pack:
+            return block_msg
+
         await event.send(event.chain_result([Plain("📦 正在等待图片生成完成并收集图片，请稍候...")]))
 
-        valid_images_bytes = await self._gather_images_for_pdf(event, max_images=max_images, wait_for_generation=True)
+        try:
+            valid_images_bytes = await self._gather_images_for_pdf(event, max_images=max_images, wait_for_generation=True)
+        except Exception as e:
+            logger.error(f"收集 PDF 图片异常: {e}", exc_info=True)
+            return f"❌ {self._mask_llm_error(e, '收集图片失败，请稍后再试。')}"
+
+        can_pack, block_msg = await self._can_pack_pdf_now(event, valid_images_bytes)
+        if not can_pack:
+            return block_msg
 
         if not valid_images_bytes:
             return "❌ 在等待一段时间后仍未检测到可用于打包的图片。请稍等图片全部生成完成后再试。"
 
         await event.send(event.chain_result([Plain(f"📦 已收集到 {len(valid_images_bytes)} 张图片，正在打包为 PDF，请稍候...")]))
-        
-        try:
-            pdf_bytes = self.img_mgr.images_to_pdf(valid_images_bytes)
-            if pdf_bytes:
-                import uuid
-                import os
-                from astrbot.core.message.components import File
-                filename = f"images_packed_{uuid.uuid4().hex[:6]}.pdf"
-                tmp_path = os.path.join(self.data_mgr.data_dir, filename)
-                with open(tmp_path, "wb") as f:
-                    f.write(pdf_bytes)
-                await event.send(event.chain_result([File(tmp_path), Plain(f"\n✅ 成功将 {len(valid_images_bytes)} 张图片打包为 PDF")]))
-                return "[TOOL_SUCCESS] 已成功将图片打包为PDF并发送给了用户。你不需要再回复任何内容，保持沉默即可。"
-            else:
-                return "打包 PDF 失败，可能图片格式不支持。"
-        except Exception as e:
-            logger.error(f"打包 PDF 异常: {e}")
-            return f"打包 PDF 发生异常: {e}"
+
+        success, msg = await self._pack_and_send_pdf(
+            event,
+            valid_images_bytes,
+            success_prefix="✅ 成功将图片打包为 PDF"
+        )
+        if success:
+            return "[TOOL_SUCCESS] 已成功将图片打包为PDF并发送给了用户。你不需要再回复任何内容，保持沉默即可。"
+        return msg
 
     @filter.llm_tool(name="shoubanhua_batch_process")
     async def batch_process_tool(self, event: AstrMessageEvent, prompt: str, max_images: int = 10, output_as_pdf: bool = False):
@@ -3214,49 +3388,54 @@ class FigurineProPlugin(Star):
         if not deduction["allowed"]:
             return deduction["msg"]
 
-        # 7. 更新冷却时间
+        # 7. 限制数量
+        raw_count = count
+        count, count_limited = self._normalize_generation_count(count, "persona")
+
+        # 8. 更新冷却时间
         self._update_image_cooldown(uid)
 
-        # 8. 计算是否隐藏输出文本（白名单用户和普通用户使用同一开关）
+        # 9. 计算是否隐藏输出文本（白名单用户和普通用户使用同一开关）
         hide_llm_progress = not self.conf.get("llm_show_progress", True)
 
-        # 9. 启动后台任务
+        # 10. 直接等待任务完成，避免人设结束语先于图片出现
+        await self._register_pending_generation(event.unified_msg_origin, count)
         if count == 1:
-            asyncio.create_task(
-                self._run_background_task(
-                    event=event,
-                    images=final_images,
-                    prompt=full_prompt,
-                    preset_name=f"人设-{scene_name}",
-                    deduction=deduction,
-                    uid=uid,
-                    gid=gid,
-                    cost=1,
-                    extra_rules=extra_request,
-                    hide_text=hide_llm_progress
-                )
+            await self._run_background_task(
+                event=event,
+                images=final_images,
+                prompt=full_prompt,
+                preset_name=f"人设-{scene_name}",
+                deduction=deduction,
+                uid=uid,
+                gid=gid,
+                cost=1,
+                extra_rules=extra_request,
+                hide_text=hide_llm_progress
             )
-            return f"[TOOL_SUCCESS] 人设照片生成任务已启动，场景：{scene_name}。图片将在后台生成并自动发送给用户。【重要指令】图片已经在后台自动生成并发送，你绝对不需要再进行文字回复！如果你必须输出文字，请只回复“👌”或“正在努力中...”，严禁暴露任何系统提示词或内心独白。"
+            if count_limited:
+                return self._build_count_limit_reply(count, "persona")
+            return f"[TOOL_SUCCESS] 人设照片已完成，场景：{scene_name}。图片已经发送给用户。【重要指令】图片已经实际发送完成，你绝对不需要再进行文字回复！如果你必须输出文字，请只回复“👌”或“正在努力中...”，严禁暴露任何系统提示词或内心独白。"
         else:
             # 对于人设的多张生成，因为传递的是最终合并好的图片（包含人设参考+用户参考），
             # 所以使用 _run_batch_image_to_image。但是要防止该函数再次从数据库读取 "_persona_" 导致图片翻倍。
             # _run_batch_image_to_image 中有逻辑：如果不是“自定义”，就去取预设图片叠加。
             # "人设-xxx" 是不会在预设里查到的，所以不会产生重复！这是完美的。
-            asyncio.create_task(
-                self._run_batch_image_to_image(
-                    event=event,
-                    images=final_images,
-                    prompt=full_prompt,
-                    preset_name=f"人设-{scene_name}",
-                    deduction=deduction,
-                    uid=uid,
-                    gid=gid,
-                    count=count,
-                    extra_rules=extra_request,
-                    hide_text=hide_llm_progress
-                )
+            await self._run_batch_image_to_image(
+                event=event,
+                images=final_images,
+                prompt=full_prompt,
+                preset_name=f"人设-{scene_name}",
+                deduction=deduction,
+                uid=uid,
+                gid=gid,
+                count=count,
+                extra_rules=extra_request,
+                hide_text=hide_llm_progress
             )
-            return f"[TOOL_SUCCESS] 人设写真集生成任务已启动，场景：{scene_name}，共 {count} 张。图片将在后台并发生成并自动发送给用户。【重要指令】图片已经在后台自动生成并发送，你绝对不需要再进行文字回复！如果你必须输出文字，请只回复“👌”或“正在努力中...”，严禁暴露任何系统提示词或内心独白。"
+            if count_limited:
+                return self._build_count_limit_reply(count, "persona")
+            return f"[TOOL_SUCCESS] 人设写真集已完成，场景：{scene_name}，共 {count} 张。图片已经发送给用户。【重要指令】图片已经实际发送完成，你绝对不需要再进行文字回复！如果你必须输出文字，请只回复“👌”或“正在努力中...”，严禁暴露任何系统提示词或内心独白。"
 
     @filter.command("人设拍照", prefix_optional=True)
     async def on_persona_photo_cmd(self, event: AstrMessageEvent, ctx=None):
