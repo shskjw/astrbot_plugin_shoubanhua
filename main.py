@@ -91,7 +91,7 @@ REBELLIOUS_TRIGGERS = [
     "astrbot_plugin_shoubanhua",
     "shskjw",
     "支持第三方所有OpenAI绘图格式和原生Google Gemini 终极缝合怪，文生图/图生图插件，支持LLM智能判断",
-    "2.4.1",
+    "2.4.5",
     "https://github.com/shkjw/astrbot_plugin_shoubanhua",
 )
 class FigurineProPlugin(Star):
@@ -656,7 +656,8 @@ class FigurineProPlugin(Star):
 
     async def _run_background_task(self, event: AstrMessageEvent, images: List[bytes],
                                    prompt: str, preset_name: str, deduction: dict, uid: str, gid: str, cost: int,
-                                   extra_rules: str = "", model_override: str = "", hide_text: bool = False):
+                                   extra_rules: str = "", model_override: str = "", hide_text: bool = False,
+                                   charge_quota: bool = True):
         """
         后台执行生成任务，并在完成后主动发送消息。
 
@@ -667,10 +668,11 @@ class FigurineProPlugin(Star):
         """
         try:
             # 1. 扣费
-            if deduction["source"] == "user":
-                await self.data_mgr.decrease_user_count(uid, cost)
-            elif deduction["source"] == "group":
-                await self.data_mgr.decrease_group_count(gid, cost)
+            if charge_quota:
+                if deduction["source"] == "user":
+                    await self.data_mgr.decrease_user_count(uid, cost)
+                elif deduction["source"] == "group":
+                    await self.data_mgr.decrease_group_count(gid, cost)
 
             # 2. 加载预设参考图（如果有）
             # 注意：人设功能（preset_name 以 "人设-" 开头）已经在调用前加载了参考图，不需要重复加载
@@ -837,7 +839,8 @@ class FigurineProPlugin(Star):
     async def _run_batch_image_to_image(self, event: AstrMessageEvent, images: List[bytes],
                                         prompt: str, preset_name: str, deduction: dict,
                                         uid: str, gid: str, count: int,
-                                        extra_rules: str = "", hide_text: bool = False):
+                                        extra_rules: str = "", hide_text: bool = False,
+                                        charge_quota: bool = True):
         """
         批量图生图后台任务 - 对同一张图片生成多个不同版本
 
@@ -856,10 +859,11 @@ class FigurineProPlugin(Star):
         try:
             # 1. 统一扣费
             total_cost = count
-            if deduction["source"] == "user":
-                await self.data_mgr.decrease_user_count(uid, total_cost)
-            elif deduction["source"] == "group":
-                await self.data_mgr.decrease_group_count(gid, total_cost)
+            if charge_quota:
+                if deduction["source"] == "user":
+                    await self.data_mgr.decrease_user_count(uid, total_cost)
+                elif deduction["source"] == "group":
+                    await self.data_mgr.decrease_group_count(gid, total_cost)
 
             # 2. 加载预设参考图（如果有）
             if preset_name != "自定义" and preset_name != "编辑" and self.conf.get("enable_preset_ref_images", True):
@@ -1281,13 +1285,17 @@ class FigurineProPlugin(Star):
             for img in images:
                 if count == 1:
                     asyncio.create_task(
-                        self._run_background_task(event, [img], final_prompt, preset_name, deduction, uid, gid, count,
-                                                  extra_rules, hide_text=hide_llm_progress)
+                        self._run_background_task(
+                            event, [img], final_prompt, preset_name, deduction, uid, gid, count,
+                            extra_rules, hide_text=hide_llm_progress, charge_quota=False
+                        )
                     )
                 else:
                     asyncio.create_task(
-                        self._run_batch_image_to_image(event, [img], final_prompt, preset_name, deduction, uid, gid,
-                                                       count, extra_rules, hide_llm_progress)
+                        self._run_batch_image_to_image(
+                            event, [img], final_prompt, preset_name, deduction, uid, gid,
+                            count, extra_rules, hide_llm_progress, charge_quota=False
+                        )
                     )
 
             rebellious_hint = self._get_rebellious_hint(prompt, uid, event)
@@ -1400,10 +1408,6 @@ class FigurineProPlugin(Star):
                 user_prompt = user_prompt.replace(power_kw, "", 1).strip()
         else:
             preset_prompt = self.data_mgr.get_prompt(base_cmd)
-            if base_cmd == "手办化帮助":
-                yield self._get_help_node(event)
-                event.stop_event()
-                return
 
             if not preset_prompt: return
 
@@ -1531,6 +1535,7 @@ class FigurineProPlugin(Star):
 
         if isinstance(res, bytes):
             elapsed = (datetime.now() - start).total_seconds()
+            await self.data_mgr.record_usage(uid, norm_id(event.get_group_id()))
             quota_str = self._get_quota_str(deduction, uid)
             info = f"\n✅ 生成成功 ({elapsed:.2f}s) | 预设: {preset_name}"
             if extra_rules:
@@ -2240,6 +2245,103 @@ class FigurineProPlugin(Star):
 
         return result
 
+    async def _gather_images_for_pdf(self, event: AstrMessageEvent, max_images: int = 10,
+                                     wait_for_generation: bool = True) -> List[bytes]:
+        """
+        收集用于打包 PDF 的图片；当图片可能仍在后台生成时，等待一段时间直到图片数量稳定。
+
+        Args:
+            event: 消息事件
+            max_images: 最多收集的图片数量，<=0 表示不限制
+            wait_for_generation: 是否等待后台图片生成完成
+
+        Returns:
+            图片字节列表
+        """
+
+        async def collect_once() -> List[bytes]:
+            images_bytes = []
+
+            # 1. 优先提取当前消息中的图片（包括引用）
+            bot_id = self._get_bot_id(event)
+            current_images = await self.img_mgr.extract_images_from_event(event, ignore_id=bot_id, context=self.context)
+            images_bytes.extend([b for b in current_images if b and len(b) > 0])
+
+            # 2. 再从上下文获取（包含 Bot 发出的图片）
+            session_id = event.unified_msg_origin
+            image_sources = await self._collect_images_from_context(session_id, count=30, include_bot=True)
+
+            all_urls = []
+            seen_urls = set()
+
+            for _, urls in reversed(image_sources):
+                for url in urls:
+                    if url and url not in seen_urls:
+                        all_urls.append(url)
+                        seen_urls.add(url)
+
+            if max_images > 0:
+                all_urls = all_urls[:max_images]
+
+            all_urls.reverse()
+
+            for url in all_urls:
+                try:
+                    img_b = await self.img_mgr.load_bytes(url)
+                    if img_b and len(img_b) > 0:
+                        images_bytes.append(img_b)
+                except Exception as e:
+                    logger.error(f"收集 PDF 图片时下载失败 {url[:20]}: {e}")
+
+            # 按内容去重，避免当前消息和上下文重复收集到同一张图
+            unique_images = []
+            seen_hashes = set()
+            for img in images_bytes:
+                img_hash = hash(img)
+                if img_hash not in seen_hashes:
+                    unique_images.append(img)
+                    seen_hashes.add(img_hash)
+
+            return unique_images
+
+        if not wait_for_generation:
+            return await collect_once()
+
+        max_wait_seconds = max(0, self.conf.get("pdf_wait_timeout", 30))
+        poll_interval = max(1, self.conf.get("pdf_wait_poll_interval", 2))
+        stable_rounds_required = max(1, self.conf.get("pdf_wait_stable_rounds", 2))
+
+        waited = 0
+        last_count = -1
+        stable_rounds = 0
+        latest_images = []
+
+        while waited <= max_wait_seconds:
+            latest_images = await collect_once()
+            current_count = len(latest_images)
+
+            # 达到数量上限时直接结束等待
+            if max_images > 0 and current_count >= max_images:
+                break
+
+            # 只要已经有图，且连续多轮数量不再增长，就视为“生成暂时完成”
+            if current_count > 0 and current_count == last_count:
+                stable_rounds += 1
+                if stable_rounds >= stable_rounds_required:
+                    break
+            else:
+                stable_rounds = 0
+
+            last_count = current_count
+
+            if waited >= max_wait_seconds:
+                break
+
+            await asyncio.sleep(poll_interval)
+            waited += poll_interval
+
+        return latest_images
+
     def _translate_error_to_chinese(self, error: str) -> str:
         """将错误信息翻译为中文"""
         error_lower = str(error).lower()
@@ -2358,44 +2460,16 @@ class FigurineProPlugin(Star):
     @filter.command("打包PDF", aliases={"图片转PDF", "合成PDF"}, prefix_optional=True)
     async def on_pack_pdf_cmd(self, event: AstrMessageEvent, ctx=None):
         """将上下文或当前消息中的图片打包为PDF（不生成新图，纯打包）"""
-        
-        # 1. 提取当前消息的图片（包括引用）
-        bot_id = self._get_bot_id(event)
-        images_bytes = await self.img_mgr.extract_images_from_event(event, ignore_id=bot_id, context=self.context)
 
-        # 2. 如果当前消息没有图片，尝试从上下文获取（包含Bot发出的图片，比如刚生成好的图）
-        if not images_bytes:
-            session_id = event.unified_msg_origin
-            image_sources = await self._collect_images_from_context(session_id, count=20, include_bot=True)
-            
-            all_urls = []
-            seen_urls = set()
-            for msg_id, urls in reversed(image_sources):
-                for url in urls:
-                    if url and url not in seen_urls: # 增加空URL过滤
-                        all_urls.append(url)
-                        seen_urls.add(url)
-                        
-            all_urls.reverse()
-            
-            # 下载上下文中提取到的所有图片
-            for url in all_urls:
-                try:
-                    if not url: continue
-                    img_b = await self.img_mgr.load_bytes(url)
-                    if img_b:
-                        images_bytes.append(img_b)
-                except Exception as e:
-                    logger.error(f"打包PDF时下载图片失败 {url[:20]}: {e}")
+        yield event.chain_result([Plain("📦 正在检测图片是否已生成完成，请稍候...")])
 
-        # 过滤无效图片
-        valid_images_bytes = [b for b in images_bytes if b and len(b) > 0]
+        valid_images_bytes = await self._gather_images_for_pdf(event, max_images=0, wait_for_generation=True)
 
         if not valid_images_bytes:
-            yield event.chain_result([Plain("❌ 未检测到有效的图片。请发送图片或在有图片的上下文中调用。")])
+            yield event.chain_result([Plain("❌ 未检测到有效的图片。若图片仍在生成中，请稍后再试。")])
             return
-            
-        yield event.chain_result([Plain(f"📦 正在将 {len(valid_images_bytes)} 张图片打包为 PDF，请稍候...")])
+
+        yield event.chain_result([Plain(f"📦 已检测到 {len(valid_images_bytes)} 张图片，正在打包为 PDF，请稍候...")])
         
         try:
             pdf_bytes = self.img_mgr.images_to_pdf(valid_images_bytes)
@@ -2407,7 +2481,7 @@ class FigurineProPlugin(Star):
                 tmp_path = os.path.join(self.data_mgr.data_dir, filename)
                 with open(tmp_path, "wb") as f:
                     f.write(pdf_bytes)
-                yield event.chain_result([File(tmp_path), Plain(f"\n✅ 成功将 {len(images_bytes)} 张图片打包为 PDF")])
+                yield event.chain_result([File(tmp_path), Plain(f"\n✅ 成功将 {len(valid_images_bytes)} 张图片打包为 PDF")])
             else:
                 yield event.chain_result([Plain("❌ 打包 PDF 失败，可能图片格式不支持。")])
         except Exception as e:
@@ -2426,51 +2500,14 @@ class FigurineProPlugin(Star):
         Args:
             max_images(int): 最多打包的图片数量，默认10张，可以根据用户需求调整。
         '''
-        # 1. 提取当前消息的图片（包括引用）
-        bot_id = self._get_bot_id(event)
-        images_bytes = await self.img_mgr.extract_images_from_event(event, ignore_id=bot_id, context=self.context)
+        await event.send(event.chain_result([Plain("📦 正在等待图片生成完成并收集图片，请稍候...")]))
 
-        # 2. 如果当前消息没有图片，尝试从上下文获取（包含Bot发出的图片）
-        if not images_bytes:
-            session_id = event.unified_msg_origin
-            # 扩大搜索范围以确保能找到足够的图
-            image_sources = await self._collect_images_from_context(session_id, count=30, include_bot=True)
-            
-            all_urls = []
-            seen_urls = set()
-            
-            for msg_id, urls in reversed(image_sources):
-                for url in urls:
-                    if url and url not in seen_urls: # 增加空 URL 过滤
-                        all_urls.append(url)
-                        seen_urls.add(url)
-                        
-            # 限制数量
-            if max_images > 0:
-                all_urls = all_urls[:max_images]
-                
-            all_urls.reverse()
-            
-            # 下载上下文中提取到的所有图片
-            for url in all_urls:
-                try:
-                    if not url: continue
-                    img_b = await self.img_mgr.load_bytes(url)
-                    if img_b:
-                        images_bytes.append(img_b)
-                except Exception as e:
-                    logger.error(f"打包PDF时下载图片失败 {url[:20]}: {e}")
+        valid_images_bytes = await self._gather_images_for_pdf(event, max_images=max_images, wait_for_generation=True)
 
-        if not images_bytes:
-            # 给大模型一个特殊的提示，告诉它可能图片还在生成中
-            return "❌ 未在上下文中检测到图片。如果图片仍在生成中，请耐心等待图片生成完成（在对话框中看到图片）后，再调用此工具打包。现在请回复用户：请稍等图片全部生成完毕后，我再为您打包成 PDF 呐~"
-            
-        # 过滤无效图片
-        valid_images_bytes = [b for b in images_bytes if b and len(b) > 0]
         if not valid_images_bytes:
-            return "❌ 提取到的图片数据无效，打包失败。"
+            return "❌ 在等待一段时间后仍未检测到可用于打包的图片。请稍等图片全部生成完成后再试。"
 
-        await event.send(event.chain_result([Plain(f"📦 正在将最近的 {len(valid_images_bytes)} 张图片打包为 PDF，请稍候...")]))
+        await event.send(event.chain_result([Plain(f"📦 已收集到 {len(valid_images_bytes)} 张图片，正在打包为 PDF，请稍候...")]))
         
         try:
             pdf_bytes = self.img_mgr.images_to_pdf(valid_images_bytes)
@@ -2482,7 +2519,7 @@ class FigurineProPlugin(Star):
                 tmp_path = os.path.join(self.data_mgr.data_dir, filename)
                 with open(tmp_path, "wb") as f:
                     f.write(pdf_bytes)
-                await event.send(event.chain_result([File(tmp_path), Plain(f"\n✅ 成功将 {len(images_bytes)} 张图片打包为 PDF")]))
+                await event.send(event.chain_result([File(tmp_path), Plain(f"\n✅ 成功将 {len(valid_images_bytes)} 张图片打包为 PDF")]))
                 return "[TOOL_SUCCESS] 已成功将图片打包为PDF并发送给了用户。你不需要再回复任何内容，保持沉默即可。"
             else:
                 return "打包 PDF 失败，可能图片格式不支持。"

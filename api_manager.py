@@ -457,6 +457,7 @@ class ApiManager:
                             valid_stream = False
                             extracted_images = []
                             extracted_data_arr = []
+                            extracted_urls = []
                             
                             for line in lines:
                                 line = line.strip()
@@ -482,12 +483,34 @@ class ApiManager:
                                                     
                                                     if "function" in tc and "arguments" in tc["function"]:
                                                         tool_calls_buffer[idx] += tc["function"]["arguments"]
+
+                                            # 3. 捕获 delta 中的非标准图片字段（部分兼容接口会把图片放在 delta 内）
+                                            if "images" in delta and isinstance(delta["images"], list):
+                                                extracted_images.extend(delta["images"])
+                                            if "data" in delta and isinstance(delta["data"], list):
+                                                extracted_data_arr.extend(delta["data"])
+                                            if "image_url" in delta:
+                                                image_url = delta["image_url"]
+                                                if isinstance(image_url, str):
+                                                    extracted_urls.append(image_url)
+                                                elif isinstance(image_url, dict) and image_url.get("url"):
+                                                    extracted_urls.append(image_url["url"])
+                                            if "url" in delta and isinstance(delta["url"], str):
+                                                extracted_urls.append(delta["url"])
                                         
-                                        # 3. 捕获非标准/跨界的图片字段（部分中转站会将生图直接放在chunk外层）
+                                        # 4. 捕获非标准/跨界的图片字段（部分中转站会将生图直接放在chunk外层）
                                         if "images" in chunk and isinstance(chunk["images"], list):
                                             extracted_images.extend(chunk["images"])
                                         if "data" in chunk and isinstance(chunk["data"], list):
                                             extracted_data_arr.extend(chunk["data"])
+                                        if "image_url" in chunk:
+                                            image_url = chunk["image_url"]
+                                            if isinstance(image_url, str):
+                                                extracted_urls.append(image_url)
+                                            elif isinstance(image_url, dict) and image_url.get("url"):
+                                                extracted_urls.append(image_url["url"])
+                                        if "url" in chunk and isinstance(chunk["url"], str):
+                                            extracted_urls.append(chunk["url"])
                                     except:
                                         pass
                             
@@ -508,13 +531,16 @@ class ApiManager:
                                 # 将其他提取到的数据并入
                                 if extracted_images:
                                     msg_obj["images"] = extracted_images
+                                if extracted_urls:
+                                    msg_obj["images"] = msg_obj.get("images", [])
+                                    msg_obj["images"].extend(extracted_urls)
                                 
                                 res_data = {"choices": [{"message": msg_obj, "finish_reason": "stop"}]}
                                 if extracted_data_arr:
                                     res_data["data"] = extracted_data_arr
                                 
                                 # 如果虽然是流式，但是既没有内容也没有工具调用也没有图片，且原始返回里有错误信息
-                                if not full_content and not tool_calls_buffer and not extracted_images and not extracted_data_arr:
+                                if not full_content and not tool_calls_buffer and not extracted_images and not extracted_data_arr and not extracted_urls:
                                     # 再次检查是不是把 error 藏在流里了
                                     for line in lines:
                                         if '"error"' in line:
@@ -562,6 +588,18 @@ class ApiManager:
                     if pure_b64_match:
                         logger.warning("在报错分支的终极fallback中找到了纯base64，已挽救")
                         img_url = f"data:image/png;base64,{pure_b64_match.group(1)}"
+
+                if not img_url:
+                    raw_resp_b64_match = re.search(r'(data:image\/[\w\-\+\.]+(?:;base64)?,[\w\-\+\/=\s]{100,})', resp_text)
+                    if raw_resp_b64_match:
+                        logger.warning("在原始流响应中找到了base64，已挽救")
+                        img_url = raw_resp_b64_match.group(1).replace("\\n", "").replace("\\r", "").replace(" ", "").replace("\\", "")
+
+                if not img_url:
+                    raw_resp_url_match = re.search(r'(https?://[^\s<>")\]]+)', resp_text)
+                    if raw_resp_url_match:
+                        logger.warning("在原始流响应中找到了图片URL，已挽救")
+                        img_url = raw_resp_url_match.group(1).rstrip(")>,'\".")
 
                 if not img_url:
                     # Gemini 特殊错误诊断 (原生 API)
@@ -614,7 +652,10 @@ class ApiManager:
                             if finish_reason == "content_filter":
                                 return "❌ 生成被拦截: 触发了安全过滤 (content_filter)。建议修改 Prompt 或重试。"
                             
-                            return f"API 返回内容为空字符串。finish_reason: {finish_reason}。"
+                            if "data:image/" in resp_text or '"images"' in resp_text or '"image_url"' in resp_text or '"url"' in resp_text:
+                                logger.warning("检测到空文本响应，但原始响应中仍包含疑似图片字段，已跳过空字符串误报")
+                            else:
+                                return f"API 返回内容为空字符串。finish_reason: {finish_reason}。"
                             
                         # 3. content 有文本内容
                         if isinstance(content, str) and content.strip():

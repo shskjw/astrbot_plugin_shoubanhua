@@ -42,9 +42,9 @@
         ]
     },
     "model_list": {
-        "description": "【核心】模型列表配置",
+        "description": "【核心】模型列表配置（仅用于展示/序号切换）",
         "type": "list",
-        "hint": "在此处配置所有可用的模型ID。系统将自动使用全局Key池进行调用。",
+        "hint": "这里只是给 #切换模型 命令和序号切换功能提供候选列表，可留空。它不会限制【通用】默认模型名称、【通用】文生图专用模型、【高级】强力模型 ID 的填写，这些字段都可以直接填写任意模型名称，即使不在本列表中也能正常使用。",
         "items": {
             "type": "string",
             "description": "模型名称 (如 nano-banana, gemini-1.5-pro)"
@@ -68,13 +68,13 @@
     "model": {
         "description": "【通用】默认模型名称",
         "type": "string",
-        "hint": "当前默认使用的模型ID。即使不在模型列表中也可直接填入。",
+        "hint": "当前默认使用的模型ID。这里可以直接填写任意模型名称，不需要出现在【核心】模型列表配置中。",
         "default": "nano-banana"
     },
     "text_to_image_model": {
         "description": "【通用】文生图专用模型",
         "type": "string",
-        "hint": "文生图功能使用的模型ID。即使不在模型列表中也可直接填入。留空则使用默认模型。",
+        "hint": "文生图功能使用的模型ID。这里也可以直接填写任意模型名称，不需要出现在【核心】模型列表配置中。留空则使用默认模型。",
         "default": ""
     },
     "image_resolution": {
@@ -103,7 +103,7 @@
     "power_model_id": {
         "description": "【高级】强力模型 ID",
         "type": "string",
-        "hint": "启用强力模式后实际调用的模型名称（必须填写）。",
+        "hint": "启用强力模式后实际调用的模型名称（必须填写）。这里同样可以直接填写任意模型名称，不需要出现在【核心】模型列表配置中。",
         "default": ""
     },
     "power_model_tip_enabled": {

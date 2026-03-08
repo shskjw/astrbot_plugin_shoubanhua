@@ -63,18 +63,16 @@ class ImageManager:
             logger.warning(f"Image conversion/resize failed: {e}")
             return raw
 
-    async def load_bytes(self, src: str) -> bytes | None:
-        """加载图片数据（本地/URL/Base64）- 纯异步封装"""
+    async def load_raw_bytes(self, src: str) -> bytes | None:
+        """加载原始字节（本地/URL/Base64），不做图片解析或格式转换"""
         raw = None
         loop = asyncio.get_running_loop()
 
         try:
-            # 过滤空字符串或纯空格
             src = str(src).strip()
             if not src:
                 return None
 
-            # 判断是否是本地文件路径（兼容Windows环境，但忽略超长字符串因为可能是base64）
             is_local_file = False
             if len(src) < 512 and not src.startswith("http") and not src.startswith("base64://"):
                 try:
@@ -84,20 +82,26 @@ class ImageManager:
                     pass
 
             if src.startswith("http"):
-                # 网络IO本身就是异步
                 raw = await self._download_image(src)
             elif src.startswith("base64://"):
-                # Base64解码放入线程池
                 raw = await loop.run_in_executor(None, base64.b64decode, src[9:])
             elif is_local_file:
-                # 文件IO放入线程池
                 raw = await loop.run_in_executor(None, Path(src).read_bytes)
             else:
-                # GSUID Core 可能会传进来纯文件名 (file_unique) 等情况
-                # 或者路径无效
-                logger.warning(f"无法识别的图片来源或本地文件不存在: {src[:50]}...")
+                logger.warning(f"无法识别的原始资源来源或本地文件不存在: {src[:50]}...")
                 return None
 
+            return raw
+        except Exception as e:
+            logger.error(f"Failed to load raw bytes from {src[:50]}...: {e}")
+            return None
+
+    async def load_bytes(self, src: str) -> bytes | None:
+        """加载图片数据（本地/URL/Base64）- 纯异步封装"""
+        loop = asyncio.get_running_loop()
+
+        try:
+            raw = await self.load_raw_bytes(src)
             if raw:
                 # 图片处理(PIL)放入线程池，防止阻塞
                 return await loop.run_in_executor(None, self._extract_first_frame_sync, raw)
@@ -176,9 +180,9 @@ class ImageManager:
                     
                 if is_pdf:
                     if url:
-                        tasks.append(self.load_bytes(url))
+                        tasks.append(self.load_raw_bytes(url))
                     elif file:
-                        tasks.append(self.load_bytes(file))
+                        tasks.append(self.load_raw_bytes(file))
                         
         if not tasks:
             return []
