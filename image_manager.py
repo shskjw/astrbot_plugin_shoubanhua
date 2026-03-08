@@ -4,6 +4,7 @@ import aiohttp
 import base64
 import ssl
 import re
+import inspect
 from typing import List, Tuple
 from pathlib import Path
 from PIL import Image as PILImage, ImageFont, ImageDraw
@@ -63,6 +64,95 @@ class ImageManager:
             logger.warning(f"Image conversion/resize failed: {e}")
             return raw
 
+    def _is_probably_valid_source(self, src: str) -> bool:
+        """判断一个图片来源字符串是否值得继续尝试加载"""
+        if src is None:
+            return False
+
+        try:
+            src = str(src).strip()
+        except Exception:
+            return False
+
+        if not src:
+            return False
+
+        if src.startswith("http://") or src.startswith("https://") or src.startswith("base64://"):
+            return True
+
+        if len(src) < 512:
+            try:
+                return Path(src).is_file()
+            except Exception:
+                return False
+
+        return False
+
+    async def _resolve_bot_for_context(self, context):
+        """兼容不同 AstrBot 版本的 Context/Bot 获取方式"""
+        if not context:
+            return None
+
+        candidate_attrs = [
+            "get_bot",
+            "get_robot",
+            "get_adapter",
+            "get_client",
+            "bot",
+            "robot",
+            "adapter",
+            "client",
+        ]
+
+        for attr_name in candidate_attrs:
+            if not hasattr(context, attr_name):
+                continue
+
+            try:
+                target = getattr(context, attr_name)
+                value = target() if callable(target) else target
+                if inspect.isawaitable(value):
+                    value = await value
+                if value:
+                    return value
+            except Exception:
+                continue
+
+        return None
+
+    async def _fetch_reply_components(self, context, reply_id) -> list:
+        """尝试从上下文/机器人中获取被回复消息的组件列表"""
+        if not context or not reply_id:
+            return []
+
+        bot = await self._resolve_bot_for_context(context)
+        if not bot:
+            return []
+
+        for method_name in ("get_message", "fetch_message", "get_msg", "get_reply_message"):
+            if not hasattr(bot, method_name):
+                continue
+
+            try:
+                method = getattr(bot, method_name)
+                result = method(reply_id)
+                if inspect.isawaitable(result):
+                    result = await result
+
+                if not result:
+                    continue
+
+                if hasattr(result, "message_obj") and hasattr(result.message_obj, "message"):
+                    return list(result.message_obj.message)
+                if hasattr(result, "message"):
+                    return list(result.message)
+                if isinstance(result, list):
+                    return result
+            except Exception:
+                continue
+
+        return []
+
     async def load_raw_bytes(self, src: str) -> bytes | None:
         """加载原始字节（本地/URL/Base64），不做图片解析或格式转换"""
         raw = None
@@ -88,7 +178,7 @@ class ImageManager:
             elif is_local_file:
                 raw = await loop.run_in_executor(None, Path(src).read_bytes)
             else:
-                logger.warning(f"无法识别的原始资源来源或本地文件不存在: {src[:50]}...")
+                logger.debug(f"跳过无效图片来源: {src[:80]}")
                 return None
 
             return raw
@@ -227,35 +317,22 @@ class ImageManager:
                 if not found_in_chain and context and hasattr(seg, "id") and seg.id:
                     try:
                         logger.debug(f"Reply chain empty/no-image, fetching message_id: {seg.id}")
-                        # 尝试获取原消息
-                        bot = context.get_bot()
-                        if bot:
-                            # 这是一个异步调用，获取历史消息
-                            target_msg = await bot.get_message(seg.id)
-                            if target_msg:
-                                # target_msg 可能是 AstrMessageEvent 或 组件列表
-                                components = []
-                                if hasattr(target_msg, "message_obj") and hasattr(target_msg.message_obj, "message"):
-                                    components = target_msg.message_obj.message
-                                elif isinstance(target_msg, list):
-                                    components = target_msg
-                                elif hasattr(target_msg, "message"):
-                                    components = target_msg.message
-                                
-                                for comp in components:
-                                    if isinstance(comp, Image):
-                                        if comp.url:
-                                            tasks.append(self.load_bytes(comp.url))
-                                        elif comp.file:
-                                            tasks.append(self.load_bytes(comp.file))
+                        components = await self._fetch_reply_components(context, seg.id)
+
+                        for comp in components:
+                            if isinstance(comp, Image):
+                                if self._is_probably_valid_source(getattr(comp, "url", None)):
+                                    tasks.append(self.load_bytes(comp.url))
+                                elif self._is_probably_valid_source(getattr(comp, "file", None)):
+                                    tasks.append(self.load_bytes(comp.file))
                     except Exception as e:
                         logger.warning(f"Failed to fetch reply message {seg.id}: {e}")
 
             # 当前消息图片
             elif isinstance(seg, Image):
-                if seg.url:
+                if self._is_probably_valid_source(getattr(seg, "url", None)):
                     tasks.append(self.load_bytes(seg.url))
-                elif seg.file:
+                elif self._is_probably_valid_source(getattr(seg, "file", None)):
                     tasks.append(self.load_bytes(seg.file))
             # @用户
             elif isinstance(seg, At):

@@ -1790,10 +1790,15 @@ class FigurineProPlugin(Star):
         for seg in event.message_obj.message:
             if isinstance(seg, Image):
                 has_image = True
-                if seg.url:
-                    image_urls.append(seg.url)
-                elif seg.file:
-                    image_urls.append(seg.file)
+
+                seg_url = getattr(seg, "url", None)
+                seg_file = getattr(seg, "file", None)
+
+                if self.img_mgr._is_probably_valid_source(seg_url):
+                    image_urls.append(seg_url)
+                elif self.img_mgr._is_probably_valid_source(seg_file):
+                    image_urls.append(seg_file)
+
                 content_parts.append("[图片]")
             elif isinstance(seg, Plain) and seg.text:
                 content_parts.append(seg.text)
@@ -1803,8 +1808,13 @@ class FigurineProPlugin(Star):
                     for s_chain in seg.chain:
                         if isinstance(s_chain, Image):
                             has_image = True
-                            if s_chain.url:
-                                image_urls.append(s_chain.url)
+                            chain_url = getattr(s_chain, "url", None)
+                            chain_file = getattr(s_chain, "file", None)
+
+                            if self.img_mgr._is_probably_valid_source(chain_url):
+                                image_urls.append(chain_url)
+                            elif self.img_mgr._is_probably_valid_source(chain_file):
+                                image_urls.append(chain_file)
 
         return {
             "content": "".join(content_parts) or event.message_str,
@@ -2276,7 +2286,9 @@ class FigurineProPlugin(Star):
 
             for _, urls in reversed(image_sources):
                 for url in urls:
-                    if url and url not in seen_urls:
+                    if not self.img_mgr._is_probably_valid_source(url):
+                        continue
+                    if url not in seen_urls:
                         all_urls.append(url)
                         seen_urls.add(url)
 
