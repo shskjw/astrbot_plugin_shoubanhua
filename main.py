@@ -710,7 +710,11 @@ class FigurineProPlugin(Star):
                 await event.send(chain)
             else:
                 # 失败反馈
-                await event.send(event.chain_result([Plain(f"❌ 生成失败: {res}")]))
+                # 兼容纯文本错误信息，如果已经是提示语则不重复加前缀
+                error_msg = str(res)
+                if not error_msg.startswith("❌"):
+                    error_msg = f"❌ 生成失败: {error_msg}"
+                await event.send(event.chain_result([Plain(error_msg)]))
 
         except Exception as e:
             logger.error(f"Background task error: {e}")

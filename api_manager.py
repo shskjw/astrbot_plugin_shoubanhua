@@ -574,13 +574,20 @@ class ApiManager:
                             return f"生成被终止，原因: {finish_reason} (通常是安全过滤导致)"
                         
                         # 2. 正常结束但无内容
-                        content = cand.get("content") or {}
-                        parts = content.get("parts")
+                        content_obj = cand.get("content") or {}
+                        parts = content_obj.get("parts")
                         if not parts:
                             # 尝试打印整个 candidate 以便排查
                             cand_str = json.dumps(cand, ensure_ascii=False)
                             logger.warning(f"Gemini API returned empty parts: {cand_str}")
                             return f"模型响应为空 (finishReason={finish_reason})。请确认使用的模型 ({model}) 是否支持生图，或者 Prompt 是否触发了隐性过滤。\nRaw: {cand_str[:100]}..."
+                        else:
+                            # 尝试提取文本内容作为错误信息提示
+                            texts = [p.get("text", "") for p in parts if "text" in p]
+                            if texts:
+                                text_msg = "\n".join(texts).strip()
+                                if text_msg:
+                                    return text_msg
                     
                     # OpenAI 格式错误诊断 (兼容 API)
                     if "choices" in res_data and isinstance(res_data["choices"], list) and len(res_data["choices"]) > 0:
@@ -607,20 +614,17 @@ class ApiManager:
                             if finish_reason == "content_filter":
                                 return "❌ 生成被拦截: 触发了安全过滤 (content_filter)。建议修改 Prompt 或重试。"
                             
-                            # 特殊判断：如果已经是 tool_calls 返回并且提取失败了才报空，如果有 b64_json 也算成功
                             return f"API 返回内容为空字符串。finish_reason: {finish_reason}。"
+                            
+                        # 3. content 有文本内容
+                        if isinstance(content, str) and content.strip():
+                            return content.strip()
+                            
+                        # 4. tool_calls
+                        if has_tools:
+                            return "API返回了工具调用但无法解析出图片。请重试或检查接口。"
 
-                    # 尝试提取文本内容作为错误信息提示
-                    diag_msg = "未找到图片数据"
-                    if "choices" in res_data and res_data["choices"]:
-                            c0 = res_data["choices"][0]
-                            msg = c0.get("message", {})
-                            if msg.get("content"):
-                                diag_msg = f"API返回了文本而非图片: {msg['content'][:200]}"
-                            elif "tool_calls" in msg:
-                                diag_msg = f"API返回了工具调用但无法解析出图片。请重试或检查接口。"
-
-                    return f"API请求成功但{diag_msg}。Raw: {str(res_data)[:300]}..."
+                    return f"API请求成功但未找到图片数据。Raw: {str(res_data)[:300]}..."
 
                 # 如果是 Base64 直接返回 Bytes
                 if img_url.startswith("data:"):
