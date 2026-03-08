@@ -2814,9 +2814,11 @@ class FigurineProPlugin(Star):
         if not image_sources and not current_urls and not pdf_extracted_urls:
             return "❌ 未在上下文中找到图片或PDF。请先发送图片/PDF，然后再使用批量处理功能。"
 
-        # 3. 收集所有图片URL（去重，优先获取最新图片）
+        # 3. 收集所有图片URL（去重，优先当前消息；当前消息有图时，不再混入历史上下文图片）
         all_image_urls = []
         seen_urls = set()
+
+        has_current_inputs = bool(current_urls or pdf_extracted_urls)
 
         # 先添加当前消息中从 PDF 提取的图片
         for url in pdf_extracted_urls:
@@ -2830,13 +2832,15 @@ class FigurineProPlugin(Star):
                 all_image_urls.append(url)
                 seen_urls.add(url)
 
-        # 倒序遍历上下文（从最新消息开始）
-        for msg_id, urls in reversed(image_sources):
-            # 一条消息内的图片按正常顺序遍历
-            for url in urls:
-                if url not in seen_urls:
-                    all_image_urls.append(url)
-                    seen_urls.add(url)
+        # 只有当前消息没有提供图片/PDF时，才回退到上下文中找历史图片
+        if not has_current_inputs:
+            # 倒序遍历上下文（从最新消息开始）
+            for msg_id, urls in reversed(image_sources):
+                # 一条消息内的图片按正常顺序遍历
+                for url in urls:
+                    if url not in seen_urls:
+                        all_image_urls.append(url)
+                        seen_urls.add(url)
 
         # 限制数量（保留最新的 max_images 张）
         if max_images > 0:
@@ -3102,9 +3106,11 @@ class FigurineProPlugin(Star):
         if not image_sources and not current_urls and not pdf_extracted_urls:
             return "❌ 未在上下文中找到图片或PDF。请先发送图片/PDF，然后再使用批量处理功能。"
 
-        # 3. 收集所有图片URL（去重，优先获取最新图片）
+        # 3. 收集所有图片URL（去重，优先当前消息；当前消息有图时，不再混入历史上下文图片）
         all_image_urls = []
         seen_urls = set()
+
+        has_current_inputs = bool(current_urls or pdf_extracted_urls)
 
         # 先添加当前消息中从 PDF 提取的图片
         for url in pdf_extracted_urls:
@@ -3118,12 +3124,14 @@ class FigurineProPlugin(Star):
                 all_image_urls.append(url)
                 seen_urls.add(url)
 
-        # 倒序遍历上下文（从最新消息开始）
-        for msg_id, urls in reversed(image_sources):
-            for url in urls:
-                if url not in seen_urls:
-                    all_image_urls.append(url)
-                    seen_urls.add(url)
+        # 只有当前消息没有提供图片/PDF时，才回退到上下文中找历史图片
+        if not has_current_inputs:
+            # 倒序遍历上下文（从最新消息开始）
+            for msg_id, urls in reversed(image_sources):
+                for url in urls:
+                    if url not in seen_urls:
+                        all_image_urls.append(url)
+                        seen_urls.add(url)
 
         # 限制数量（保留最新的 max_images 张）
         if max_images > 0:
@@ -3716,9 +3724,11 @@ class FigurineProPlugin(Star):
             yield event.chain_result([Plain("❌ 未在上下文中找到图片。请先发送图片，然后再使用批量处理功能。")])
             return
 
-        # 3. 收集所有图片URL（去重，优先获取最新图片）
+        # 3. 收集所有图片URL（优先当前消息；当前消息有图时，不再混入历史上下文图片）
         all_image_urls = []
         seen_urls = set()
+
+        has_current_inputs = bool(current_urls)
 
         # 先添加当前消息的图片
         for url in current_urls:
@@ -3726,12 +3736,14 @@ class FigurineProPlugin(Star):
                 all_image_urls.append(url)
                 seen_urls.add(url)
 
-        # 倒序遍历上下文
-        for msg_id, urls in reversed(image_sources):
-            for url in urls:
-                if url not in seen_urls:
-                    all_image_urls.append(url)
-                    seen_urls.add(url)
+        # 只有当前消息没有提供图片时，才回退到上下文中找历史图片
+        if not has_current_inputs:
+            # 倒序遍历上下文
+            for msg_id, urls in reversed(image_sources):
+                for url in urls:
+                    if url not in seen_urls:
+                        all_image_urls.append(url)
+                        seen_urls.add(url)
 
         # 限制数量
         max_images = self.conf.get("batch_max_images", 10)

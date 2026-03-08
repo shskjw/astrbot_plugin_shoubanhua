@@ -301,6 +301,45 @@ class ApiManager:
             "image generation model"
         ])
 
+    async def _download_result_image(self, img_url: str, proxy: str = None) -> bytes | str:
+        """下载模型返回的结果图片，增加重试与容错，避免外链偶发重置导致整次任务失败"""
+        if not img_url:
+            return "结果图片地址为空"
+
+        session = await self._get_session()
+        retries = max(1, int(self.config.get("result_image_download_retries", 3)))
+        timeout_val = max(10, int(self.config.get("result_image_download_timeout", 60)))
+        timeout = aiohttp.ClientTimeout(total=timeout_val)
+
+        headers = {
+            "User-Agent": self.config.get(
+                "result_image_user_agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
+            )
+        }
+
+        last_error = ""
+        for attempt in range(1, retries + 1):
+            try:
+                async with session.get(img_url, proxy=proxy, timeout=timeout, headers=headers) as img_resp:
+                    if img_resp.status != 200:
+                        last_error = f"下载结果图失败，HTTP {img_resp.status}"
+                    else:
+                        data = await img_resp.read()
+                        if data:
+                            return data
+                        last_error = "下载结果图失败，返回内容为空"
+            except asyncio.TimeoutError:
+                last_error = f"下载结果图超时 ({timeout_val}s)"
+            except Exception as e:
+                last_error = str(e) or type(e).__name__
+
+            if attempt < retries:
+                await asyncio.sleep(min(2 * attempt, 5))
+
+        logger.error(f"结果图下载失败: {img_url[:120]} | {last_error}")
+        return f"结果图片下载失败: {last_error}"
+
     async def call_api(self, images: List[bytes], prompt: str,
                        model: str, use_power: bool, proxy: str = None) -> bytes | str:
         """核心生成逻辑"""
@@ -671,9 +710,8 @@ class ApiManager:
                 if img_url.startswith("data:"):
                     return base64.b64decode(img_url.split(",")[-1])
 
-                # 如果是 URL，需要再次下载
-                async with session.get(img_url, proxy=proxy) as img_resp:
-                    return await img_resp.read()
+                # 如果是 URL，需要再次下载（增加重试与容错，避免外链偶发失败）
+                return await self._download_result_image(img_url, proxy)
 
         except asyncio.TimeoutError:
             logger.error(f"API Call Timeout after {timeout_val}s")
