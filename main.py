@@ -141,6 +141,11 @@ class FigurineProPlugin(Star):
         self._session_generated_success: Dict[str, int] = {}  # session_id -> success count
         self._session_generated_success_lock = asyncio.Lock()
 
+        # 会话级最近成功生成图片缓存（用于 PDF 打包时直接拿到刚生成完成的图片）
+        self._session_generated_images: Dict[str, List[bytes]] = {}  # session_id -> recent image bytes
+        self._session_generated_images_lock = asyncio.Lock()
+        self._session_generated_images_max = max(1, int(config.get("pdf_session_image_cache", 20)))
+
     def _is_message_processed(self, msg_id: str) -> bool:
         """
         检查消息是否已被处理过（用于去重）
@@ -656,6 +661,36 @@ class FigurineProPlugin(Star):
         async with self._session_generated_success_lock:
             return max(0, self._session_generated_success.get(session_id, 0))
 
+    async def _register_generated_image(self, session_id: str, image_bytes: Optional[bytes]):
+        """缓存会话中最近成功生成的图片字节，供 PDF 打包直接使用"""
+        if not session_id or not isinstance(image_bytes, bytes) or len(image_bytes) == 0:
+            return
+
+        async with self._session_generated_images_lock:
+            current = self._session_generated_images.get(session_id, [])
+
+            # 按内容去重，避免重复缓存同一张图
+            exists = any(img == image_bytes for img in current)
+            if not exists:
+                current.append(image_bytes)
+
+            if len(current) > self._session_generated_images_max:
+                current = current[-self._session_generated_images_max:]
+
+            self._session_generated_images[session_id] = current
+
+    async def _get_recent_generated_images(self, session_id: str, max_images: int = 0) -> List[bytes]:
+        """获取会话中最近成功生成的图片缓存"""
+        if not session_id:
+            return []
+
+        async with self._session_generated_images_lock:
+            cached = list(self._session_generated_images.get(session_id, []))
+
+        if max_images and max_images > 0:
+            return cached[-max_images:]
+        return cached
+
     async def _can_pack_pdf_now(self, event: AstrMessageEvent, gathered_images: Optional[List[bytes]] = None) -> Tuple[bool, str]:
         """校验当前是否满足打包 PDF 的前置条件：必须有成功生成结果或当前上下文存在明确有效图片"""
         session_id = event.unified_msg_origin
@@ -665,6 +700,10 @@ class FigurineProPlugin(Star):
             return True, ""
 
         if success_count > 0:
+            return True, ""
+
+        cached_images = await self._get_recent_generated_images(session_id)
+        if cached_images:
             return True, ""
 
         msg_info = self._extract_message_info(event)
@@ -791,6 +830,7 @@ class FigurineProPlugin(Star):
                 elapsed = (datetime.now() - start_time).total_seconds()
                 await self.data_mgr.record_usage(uid, gid)
                 await self._register_generation_success(event.unified_msg_origin, 1)
+                await self._register_generated_image(event.unified_msg_origin, res)
 
                 # 5. 主动发送结果
                 chain_nodes = [Image.fromBytes(res)]
@@ -2384,13 +2424,17 @@ class FigurineProPlugin(Star):
         async def collect_once() -> List[bytes]:
             images_bytes = []
 
-            # 1. 优先提取当前消息中的图片（包括引用）
+            # 0. 优先使用当前会话中最近成功生成的图片缓存
+            session_id = event.unified_msg_origin
+            cached_images = await self._get_recent_generated_images(session_id, max_images=max_images)
+            images_bytes.extend([b for b in cached_images if isinstance(b, bytes) and len(b) > 0])
+
+            # 1. 再提取当前消息中的图片（包括引用）
             bot_id = self._get_bot_id(event)
             current_images = await self.img_mgr.extract_images_from_event(event, ignore_id=bot_id, context=self.context)
             images_bytes.extend([b for b in current_images if b and len(b) > 0])
 
             # 2. 再从上下文获取（包含 Bot 发出的图片）
-            session_id = event.unified_msg_origin
             image_sources = await self._collect_images_from_context(session_id, count=30, include_bot=True)
 
             all_urls = []
