@@ -2559,7 +2559,7 @@ class FigurineProPlugin(Star):
             with open(tmp_path, "wb") as f:
                 f.write(pdf_bytes)
 
-            await event.send(event.chain_result([File(tmp_path), Plain(f"\n{success_prefix}（共 {len(valid_images)} 张）")]))
+            await event.send(event.chain_result([File(file=tmp_path), Plain(f"\n{success_prefix}（共 {len(valid_images)} 张）")]))
             return True, f"成功将 {len(valid_images)} 张图片打包为 PDF"
         except Exception as e:
             logger.error(f"独立打包 PDF 异常: {e}", exc_info=True)
@@ -3008,7 +3008,7 @@ class FigurineProPlugin(Star):
                             tmp_path = os.path.join(self.data_mgr.data_dir, filename)
                             with open(tmp_path, "wb") as f:
                                 f.write(pdf_bytes_result)
-                            await event.send(event.chain_result([File(tmp_path)]))
+                            await event.send(event.chain_result([File(file=tmp_path)]))
                             
                             summary = f"\n📊 批量处理完成，已打包为 PDF\n"
                             summary += f"✅ 成功: {success_count} 张\n"
@@ -3301,7 +3301,7 @@ class FigurineProPlugin(Star):
                             tmp_path = os.path.join(self.data_mgr.data_dir, filename)
                             with open(tmp_path, "wb") as f:
                                 f.write(pdf_bytes_result)
-                            await event.send(event.chain_result([File(tmp_path)]))
+                            await event.send(event.chain_result([File(file=tmp_path)]))
                             
                             summary = f"\n📊 并发批量处理完成，已打包为 PDF\n"
                             summary += f"✅ 成功: {results['success']} 张\n"
