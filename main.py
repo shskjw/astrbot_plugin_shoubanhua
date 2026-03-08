@@ -91,7 +91,7 @@ REBELLIOUS_TRIGGERS = [
     "astrbot_plugin_shoubanhua",
     "shskjw",
     "支持第三方所有OpenAI绘图格式和原生Google Gemini 终极缝合怪，文生图/图生图插件，支持LLM智能判断",
-    "2.4.5",
+    "2.4.9",
     "https://github.com/shkjw/astrbot_plugin_shoubanhua",
 )
 class FigurineProPlugin(Star):
@@ -145,6 +145,10 @@ class FigurineProPlugin(Star):
         self._session_generated_images: Dict[str, List[bytes]] = {}  # session_id -> recent image bytes
         self._session_generated_images_lock = asyncio.Lock()
         self._session_generated_images_max = max(1, int(config.get("pdf_session_image_cache", 20)))
+
+        # 会话级任务进度表（用于催促时优先返回当前任务状态，避免重复开新任务）
+        self._session_task_status: Dict[str, Dict[str, Any]] = {}
+        self._session_task_status_lock = asyncio.Lock()
 
     def _is_message_processed(self, msg_id: str) -> bool:
         """
@@ -690,6 +694,61 @@ class FigurineProPlugin(Star):
         if max_images and max_images > 0:
             return cached[-max_images:]
         return cached
+
+    def _should_show_debug_errors(self) -> bool:
+        """是否向用户显示中途调试错误信息"""
+        return bool(self.conf.get("debug_mode", False))
+
+    async def _get_active_session_task(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """获取当前会话中的进行中任务"""
+        if not session_id:
+            return None
+        async with self._session_task_status_lock:
+            task = self._session_task_status.get(session_id)
+            if task and task.get("running"):
+                return dict(task)
+            return None
+
+    async def _begin_session_task(self, session_id: str, task_type: str, total: int):
+        """登记会话任务开始"""
+        if not session_id:
+            return
+        async with self._session_task_status_lock:
+            self._session_task_status[session_id] = {
+                "running": True,
+                "task_type": task_type,
+                "total": max(0, int(total or 0)),
+                "current": 0,
+                "success": 0,
+                "fail": 0,
+                "started_at": datetime.now().isoformat(timespec="seconds"),
+            }
+
+    async def _update_session_task_progress(self, session_id: str, current: Optional[int] = None,
+                                            success: Optional[int] = None, fail: Optional[int] = None):
+        """更新会话任务进度"""
+        if not session_id:
+            return
+        async with self._session_task_status_lock:
+            task = self._session_task_status.get(session_id)
+            if not task:
+                return
+            if current is not None:
+                task["current"] = max(0, int(current))
+            if success is not None:
+                task["success"] = max(0, int(success))
+            if fail is not None:
+                task["fail"] = max(0, int(fail))
+
+    async def _finish_session_task(self, session_id: str):
+        """标记会话任务完成"""
+        if not session_id:
+            return
+        async with self._session_task_status_lock:
+            task = self._session_task_status.get(session_id)
+            if task:
+                task["running"] = False
+                task["finished_at"] = datetime.now().isoformat(timespec="seconds")
 
     async def _can_pack_pdf_now(self, event: AstrMessageEvent, gathered_images: Optional[List[bytes]] = None) -> Tuple[bool, str]:
         """校验当前是否满足打包 PDF 的前置条件：必须有成功生成结果或当前上下文存在明确有效图片"""
@@ -2781,6 +2840,15 @@ class FigurineProPlugin(Star):
         if not self.conf.get("enable_llm_tool", True):
             return "❌ LLM 工具已禁用，请使用指令模式调用此功能。"
 
+        active_task = await self._get_active_session_task(event.unified_msg_origin)
+        if active_task:
+            return (
+                f"[TOOL_SUCCESS] 当前已有进行中的{active_task.get('task_type', '批量任务')}，"
+                f"进度 {active_task.get('current', 0)}/{active_task.get('total', 0)}，"
+                f"成功 {active_task.get('success', 0)} 张，失败 {active_task.get('fail', 0)} 张。"
+                f"请不要重复创建任务，继续等待即可。"
+            )
+
         # 0.1 检查图片生成冷却时间
         uid = norm_id(event.get_sender_id())
         in_cooldown, remaining = self._check_image_cooldown(uid)
@@ -2846,8 +2914,10 @@ class FigurineProPlugin(Star):
         if max_images > 0:
             all_image_urls = all_image_urls[:max_images]
 
-        # 提取完毕后将列表反转，以符合用户的正常阅读和发送顺序（从旧到新处理）
-        all_image_urls.reverse()
+        # 仅在回退使用历史上下文图片时才反转顺序；
+        # 当前消息自带图片时，保持用户原始上传顺序不变
+        if not has_current_inputs:
+            all_image_urls.reverse()
 
         total_images = len(all_image_urls)
         if total_images == 0:
@@ -2885,6 +2955,8 @@ class FigurineProPlugin(Star):
         elif deduction["source"] == "group":
             await self.data_mgr.decrease_group_count(gid, total_cost)
 
+        await self._begin_session_task(event.unified_msg_origin, "批量处理任务", total_images)
+
         # 7. 启动批量处理任务
         async def process_all():
             success_count = 0
@@ -2906,10 +2978,14 @@ class FigurineProPlugin(Star):
                             "url_preview": url[:50] + "..." if len(url) > 50 else url
                         })
                         fail_count += 1
-                        # 发送单条失败提示
-                        await event.send(event.chain_result([
-                            Plain(f"❌ 第 {i}/{total_images} 张图片处理失败\n📍 原因: {error_msg}")
-                        ]))
+                        await self._update_session_task_progress(
+                            event.unified_msg_origin, current=i, success=success_count, fail=fail_count
+                        )
+                        # 发送单条失败提示（仅调试模式显示）
+                        if self._should_show_debug_errors():
+                            await event.send(event.chain_result([
+                                Plain(f"❌ 第 {i}/{total_images} 张图片处理失败\n📍 原因: {error_msg}")
+                            ]))
                         continue
 
                     # 处理单张图片（带重试机制）
@@ -2961,10 +3037,11 @@ class FigurineProPlugin(Star):
 
                         retry_count += 1
                         if retry_count <= max_retries:
-                            await event.send(event.chain_result([
-                                Plain(
-                                    f"⚠️ 第 {i}/{total_images} 张图片生成失败 ({error_msg})\n⏳ 正在进行第 {retry_count} 次重试...")
-                            ]))
+                            if self._should_show_debug_errors():
+                                await event.send(event.chain_result([
+                                    Plain(
+                                        f"⚠️ 第 {i}/{total_images} 张图片生成失败 ({error_msg})\n⏳ 正在进行第 {retry_count} 次重试...")
+                                ]))
                             await asyncio.sleep(1.5)
 
                     if success:
@@ -2976,10 +3053,15 @@ class FigurineProPlugin(Star):
                             "reason": error_msg,
                             "url_preview": url[:50] + "..." if len(url) > 50 else url
                         })
-                        # 发送单条失败提示
-                        await event.send(event.chain_result([
-                            Plain(f"❌ 第 {i}/{total_images} 张图片最终处理失败\n📍 原因: {error_msg}")
-                        ]))
+                        # 发送单条失败提示（仅调试模式显示）
+                        if self._should_show_debug_errors():
+                            await event.send(event.chain_result([
+                                Plain(f"❌ 第 {i}/{total_images} 张图片最终处理失败\n📍 原因: {error_msg}")
+                            ]))
+
+                    await self._update_session_task_progress(
+                        event.unified_msg_origin, current=i, success=success_count, fail=fail_count
+                    )
 
                     # 添加短暂延迟，避免API限流
                     if i < total_images:
@@ -2994,9 +3076,13 @@ class FigurineProPlugin(Star):
                         "url_preview": url[:50] + "..." if len(url) > 50 else url
                     })
                     fail_count += 1
-                    await event.send(event.chain_result([
-                        Plain(f"❌ 第 {i}/{total_images} 张图片处理异常\n📍 原因: {error_msg}")
-                    ]))
+                    await self._update_session_task_progress(
+                        event.unified_msg_origin, current=i, success=success_count, fail=fail_count
+                    )
+                    if self._should_show_debug_errors():
+                        await event.send(event.chain_result([
+                            Plain(f"❌ 第 {i}/{total_images} 张图片处理异常\n📍 原因: {error_msg}")
+                        ]))
 
             if output_as_pdf:
                 if pdf_result_images:
@@ -3042,7 +3128,13 @@ class FigurineProPlugin(Star):
                 await event.send(event.chain_result([Plain(summary)]))
 
         # 启动异步任务
-        asyncio.create_task(process_all())
+        async def wrapped_process_all():
+            try:
+                await process_all()
+            finally:
+                await self._finish_session_task(event.unified_msg_origin)
+
+        asyncio.create_task(wrapped_process_all())
 
         return f"批量处理任务已启动，共 {total_images} 张图片，预设：{preset_name}。每张图片将独立处理并发送结果。"
 
@@ -3073,6 +3165,15 @@ class FigurineProPlugin(Star):
         # 0. 检查 LLM 工具开关
         if not self.conf.get("enable_llm_tool", True):
             return "❌ LLM 工具已禁用，请使用指令模式调用此功能。"
+
+        active_task = await self._get_active_session_task(event.unified_msg_origin)
+        if active_task:
+            return (
+                f"[TOOL_SUCCESS] 当前已有进行中的{active_task.get('task_type', '批量任务')}，"
+                f"进度 {active_task.get('current', 0)}/{active_task.get('total', 0)}，"
+                f"成功 {active_task.get('success', 0)} 张，失败 {active_task.get('fail', 0)} 张。"
+                f"请不要重复创建任务，继续等待即可。"
+            )
 
         # 0.1 检查图片生成冷却时间
         uid = norm_id(event.get_sender_id())
@@ -3137,8 +3238,10 @@ class FigurineProPlugin(Star):
         if max_images > 0:
             all_image_urls = all_image_urls[:max_images]
 
-        # 反转列表以正常顺序处理
-        all_image_urls.reverse()
+        # 仅在回退使用历史上下文图片时才反转顺序；
+        # 当前消息自带图片时，保持用户原始上传顺序不变
+        if not has_current_inputs:
+            all_image_urls.reverse()
 
         total_images = len(all_image_urls)
         if total_images == 0:
@@ -3176,6 +3279,8 @@ class FigurineProPlugin(Star):
         elif deduction["source"] == "group":
             await self.data_mgr.decrease_group_count(gid, total_cost)
 
+        await self._begin_session_task(event.unified_msg_origin, "并发批量处理任务", total_images)
+
         # 7. 使用信号量控制并发
         semaphore = asyncio.Semaphore(concurrency)
         results = {"success": 0, "fail": 0}
@@ -3199,9 +3304,13 @@ class FigurineProPlugin(Star):
                                 "reason": error_msg,
                                 "url_preview": url[:50] + "..." if len(url) > 50 else url
                             })
-                        await event.send(event.chain_result([
-                            Plain(f"❌ 第 {index}/{total_images} 张图片处理失败\n📍 原因: {error_msg}")
-                        ]))
+                        await self._update_session_task_progress(
+                            event.unified_msg_origin, current=index, success=results["success"], fail=results["fail"]
+                        )
+                        if self._should_show_debug_errors():
+                            await event.send(event.chain_result([
+                                Plain(f"❌ 第 {index}/{total_images} 张图片处理失败\n📍 原因: {error_msg}")
+                            ]))
                         return
 
                     # 处理单张图片（带重试机制）
@@ -3251,10 +3360,11 @@ class FigurineProPlugin(Star):
 
                         retry_count += 1
                         if retry_count <= max_retries:
-                            await event.send(event.chain_result([
-                                Plain(
-                                    f"⚠️ 第 {index}/{total_images} 张图片生成失败 ({error_msg})\n⏳ 正在进行第 {retry_count} 次重试...")
-                            ]))
+                            if self._should_show_debug_errors():
+                                await event.send(event.chain_result([
+                                    Plain(
+                                        f"⚠️ 第 {index}/{total_images} 张图片生成失败 ({error_msg})\n⏳ 正在进行第 {retry_count} 次重试...")
+                                ]))
                             await asyncio.sleep(1.5)
 
                     async with results_lock:
@@ -3267,9 +3377,13 @@ class FigurineProPlugin(Star):
                                 "reason": error_msg,
                                 "url_preview": url[:50] + "..." if len(url) > 50 else url
                             })
-                            await event.send(event.chain_result([
-                                Plain(f"❌ 第 {index}/{total_images} 张图片最终处理失败\n📍 原因: {error_msg}")
-                            ]))
+                            if self._should_show_debug_errors():
+                                await event.send(event.chain_result([
+                                    Plain(f"❌ 第 {index}/{total_images} 张图片最终处理失败\n📍 原因: {error_msg}")
+                                ]))
+                        await self._update_session_task_progress(
+                            event.unified_msg_origin, current=index, success=results["success"], fail=results["fail"]
+                        )
 
                 except Exception as e:
                     error_msg = self._translate_error_to_chinese(str(e))
@@ -3281,9 +3395,13 @@ class FigurineProPlugin(Star):
                             "reason": error_msg,
                             "url_preview": url[:50] + "..." if len(url) > 50 else url
                         })
-                    await event.send(event.chain_result([
-                        Plain(f"❌ 第 {index}/{total_images} 张图片处理异常\n📍 原因: {error_msg}")
-                    ]))
+                    await self._update_session_task_progress(
+                        event.unified_msg_origin, current=index, success=results["success"], fail=results["fail"]
+                    )
+                    if self._should_show_debug_errors():
+                        await event.send(event.chain_result([
+                            Plain(f"❌ 第 {index}/{total_images} 张图片处理异常\n📍 原因: {error_msg}")
+                        ]))
 
         async def process_all():
             # 创建所有任务
@@ -3339,7 +3457,13 @@ class FigurineProPlugin(Star):
                 await event.send(event.chain_result([Plain(summary)]))
 
         # 启动异步任务
-        asyncio.create_task(process_all())
+        async def wrapped_process_all():
+            try:
+                await process_all()
+            finally:
+                await self._finish_session_task(event.unified_msg_origin)
+
+        asyncio.create_task(wrapped_process_all())
 
         return f"并发批量处理任务已启动，共 {total_images} 张图片，并发数 {concurrency}，预设：{preset_name}。"
 
@@ -3750,8 +3874,10 @@ class FigurineProPlugin(Star):
         if max_images > 0:
             all_image_urls = all_image_urls[:max_images]
 
-        # 反转列表以正常顺序处理
-        all_image_urls.reverse()
+        # 仅在回退使用历史上下文图片时才反转顺序；
+        # 当前消息自带图片时，保持用户原始上传顺序不变
+        if not has_current_inputs:
+            all_image_urls.reverse()
 
         total_images = len(all_image_urls)
         if total_images == 0:
