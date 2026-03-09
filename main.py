@@ -439,7 +439,9 @@ class FigurineProPlugin(Star):
             f"Character description: {persona_desc}",
             f"Scene: {scene_prompt}",
             f"Style: {photo_style}",
-            "The character must maintain consistent appearance with the reference image.",
+            "The character identity must strictly remain the same as the persona reference image.",
+            "Preserve the original face, hairstyle, hair color, body shape, age appearance, and core character features from the persona reference.",
+            "The output must still clearly be the same character from the persona reference, not a different girl with similar clothes.",
             "Natural pose and expression, candid moment, high quality, detailed.",
             "Do NOT include any phones, cameras, or selfie elements in the image."
         ]
@@ -3544,7 +3546,13 @@ class FigurineProPlugin(Star):
         # 4. 构建完整提示词
         full_prompt = self._build_persona_prompt(scene_prompt, extra_request)
         if user_images:
-            full_prompt += " Please accurately refer to the clothing, pose or style provided in the additional reference image."
+            full_prompt += (
+                " Use the additional user reference image only for outfit, accessories, pose, composition, or atmosphere reference."
+                " If the user asks for same outfit, reproduce the same clothing design and matching style as closely as possible."
+                " The persona reference has absolute priority for identity consistency."
+                " Do NOT replace the character's face, hairstyle, body identity, or overall persona with the user reference image."
+                " In short: keep the persona character unchanged, only borrow the requested clothing or styling details from the user reference."
+            )
 
         # 5. 根据配置决定是否发送进度提示
         if self.conf.get("llm_show_progress", True):
