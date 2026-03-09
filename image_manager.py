@@ -249,42 +249,92 @@ class ImageManager:
             
         return images
 
-    async def extract_pdfs_from_event(self, event: AstrMessageEvent) -> List[bytes]:
-        """从消息中提取 PDF 文件"""
-        tasks = []
-        for seg in event.message_obj.message:
+    def _collect_pdf_sources_from_components(self, components: list) -> List[str]:
+        """从组件列表中提取 PDF 来源（url/file），保持顺序并去重"""
+        if not components:
+            return []
+
+        sources = []
+        seen = set()
+
+        for seg in components:
             seg_class = type(seg).__name__
             # 兼容 AstrBot 的 File/Document 等文件组件
-            if seg_class in ['File', 'Document', 'Record']:
-                url = getattr(seg, 'url', None)
-                file = getattr(seg, 'file', None)
-                name = getattr(seg, 'name', '').lower()
-                
+            if seg_class in ["File", "Document", "Record"]:
+                url = getattr(seg, "url", None)
+                file = getattr(seg, "file", None)
+                name = str(getattr(seg, "name", "") or "").lower()
+
                 is_pdf = False
-                if name.endswith('.pdf'):
+                if name.endswith(".pdf"):
                     is_pdf = True
-                elif url and '.pdf' in url.lower():
+                elif isinstance(url, str) and ".pdf" in url.lower():
                     is_pdf = True
-                elif file and '.pdf' in str(file).lower():
+                elif isinstance(file, str) and ".pdf" in file.lower():
                     is_pdf = True
-                    
-                if is_pdf:
-                    if url:
-                        tasks.append(self.load_raw_bytes(url))
-                    elif file:
-                        tasks.append(self.load_raw_bytes(file))
-                        
-        if not tasks:
+
+                if not is_pdf:
+                    continue
+
+                source = None
+                if url:
+                    source = str(url).strip()
+                elif file:
+                    source = str(file).strip()
+
+                if source and source not in seen:
+                    seen.add(source)
+                    sources.append(source)
+
+        return sources
+
+    async def extract_pdfs_from_event(self, event: AstrMessageEvent, context=None) -> List[bytes]:
+        """从消息中提取 PDF 文件，支持当前消息、引用链和主动拉取被引用消息"""
+        pdf_sources = []
+        seen_sources = set()
+
+        def add_sources(sources: List[str]):
+            for src in sources:
+                if src and src not in seen_sources:
+                    seen_sources.add(src)
+                    pdf_sources.append(src)
+
+        # 1. 当前消息中的 PDF
+        add_sources(self._collect_pdf_sources_from_components(list(event.message_obj.message)))
+
+        # 2. Reply 中的 PDF（优先使用 chain；如 chain 为空则主动拉取被引用消息）
+        for seg in event.message_obj.message:
+            if not isinstance(seg, Reply):
+                continue
+
+            found_in_chain = False
+            if seg.chain:
+                chain_sources = self._collect_pdf_sources_from_components(list(seg.chain))
+                if chain_sources:
+                    found_in_chain = True
+                    add_sources(chain_sources)
+
+            if not found_in_chain and context and hasattr(seg, "id") and seg.id:
+                try:
+                    logger.debug(f"Reply chain empty/no-pdf, fetching message_id: {seg.id}")
+                    components = await self._fetch_reply_components(context, seg.id)
+                    add_sources(self._collect_pdf_sources_from_components(components))
+                except Exception as e:
+                    logger.warning(f"Failed to fetch reply PDF message {seg.id}: {e}")
+
+        if not pdf_sources:
             return []
-            
+
+        tasks = [self.load_raw_bytes(src) for src in pdf_sources]
         results = await asyncio.gather(*tasks, return_exceptions=True)
+
         pdf_bytes = []
         for res in results:
             if isinstance(res, bytes):
                 pdf_bytes.append(res)
             elif isinstance(res, Exception):
                 logger.warning(f"PDF extraction error: {res}")
-                
+
         return pdf_bytes
 
     async def extract_images_from_event(self, event: AstrMessageEvent, ignore_id: str = None, context=None) -> List[bytes]:
