@@ -559,6 +559,47 @@ class FigurineProPlugin(Star):
         except Exception as e:
             logger.error(f"FigurinePro Config Save Failed: {e}")
 
+    def _append_preset_safety_suffix(self, prompt: str, preset_name: str = "") -> str:
+        """为预设统一追加安全尺度后缀，降低露骨内容导致的失败概率"""
+        if not prompt:
+            return prompt
+
+        if not self.conf.get("enable_preset_safety_suffix", True):
+            return prompt
+
+        suffix = self.conf.get(
+            "preset_safety_suffix",
+            "The final output must remain normal-scale and non-explicit. Avoid nudity, explicit sexual content, fetish-focused close-ups, voyeuristic angles, exposed private parts, non-consensual implications, or pornographic composition. Keep the character fully covered with appropriate clothing or safe occlusion when needed. Prioritize character design consistency, outfit details, expression sheets, prop details, full-body composition, and tasteful multi-angle presentation."
+        ).strip()
+
+        if not suffix:
+            return prompt
+
+        prompt_lower = prompt.lower()
+        suffix_lower = suffix.lower()
+        if suffix_lower in prompt_lower:
+            return prompt
+
+        return f"{prompt} {suffix}"
+
+    def _log_prompt_preview(self, scene: str, prompt: str):
+        """输出更完整的提示词日志，避免默认日志不完整"""
+        if not self.conf.get("enable_verbose_prompt_log", True):
+            return
+
+        try:
+            max_len = int(self.conf.get("prompt_log_max_length", 12000))
+        except Exception:
+            max_len = 12000
+
+        prompt = prompt or ""
+        if max_len > 0 and len(prompt) > max_len:
+            preview = prompt[:max_len] + f"... [truncated {len(prompt) - max_len} chars]"
+        else:
+            preview = prompt
+
+        logger.info(f"[PromptLog][{scene}] len={len(prompt)} content={preview}")
+
     def _process_prompt_and_preset(self, prompt: str) -> Tuple[str, str, str]:
         """
         处理提示词和预设
@@ -591,6 +632,7 @@ class FigurineProPlugin(Star):
                 else:
                     final_prompt = preset_content
 
+                final_prompt = self._append_preset_safety_suffix(final_prompt, key)
                 return final_prompt, key, extra_rules
 
         return prompt, "自定义", ""
@@ -1635,6 +1677,8 @@ class FigurineProPlugin(Star):
                 else:
                     user_prompt += " " + parts[1]
 
+            user_prompt = self._append_preset_safety_suffix(user_prompt, preset_name)
+
         if is_power and not self.conf.get("enable_power_model", False): is_power = False
 
         uid = norm_id(event.get_sender_id())
@@ -1693,6 +1737,11 @@ class FigurineProPlugin(Star):
         elif deduction["source"] == "group":
             await self.data_mgr.decrease_group_count(gid, cost)
 
+        self._log_prompt_preview(
+            f"command:{base_cmd if base_cmd else 'bnn'}",
+            user_prompt
+        )
+
         start = datetime.now()
         res = await self.api_mgr.call_api(images, user_prompt, model, is_power, self.img_mgr.proxy)
 
@@ -1743,6 +1792,7 @@ class FigurineProPlugin(Star):
 
         # 文生图使用专用模型
         model = self._get_text_to_image_model()
+        self._log_prompt_preview("command:文生图", final_prompt)
         start = datetime.now()
         res = await self.api_mgr.call_api(images, final_prompt, model, False, self.img_mgr.proxy)
 
