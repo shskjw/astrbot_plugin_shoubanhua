@@ -460,6 +460,7 @@ class FigurineProPlugin(Star):
 
     async def initialize(self):
         # 尝试加载动态配置备份
+        # 注意：仅在当前配置缺失/为空时才回退恢复，避免覆盖用户手动写入的 JSON 配置
         import os
         import json
         config_path = os.path.join(StarTools.get_data_dir(), "dynamic_config.json")
@@ -467,9 +468,29 @@ class FigurineProPlugin(Star):
             try:
                 with open(config_path, "r", encoding="utf-8") as f:
                     dynamic_conf = json.load(f)
-                    for k, v in dynamic_conf.items():
+
+                restored_count = 0
+                skipped_count = 0
+
+                for k, v in dynamic_conf.items():
+                    current_value = self.conf.get(k, None)
+
+                    should_restore = (
+                        current_value is None
+                        or current_value == ""
+                        or current_value == []
+                        or current_value == {}
+                    )
+
+                    if should_restore:
                         self.conf[k] = v
-                logger.info(f"FigurinePro: 已从 dynamic_config.json 恢复了 {len(dynamic_conf)} 项动态配置")
+                        restored_count += 1
+                    else:
+                        skipped_count += 1
+
+                logger.info(
+                    f"FigurinePro: dynamic_config.json 恢复完成，恢复 {restored_count} 项，跳过 {skipped_count} 项（保留手动配置）"
+                )
             except Exception as e:
                 logger.error(f"FigurinePro: 恢复动态配置失败 {e}")
 
@@ -535,13 +556,25 @@ class FigurineProPlugin(Star):
             config_path = os.path.join(StarTools.get_data_dir(), "dynamic_config.json")
 
             # 要备份的动态配置字段
+            # 这些字段可能通过指令或运行时被修改，需要持久化；
+            # 同时避免仅靠旧备份覆盖用户手动写入的主配置。
             dynamic_keys = [
                 "model",
+                "text_to_image_model",
                 "api_mode",
                 "prompt_list",
+                "generic_api_url",
                 "generic_api_keys",
+                "gemini_api_url",
                 "gemini_api_keys",
+                "enable_power_model",
+                "power_model_keyword",
+                "power_model_id",
+                "power_model_extra_cost",
+                "power_mode_fallback_to_group",
+                "power_generic_api_url",
                 "power_generic_api_keys",
+                "power_gemini_api_url",
                 "power_gemini_api_keys"
             ]
 
