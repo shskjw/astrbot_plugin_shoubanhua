@@ -277,6 +277,34 @@ class ApiManager:
 
         return candidates
 
+    def _build_candidate_generic_image_urls(self, base_url: str, has_input_image: bool = False) -> List[str]:
+        """基于用户填写的基础地址，构造一组常见 Images API 候选地址"""
+        candidates = []
+        normalized = self._convert_to_images_api_url(base_url, has_input_image=has_input_image)
+        if normalized:
+            candidates.append(normalized)
+
+        raw = (base_url or "").rstrip("/")
+        if not raw:
+            return candidates
+
+        lower_raw = raw.lower()
+        endpoint = "images/edits" if has_input_image else "images/generations"
+
+        if "/v1" not in lower_raw and "images/generations" not in lower_raw and "images/edits" not in lower_raw:
+            extra_prefixes = [
+                "/api/v1",
+                "/openai/v1",
+                "/api/openai/v1",
+                "/v1"
+            ]
+            for prefix in extra_prefixes:
+                candidate = f"{raw}{prefix}/{endpoint}"
+                if candidate not in candidates:
+                    candidates.append(candidate)
+
+        return candidates
+
     def _should_retry_images_api_with_multipart(self, error_msg: str, has_input_image: bool = False) -> bool:
         """判断 Images API 是否需要回退为 multipart/form-data 方式"""
         if not has_input_image:
@@ -319,8 +347,8 @@ class ApiManager:
                                          model: str, key: str, base_url: str, proxy: str = None) -> bytes | str:
         """以 multipart/form-data 方式调用 Images API，兼容部分仅接受文件上传的编辑接口"""
         has_input_image = bool(images)
-        url = self._convert_to_images_api_url(base_url, has_input_image=has_input_image)
-        logger.info(f"Retry Images API with multipart/form-data: {url}")
+        candidate_urls = self._build_candidate_generic_image_urls(base_url, has_input_image=has_input_image)
+        logger.info(f"Retry Images API with multipart/form-data, candidate urls: {candidate_urls}")
 
         headers = {
             "Authorization": f"Bearer {key}"
@@ -347,18 +375,28 @@ class ApiManager:
             form.add_field("image", img, filename=filename, content_type=mime)
 
         try:
-            async with session.post(url, data=form, headers=headers, proxy=proxy, timeout=timeout) as resp:
-                resp_text = await resp.text()
+            for idx, url in enumerate(candidate_urls):
+                async with session.post(url, data=form, headers=headers, proxy=proxy, timeout=timeout) as resp:
+                    resp_text = await resp.text()
 
-                if resp.status != 200:
-                    try:
-                        err_json = json.loads(resp_text)
-                        err_msg = json.dumps(err_json, ensure_ascii=False)
-                        return f"Images API Multipart Error {resp.status}: {err_msg}"
-                    except:
-                        return f"HTTP {resp.status}: {resp_text[:200]}"
+                    if "<html" in resp_text.lower() and idx < len(candidate_urls) - 1:
+                        logger.warning(f"Images API multipart 返回 HTML 页面，尝试下一个候选地址: {candidate_urls[idx + 1]}")
+                        continue
 
-                return await self._parse_images_api_success_response(resp_text, proxy)
+                    if resp.status != 200:
+                        try:
+                            err_json = json.loads(resp_text)
+                            err_msg = json.dumps(err_json, ensure_ascii=False)
+                            return f"Images API Multipart Error {resp.status}: {err_msg} | URL: {url}"
+                        except:
+                            return f"HTTP {resp.status}: {resp_text[:200]} | URL: {url}"
+
+                    if "<html" in resp_text.lower():
+                        return f"HTTP 200: 服务端返回了网页而非图片接口数据 | URL: {url}"
+
+                    return await self._parse_images_api_success_response(resp_text, proxy)
+
+            return f"Images API Multipart Error: 未找到可用接口地址 | Candidates: {candidate_urls}"
         except asyncio.TimeoutError:
             return f"请求超时 ({timeout_val}s)，请稍后再试或检查网络。"
         except Exception as e:
@@ -372,8 +410,8 @@ class ApiManager:
         """调用 Images API (DALL-E 风格接口) - 作为 fallback"""
 
         has_input_image = bool(images)
-        url = self._convert_to_images_api_url(base_url, has_input_image=has_input_image)
-        logger.info(f"Fallback to Images API: {url}")
+        candidate_urls = self._build_candidate_generic_image_urls(base_url, has_input_image=has_input_image)
+        logger.info(f"Fallback to Images API, candidate urls: {candidate_urls}")
 
         headers = {
             "Content-Type": "application/json",
@@ -409,27 +447,37 @@ class ApiManager:
             timeout = aiohttp.ClientTimeout(total=timeout_val)
             session = await self._get_session()
 
-            async with session.post(url, json=payload, headers=headers, proxy=proxy, timeout=timeout) as resp:
-                resp_text = await resp.text()
+            for idx, url in enumerate(candidate_urls):
+                async with session.post(url, json=payload, headers=headers, proxy=proxy, timeout=timeout) as resp:
+                    resp_text = await resp.text()
 
-                if resp.status != 200:
-                    err_msg = resp_text
-                    try:
-                        err_json = json.loads(resp_text)
-                        if "error" in err_json:
-                            err_msg = json.dumps(err_json["error"], ensure_ascii=False)
-                        else:
-                            err_msg = json.dumps(err_json, ensure_ascii=False)
-                    except:
-                        pass
+                    if "<html" in resp_text.lower() and idx < len(candidate_urls) - 1:
+                        logger.warning(f"Images API 返回 HTML 页面，尝试下一个候选地址: {candidate_urls[idx + 1]}")
+                        continue
 
-                    if self._should_retry_images_api_with_multipart(err_msg, has_input_image):
-                        logger.info("Images API JSON 请求失败，检测到服务端更偏好 multipart/form-data，自动重试")
-                        return await self._call_images_api_multipart(images, prompt, model, key, base_url, proxy)
+                    if resp.status != 200:
+                        err_msg = resp_text
+                        try:
+                            err_json = json.loads(resp_text)
+                            if "error" in err_json:
+                                err_msg = json.dumps(err_json["error"], ensure_ascii=False)
+                            else:
+                                err_msg = json.dumps(err_json, ensure_ascii=False)
+                        except:
+                            pass
 
-                    return f"Images API Error {resp.status}: {err_msg[:300]}"
+                        if self._should_retry_images_api_with_multipart(err_msg, has_input_image):
+                            logger.info("Images API JSON 请求失败，检测到服务端更偏好 multipart/form-data，自动重试")
+                            return await self._call_images_api_multipart(images, prompt, model, key, base_url, proxy)
 
-                return await self._parse_images_api_success_response(resp_text, proxy)
+                        return f"Images API Error {resp.status}: {err_msg[:300]} | URL: {url}"
+
+                    if "<html" in resp_text.lower():
+                        return f"HTTP 200: 服务端返回了网页而非图片接口数据 | URL: {url}"
+
+                    return await self._parse_images_api_success_response(resp_text, proxy)
+
+            return f"Images API Error: 未找到可用接口地址 | Candidates: {candidate_urls}"
 
         except asyncio.TimeoutError:
             timeout_val = self.config.get("timeout", 120)
@@ -454,7 +502,7 @@ class ApiManager:
         ])
 
     def _should_fallback_to_images_api(self, error_msg: str, has_input_image: bool = False) -> bool:
-        """检查是否应切换到 Images API，包括部分图片编辑兼容报错"""
+        """检查是否应切换到 Images API，包括部分图片编辑/生图兼容报错"""
         error_lower = (error_msg or "").lower()
         fallback_keywords = [
             "does not support chat completions",
@@ -464,16 +512,19 @@ class ApiManager:
             "images/generations",
             "images/edits",
             "not a chat model",
-            "image generation model"
+            "image generation model",
+            # 有些兼容层即使是文生图，也会错误地回这类 image edits / missing_image 提示
+            "image_url is required for image edits",
+            "missing_image",
+            "image edits",
+            "input_image",
+            "image_url is required"
         ]
-        if has_input_image:
-            fallback_keywords.extend([
-                "image_url is required for image edits",
-                "missing_image",
-                "image edits",
-                "input_image",
-                "image_url is required"
-            ])
+
+        # 无图时，如果错误点名 messages，也通常意味着 chat/completions 路径不适合当前模型
+        if not has_input_image and '"param": "messages"' in error_lower:
+            return True
+
         return any(keyword in error_lower for keyword in fallback_keywords)
 
     async def _download_result_image(self, img_url: str, proxy: str = None) -> bytes | str:
@@ -731,21 +782,17 @@ class ApiManager:
                                 if "choices" in chunk and chunk["choices"]:
                                     delta = chunk["choices"][0].get("delta", {})
 
-                                    # 1. 拼接 content
                                     if "content" in delta and delta["content"]:
                                         full_content += delta["content"]
 
-                                    # 2. 拼接 tool_calls arguments
                                     if "tool_calls" in delta and delta["tool_calls"]:
                                         for tc in delta["tool_calls"]:
                                             idx = tc.get("index", 0)
                                             if idx not in tool_calls_buffer:
                                                 tool_calls_buffer[idx] = ""
-
                                             if "function" in tc and "arguments" in tc["function"]:
                                                 tool_calls_buffer[idx] += tc["function"]["arguments"]
 
-                                    # 3. 捕获 delta 中的非标准图片字段（部分兼容接口会把图片放在 delta 内）
                                     if "images" in delta and isinstance(delta["images"], list):
                                         extracted_images.extend(delta["images"])
                                     if "data" in delta and isinstance(delta["data"], list):
@@ -759,7 +806,6 @@ class ApiManager:
                                     if "url" in delta and isinstance(delta["url"], str):
                                         extracted_urls.append(delta["url"])
 
-                                # 4. 捕获非标准/跨界的图片字段（部分中转站会将生图直接放在chunk外层）
                                 if "images" in chunk and isinstance(chunk["images"], list):
                                     extracted_images.extend(chunk["images"])
                                 if "data" in chunk and isinstance(chunk["data"], list):
@@ -776,10 +822,8 @@ class ApiManager:
                                 pass
 
                     if valid_stream:
-                        # 重构为非流式结构以便后续处理
                         msg_obj = {"content": full_content, "role": "assistant"}
 
-                        # 还原 tool_calls
                         if tool_calls_buffer:
                             msg_obj["tool_calls"] = []
                             for idx in sorted(tool_calls_buffer.keys()):
@@ -787,7 +831,6 @@ class ApiManager:
                                     "function": {"arguments": tool_calls_buffer[idx]}
                                 })
 
-                        # 将其他提取到的数据并入
                         if extracted_images:
                             msg_obj["images"] = extracted_images
                         if extracted_urls:
@@ -810,7 +853,6 @@ class ApiManager:
                     else:
                         return f"数据解析失败: 看起来是流式数据但无法解析. 内容: {resp_text[:100]}..."
                 else:
-                    # 终极兜底：如果连 data: 都没有，但包含图片base64，尝试强行挽救
                     b64_match = re.search(r'(data:image\/[\w\-\+\.]+(?:;base64)?,[\w\-\+\/=\s]{100,})', resp_text)
                     if b64_match:
                         logger.warning("在非JSON/非标准流解析失败分支中找到了base64，已挽救")
@@ -826,110 +868,100 @@ class ApiManager:
 
                     return f"数据解析失败: 返回内容不是 JSON. 内容: {resp_text[:100]}... | URL: {active_url}"
 
-                if "error" in res_data:
-                    return json.dumps(res_data["error"], ensure_ascii=False)
+            if "error" in res_data:
+                return json.dumps(res_data["error"], ensure_ascii=False)
 
-                img_url = self.extract_image_url(res_data)
-                
-                # 终极 fallback，检查是否是那种直接放在外层的 tool_calls / images 遗漏
-                if not img_url:
-                    raw_str = str(res_data)
-                    b64_match = re.search(r'(data:image\/[\w\-\+\.]+(?:;base64)?,[\w\-\+\/=\s]{100,})', raw_str)
-                    if b64_match:
-                        logger.warning("在报错分支的终极fallback中找到了base64，已挽救")
-                        img_url = b64_match.group(1).replace("\\n", "").replace("\\r", "").replace(" ", "").replace("\\", "")
+            img_url = self.extract_image_url(res_data)
 
-                if not img_url:
-                    raw_str = str(res_data)
-                    pure_b64_match = re.search(r'"([A-Za-z0-9+/]{1000,}={0,2})"', raw_str)
-                    if pure_b64_match:
-                        logger.warning("在报错分支的终极fallback中找到了纯base64，已挽救")
-                        img_url = f"data:image/png;base64,{pure_b64_match.group(1)}"
+            # 终极 fallback，检查是否是那种直接放在外层的 tool_calls / images 遗漏
+            if not img_url:
+                raw_str = str(res_data)
+                b64_match = re.search(r'(data:image\/[\w\-\+\.]+(?:;base64)?,[\w\-\+\/=\s]{100,})', raw_str)
+                if b64_match:
+                    logger.warning("在报错分支的终极fallback中找到了base64，已挽救")
+                    img_url = b64_match.group(1).replace("\\n", "").replace("\\r", "").replace(" ", "").replace("\\", "")
 
-                if not img_url:
-                    raw_resp_b64_match = re.search(r'(data:image\/[\w\-\+\.]+(?:;base64)?,[\w\-\+\/=\s]{100,})', resp_text)
-                    if raw_resp_b64_match:
-                        logger.warning("在原始流响应中找到了base64，已挽救")
-                        img_url = raw_resp_b64_match.group(1).replace("\\n", "").replace("\\r", "").replace(" ", "").replace("\\", "")
+            if not img_url:
+                raw_str = str(res_data)
+                pure_b64_match = re.search(r'"([A-Za-z0-9+/]{1000,}={0,2})"', raw_str)
+                if pure_b64_match:
+                    logger.warning("在报错分支的终极fallback中找到了纯base64，已挽救")
+                    img_url = f"data:image/png;base64,{pure_b64_match.group(1)}"
 
-                if not img_url:
-                    raw_resp_url_match = re.search(r'(https?://[^\s<>")\]]+)', resp_text)
-                    if raw_resp_url_match:
-                        logger.warning("在原始流响应中找到了图片URL，已挽救")
-                        img_url = raw_resp_url_match.group(1).rstrip(")>,'\".")
+            if not img_url:
+                raw_resp_b64_match = re.search(r'(data:image\/[\w\-\+\.]+(?:;base64)?,[\w\-\+\/=\s]{100,})', resp_text)
+                if raw_resp_b64_match:
+                    logger.warning("在原始流响应中找到了base64，已挽救")
+                    img_url = raw_resp_b64_match.group(1).replace("\\n", "").replace("\\r", "").replace(" ", "").replace("\\", "")
 
-                if not img_url:
-                    # Gemini 特殊错误诊断 (原生 API)
-                    if "candidates" in res_data and res_data["candidates"]:
-                        cand = res_data["candidates"][0]
-                        finish_reason = cand.get("finishReason", "UNKNOWN")
-                        
-                        # 1. 非正常结束
-                        if finish_reason not in ["STOP", "MAX_TOKENS"]:
-                            return f"生成被终止，原因: {finish_reason} (通常是安全过滤导致)"
-                        
-                        # 2. 正常结束但无内容
-                        content_obj = cand.get("content") or {}
-                        parts = content_obj.get("parts")
-                        if not parts:
-                            # 尝试打印整个 candidate 以便排查
-                            cand_str = json.dumps(cand, ensure_ascii=False)
-                            logger.warning(f"Gemini API returned empty parts: {cand_str}")
-                            return f"模型响应为空 (finishReason={finish_reason})。请确认使用的模型 ({model}) 是否支持生图，或者 Prompt 是否触发了隐性过滤。\nRaw: {cand_str[:100]}..."
+            if not img_url:
+                raw_resp_url_match = re.search(r'(https?://[^\s<>")\]]+)', resp_text)
+                if raw_resp_url_match:
+                    logger.warning("在原始流响应中找到了图片URL，已挽救")
+                    img_url = raw_resp_url_match.group(1).rstrip(")>,'\".")
+
+            if not img_url:
+                # Gemini 特殊错误诊断 (原生 API)
+                if "candidates" in res_data and res_data["candidates"]:
+                    cand = res_data["candidates"][0]
+                    finish_reason = cand.get("finishReason", "UNKNOWN")
+
+                    if finish_reason not in ["STOP", "MAX_TOKENS"]:
+                        return f"生成被终止，原因: {finish_reason} (通常是安全过滤导致)"
+
+                    content_obj = cand.get("content") or {}
+                    parts = content_obj.get("parts")
+                    if not parts:
+                        cand_str = json.dumps(cand, ensure_ascii=False)
+                        logger.warning(f"Gemini API returned empty parts: {cand_str}")
+                        return f"模型响应为空 (finishReason={finish_reason})。请确认使用的模型 ({model}) 是否支持生图，或者 Prompt 是否触发了隐性过滤。\nRaw: {cand_str[:100]}..."
+                    else:
+                        texts = [p.get("text", "") for p in parts if "text" in p]
+                        if texts:
+                            text_msg = "\n".join(texts).strip()
+                            if text_msg:
+                                return text_msg
+
+                # OpenAI 格式错误诊断 (兼容 API)
+                if "choices" in res_data and isinstance(res_data["choices"], list) and len(res_data["choices"]) > 0:
+                    choice = res_data["choices"][0]
+                    finish_reason = choice.get("finish_reason", "UNKNOWN")
+                    msg = choice.get("message", {})
+                    content = msg.get("content")
+                    has_tools = "tool_calls" in msg and bool(msg["tool_calls"])
+
+                    if content is None and not has_tools:
+                        refusal = msg.get("refusal")
+                        if refusal:
+                            return f"生成请求被拒绝: {refusal}"
+
+                        choice_str = json.dumps(choice, ensure_ascii=False)
+                        logger.warning(f"OpenAI API content is None: {choice_str}")
+                        return f"API 返回内容为空。finish_reason: {finish_reason}。\nDEBUG: {choice_str[:200]}..."
+
+                    if isinstance(content, str) and not content.strip() and not has_tools:
+                        if finish_reason == "content_filter":
+                            return "❌ 生成被拦截: 触发了安全过滤 (content_filter)。建议修改 Prompt 或重试。"
+
+                        if "data:image/" in resp_text or '"images"' in resp_text or '"image_url"' in resp_text or '"url"' in resp_text:
+                            logger.warning("检测到空文本响应，但原始响应中仍包含疑似图片字段，已跳过空字符串误报")
                         else:
-                            # 尝试提取文本内容作为错误信息提示
-                            texts = [p.get("text", "") for p in parts if "text" in p]
-                            if texts:
-                                text_msg = "\n".join(texts).strip()
-                                if text_msg:
-                                    return text_msg
-                    
-                    # OpenAI 格式错误诊断 (兼容 API)
-                    if "choices" in res_data and isinstance(res_data["choices"], list) and len(res_data["choices"]) > 0:
-                        choice = res_data["choices"][0]
-                        finish_reason = choice.get("finish_reason", "UNKNOWN")
-                        msg = choice.get("message", {})
-                        content = msg.get("content")
-                        
-                        # 检查是否有 tool_calls 并且我们在前面的提取阶段提取失败了
-                        has_tools = "tool_calls" in msg and bool(msg["tool_calls"])
-                        
-                        # 1. content 为 None 且没有 tool_calls
-                        if content is None and not has_tools:
-                            refusal = msg.get("refusal")
-                            if refusal: return f"生成请求被拒绝: {refusal}"
-                            
-                            # 将 choice 打印出来排查
-                            choice_str = json.dumps(choice, ensure_ascii=False)
-                            logger.warning(f"OpenAI API content is None: {choice_str}")
-                            return f"API 返回内容为空。finish_reason: {finish_reason}。\nDEBUG: {choice_str[:200]}..."
-                        
-                        # 2. content 为空字符串 且没有 tool_calls
-                        if isinstance(content, str) and not content.strip() and not has_tools:
-                            if finish_reason == "content_filter":
-                                return "❌ 生成被拦截: 触发了安全过滤 (content_filter)。建议修改 Prompt 或重试。"
-                            
-                            if "data:image/" in resp_text or '"images"' in resp_text or '"image_url"' in resp_text or '"url"' in resp_text:
-                                logger.warning("检测到空文本响应，但原始响应中仍包含疑似图片字段，已跳过空字符串误报")
-                            else:
-                                return f"API 返回内容为空字符串。finish_reason: {finish_reason}。"
-                            
-                        # 3. content 有文本内容
-                        if isinstance(content, str) and content.strip():
-                            return content.strip()
-                            
-                        # 4. tool_calls
-                        if has_tools:
-                            return "API返回了工具调用但无法解析出图片。请重试或检查接口。"
+                            return f"API 返回内容为空字符串。finish_reason: {finish_reason}。"
 
-                    return f"API请求成功但未找到图片数据。Raw: {str(res_data)[:300]}..."
+                    if isinstance(content, str) and content.strip():
+                        return content.strip()
 
-                # 如果是 Base64 直接返回 Bytes
-                if img_url.startswith("data:"):
-                    return base64.b64decode(img_url.split(",")[-1])
+                    if has_tools:
+                        return "API返回了工具调用但无法解析出图片。请重试或检查接口。"
 
-                # 如果是 URL，需要再次下载（增加重试与容错，避免外链偶发失败）
-                return await self._download_result_image(img_url, proxy)
+                return f"API请求成功但未找到图片数据。Raw: {str(res_data)[:300]}..."
+
+            # 如果是 Base64 直接返回 Bytes
+            if img_url.startswith("data:"):
+                return base64.b64decode(img_url.split(",")[-1])
+
+            # 如果是 URL，需要再次下载（增加重试与容错，避免外链偶发失败）
+            return await self._download_result_image(img_url, proxy)
 
         except asyncio.TimeoutError:
             logger.error(f"API Call Timeout after {timeout_val}s")
