@@ -35,6 +35,9 @@
   - 当前消息里如果已经带图 / PDF，则只处理当前消息中的图片
   - 只有当前消息没有图时，才回退到上下文中查找历史图片
 - 修复 **结果图外链下载不稳定** 的问题，增加了结果图下载重试、超时和 User-Agent 兜底策略
+- 修复 **Generic API 地址容易填错完整路径** 的问题：现在即使填成 `/v1/chat/completions`、`/v1/images/generations`、`/v1/images/edits`，也会自动忽略尾部路径并重新拼接
+- 新增 **Generic 图片接口优先模式**：可通过 `generic_prefer_images_api` 让插件优先直连 `images/generations` / `images/edits`
+- 新增 **Images API multipart/form-data 自动回退**：当服务端不接受 JSON data URI、要求文件上传时，会自动尝试 multipart 方式重试
 
 ### 📌 当前批处理与 PDF 行为说明
 - 用户明确发送“这两张图 / 这几张图”时，如果当前消息里已经附带图片，则插件默认只处理当前消息里的这些图片，不再额外混入历史上下文图片
@@ -209,8 +212,9 @@
 
 | 配置项 | 说明 |
 | --- | --- |
-| `generic_api_url` | Generic 模式 API 地址，例如 https://api.example.com/v1/chat/completions |
+| `generic_api_url` | Generic 模式 API 基础地址，例如 https://api.example.com 或 https://api.example.com/v1；插件会自动拼接 `/v1/chat/completions`、`/v1/images/generations`、`/v1/images/edits`，即使误填完整接口路径也会自动修正 |
 | `generic_api_keys` | Generic 模式 Key 池（可多条轮询），示例：123 |
+| `generic_prefer_images_api` | 开启后，Generic 模式优先直接走 `images/generations` / `images/edits`，不先走 `chat/completions` |
 | `gemini_api_url` | Gemini 官方 Base 地址，默认 https://generativelanguage.googleapis.com |
 | `gemini_api_keys` | Gemini 官方模式 Key 池 |
 | `api_mode` | 协议模式：generic / gemini_official |

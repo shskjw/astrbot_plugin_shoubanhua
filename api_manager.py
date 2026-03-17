@@ -197,9 +197,48 @@ class ApiManager:
             return 'image/webp'
         return 'image/png' # 默认
 
+    def _normalize_generic_chat_url(self, base_url: str) -> str:
+        """将用户填写的 Generic URL 规范化为 chat/completions 地址。
+        支持只填写域名或 /v1；如果用户误填了完整接口路径，也会自动忽略尾部路径后重新拼接。
+        """
+        original_url = (base_url or "").rstrip("/")
+        url = original_url
+        if not url:
+            return url
+
+        # 若用户直接填了完整接口路径，统一裁掉尾部，改按基础 URL 重新拼接
+        known_suffixes = [
+            "/v1/chat/completions",
+            "/chat/completions",
+            "/v1/images/generations",
+            "/images/generations",
+            "/v1/images/edits",
+            "/images/edits"
+        ]
+        lower_url = url.lower()
+        for suffix in known_suffixes:
+            if lower_url.endswith(suffix):
+                url = url[: -len(suffix)].rstrip("/")
+                lower_url = url.lower()
+                logger.info(f"检测到 Generic API 地址包含完整接口路径，已自动忽略尾部路径并改为基础 URL: {url}")
+                break
+
+        if url.endswith("/v1"):
+            normalized = f"{url}/chat/completions"
+        elif "/v1/" in url:
+            idx = lower_url.find("/v1") + 3
+            normalized = f"{url[:idx]}/chat/completions"
+        else:
+            normalized = f"{url}/v1/chat/completions"
+
+        if normalized.rstrip("/") != original_url.rstrip("/"):
+            logger.info(f"Generic API 地址已规范化为: {normalized}")
+
+        return normalized
+
     def _convert_to_images_api_url(self, chat_url: str, has_input_image: bool = False) -> str:
-        """将 chat/completions URL 转换为图片接口 URL；有输入图时优先使用 edits"""
-        url = chat_url.rstrip("/")
+        """将 Generic Base URL / chat URL 转换为图片接口 URL；有输入图时优先使用 edits"""
+        url = self._normalize_generic_chat_url(chat_url)
         endpoint = "images/edits" if has_input_image else "images/generations"
         if "chat/completions" in url:
             return url.replace("chat/completions", endpoint)
@@ -210,23 +249,113 @@ class ApiManager:
             return f"{url[:idx]}/{endpoint}"
         return f"{url}/v1/{endpoint}"
 
+    def _should_retry_images_api_with_multipart(self, error_msg: str, has_input_image: bool = False) -> bool:
+        """判断 Images API 是否需要回退为 multipart/form-data 方式"""
+        if not has_input_image:
+            return False
+        error_lower = (error_msg or "").lower()
+        keywords = [
+            "multipart",
+            "form-data",
+            "unsupported media type",
+            "image must be a file",
+            "file upload",
+            "use multipart",
+            "expected uploadfile",
+            "expected file"
+        ]
+        return any(keyword in error_lower for keyword in keywords)
+
+    async def _parse_images_api_success_response(self, resp_text: str, proxy: str = None) -> bytes | str:
+        """统一解析 Images API 成功响应"""
+        try:
+            res_data = json.loads(resp_text)
+        except json.JSONDecodeError:
+            return f"数据解析失败: 返回内容不是 JSON. 内容: {resp_text[:100]}..."
+
+        if "error" in res_data:
+            return json.dumps(res_data["error"], ensure_ascii=False)
+
+        img_url = self.extract_image_url(res_data)
+        if not img_url:
+            return f"Images API 返回成功但未找到图片数据。Raw: {str(res_data)[:200]}..."
+
+        if img_url.startswith("data:"):
+            return base64.b64decode(img_url.split(",")[-1])
+
+        session = await self._get_session()
+        async with session.get(img_url, proxy=proxy) as img_resp:
+            return await img_resp.read()
+
+    async def _call_images_api_multipart(self, images: List[bytes], prompt: str,
+                                         model: str, key: str, base_url: str, proxy: str = None) -> bytes | str:
+        """以 multipart/form-data 方式调用 Images API，兼容部分仅接受文件上传的编辑接口"""
+        has_input_image = bool(images)
+        url = self._convert_to_images_api_url(base_url, has_input_image=has_input_image)
+        logger.info(f"Retry Images API with multipart/form-data: {url}")
+
+        headers = {
+            "Authorization": f"Bearer {key}"
+        }
+
+        res_set = self.config.get("image_resolution", "1K")
+        final_prompt = f"(Masterpiece, Best Quality, {res_set} Resolution), {prompt}" if res_set != "1K" else prompt
+
+        timeout_val = self.config.get("timeout", 120)
+        timeout = aiohttp.ClientTimeout(total=timeout_val)
+        session = await self._get_session()
+
+        form = aiohttp.FormData()
+        form.add_field("model", model)
+        form.add_field("prompt", final_prompt)
+        form.add_field("n", "1")
+        form.add_field("response_format", "b64_json")
+
+        if images:
+            img = images[0]
+            mime = self.get_mime_type(img)
+            ext = mime.split("/")[-1] if "/" in mime else "png"
+            filename = f"input.{ext}"
+            form.add_field("image", img, filename=filename, content_type=mime)
+
+        try:
+            async with session.post(url, data=form, headers=headers, proxy=proxy, timeout=timeout) as resp:
+                resp_text = await resp.text()
+
+                if resp.status != 200:
+                    try:
+                        err_json = json.loads(resp_text)
+                        err_msg = json.dumps(err_json, ensure_ascii=False)
+                        return f"Images API Multipart Error {resp.status}: {err_msg}"
+                    except:
+                        return f"HTTP {resp.status}: {resp_text[:200]}"
+
+                return await self._parse_images_api_success_response(resp_text, proxy)
+        except asyncio.TimeoutError:
+            return f"请求超时 ({timeout_val}s)，请稍后再试或检查网络。"
+        except Exception as e:
+            import traceback
+            logger.error(f"Images API Multipart Call Error: {traceback.format_exc()}")
+            err_msg = str(e) or type(e).__name__
+            return f"系统错误: {err_msg}"
+
     async def call_images_api(self, images: List[bytes], prompt: str,
                                model: str, key: str, base_url: str, proxy: str = None) -> bytes | str:
         """调用 Images API (DALL-E 风格接口) - 作为 fallback"""
-        
+
         has_input_image = bool(images)
         url = self._convert_to_images_api_url(base_url, has_input_image=has_input_image)
         logger.info(f"Fallback to Images API: {url}")
-        
+
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {key}"
         }
-        
+
         # 画质强化 Prompt
         res_set = self.config.get("image_resolution", "1K")
         final_prompt = f"(Masterpiece, Best Quality, {res_set} Resolution), {prompt}" if res_set != "1K" else prompt
-        
+
         # 构造 Images API 请求
         payload = {
             "model": model,
@@ -234,7 +363,7 @@ class ApiManager:
             "n": 1,
             "response_format": "b64_json"
         }
-        
+
         # 如果有输入图片，兼容不同 Images API 的字段要求
         # 一些服务要求 image_url；另一些只认 image / input_image / images
         if images:
@@ -246,46 +375,34 @@ class ApiManager:
             payload["image_url"] = data_uri
             payload["input_image"] = data_uri
             payload["images"] = [data_uri]
-        
+
         try:
             timeout_val = self.config.get("timeout", 120)
             timeout = aiohttp.ClientTimeout(total=timeout_val)
             session = await self._get_session()
-            
+
             async with session.post(url, json=payload, headers=headers, proxy=proxy, timeout=timeout) as resp:
                 resp_text = await resp.text()
-                
+
                 if resp.status != 200:
+                    err_msg = resp_text
                     try:
                         err_json = json.loads(resp_text)
                         if "error" in err_json:
-                            err_msg = json.dumps(err_json['error'], ensure_ascii=False)
-                            return f"Images API Error {resp.status}: {err_msg}"
+                            err_msg = json.dumps(err_json["error"], ensure_ascii=False)
+                        else:
+                            err_msg = json.dumps(err_json, ensure_ascii=False)
                     except:
                         pass
-                    return f"HTTP {resp.status}: {resp_text[:200]}"
-                
-                try:
-                    res_data = json.loads(resp_text)
-                except json.JSONDecodeError:
-                    return f"数据解析失败: 返回内容不是 JSON. 内容: {resp_text[:100]}..."
-                
-                if "error" in res_data:
-                    return json.dumps(res_data["error"], ensure_ascii=False)
-                
-                # 解析 Images API 响应
-                img_url = self.extract_image_url(res_data)
-                if not img_url:
-                    return f"Images API 返回成功但未找到图片数据。Raw: {str(res_data)[:200]}..."
-                
-                # 如果是 Base64 直接返回 Bytes
-                if img_url.startswith("data:"):
-                    return base64.b64decode(img_url.split(",")[-1])
-                
-                # 如果是 URL，需要再次下载
-                async with session.get(img_url, proxy=proxy) as img_resp:
-                    return await img_resp.read()
-                    
+
+                    if self._should_retry_images_api_with_multipart(err_msg, has_input_image):
+                        logger.info("Images API JSON 请求失败，检测到服务端更偏好 multipart/form-data，自动重试")
+                        return await self._call_images_api_multipart(images, prompt, model, key, base_url, proxy)
+
+                    return f"Images API Error {resp.status}: {err_msg[:300]}"
+
+                return await self._parse_images_api_success_response(resp_text, proxy)
+
         except asyncio.TimeoutError:
             timeout_val = self.config.get("timeout", 120)
             return f"请求超时 ({timeout_val}s)，请稍后再试或检查网络。"
@@ -394,6 +511,11 @@ class ApiManager:
         payload = {}
         url = base.rstrip("/")
 
+        # 对于明确使用 Generic 图片接口的站点，可配置为优先直连 Images API
+        if mode == "generic" and self.config.get("generic_prefer_images_api", False):
+            logger.info("已启用 generic_prefer_images_api，优先直接走 Images API")
+            return await self.call_images_api(images, prompt, model, key, base, proxy)
+
         # 画质强化 Prompt
         res_set = self.config.get("image_resolution", "1K")
         final_prompt = f"(Masterpiece, Best Quality, {res_set} Resolution), {prompt}" if res_set != "1K" else prompt
@@ -443,7 +565,8 @@ class ApiManager:
                                     "HARM_CATEGORY_CIVIC_INTEGRITY"]] # 参考: 增加 CIVIC_INTEGRITY
             }
         else:
-            # OpenAI 构造
+            # OpenAI / Generic 构造：允许用户只填写 Base URL，自动补全 chat/completions
+            url = self._normalize_generic_chat_url(url)
             headers["Authorization"] = f"Bearer {key}"
             
             content_list = [{"type": "text", "text": final_prompt}]
@@ -492,14 +615,26 @@ class ApiManager:
                 if resp.status != 200:
                     try:
                         err_json = json.loads(resp_text)
+
+                        # 兼容标准 OpenAI 错误结构: {"error": {...}}
                         if "error" in err_json:
-                            err_msg = json.dumps(err_json['error'], ensure_ascii=False)
-                            
+                            err_msg = json.dumps(err_json["error"], ensure_ascii=False)
+
                             # 检查是否应自动切换到 Images API（包括部分图编模型兼容层）
                             if mode == "generic" and self._should_fallback_to_images_api(err_msg, bool(images)):
                                 logger.info(f"模型 {model} 当前错误适合切换到 Images API，自动回退处理")
                                 return await self.call_images_api(images, prompt, model, key, base, proxy)
-                            
+
+                            return f"API Error {resp.status}: {err_msg}"
+
+                        # 兼容顶层直接报错结构: {"message": "...", "type": "...", "code": "..."}
+                        if any(k in err_json for k in ["message", "type", "code", "param"]):
+                            err_msg = json.dumps(err_json, ensure_ascii=False)
+
+                            if mode == "generic" and self._should_fallback_to_images_api(err_msg, bool(images)):
+                                logger.info(f"模型 {model} 返回顶层错误结构，自动回退到 Images API")
+                                return await self.call_images_api(images, prompt, model, key, base, proxy)
+
                             return f"API Error {resp.status}: {err_msg}"
                     except:
                         pass

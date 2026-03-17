@@ -1,9 +1,9 @@
 {
     "generic_api_url": {
-        "description": "【Generic】API地址",
+        "description": "【Generic】API基础地址",
         "type": "string",
-        "hint": "Generic模式(OpenAI格式)专用：填完整URL（如 https://api.bltcy.ai/v1/chat/completions）。",
-        "default": "https://api.bltcy.ai/v1/chat/completions"
+        "hint": "Generic模式(OpenAI格式)专用：只需填写基础URL（如 https://api.bltcy.ai 或 https://api.bltcy.ai/v1），插件会自动拼接 chat/completions、images/generations、images/edits 等路径。即使误填成 /v1/chat/completions 或 /v1/images/edits，也会自动忽略尾部路径后重新拼接。",
+        "default": "https://api.bltcy.ai"
     },
     "generic_api_keys": {
         "description": "【Generic】API Key 池",
@@ -125,9 +125,9 @@
         "default": false
     },
     "power_generic_api_url": {
-        "description": "【强力模式-Generic】API地址",
+        "description": "【强力模式-Generic】API基础地址",
         "type": "string",
-        "hint": "强力模式Generic模式专用：填完整URL（如 https://api.bltcy.ai/v1/chat/completions）。如果为空则使用普通模式的API地址。",
+        "hint": "强力模式Generic模式专用：只需填写基础URL（如 https://api.bltcy.ai 或 https://api.bltcy.ai/v1）。如果为空则使用普通模式的API地址。插件会自动拼接所需接口路径；即使误填完整接口路径也会自动修正。",
         "default": ""
     },
     "power_generic_api_keys": {
@@ -202,6 +202,12 @@
         "description": "【网络】启用流式请求（仅generic模式）",
         "type": "bool",
         "hint": "开启后使用SSE流式请求，避免Cloudflare 100秒超时限制（524错误）。推荐开启，仅对generic模式生效。",
+        "default": false
+    },
+    "generic_prefer_images_api": {
+        "description": "【Generic】优先直连图片接口",
+        "type": "bool",
+        "hint": "开启后，Generic模式会优先直接调用 images/generations 或 images/edits，而不是先走 chat/completions 再回退。适合明确使用图片模型接口的中转站。",
         "default": false
     },
     "download_retries": {
