@@ -249,6 +249,34 @@ class ApiManager:
             return f"{url[:idx]}/{endpoint}"
         return f"{url}/v1/{endpoint}"
 
+    def _build_candidate_generic_chat_urls(self, base_url: str) -> List[str]:
+        """基于用户填写的基础地址，构造一组常见 Generic API 候选地址"""
+        candidates = []
+        normalized = self._normalize_generic_chat_url(base_url)
+        if normalized:
+            candidates.append(normalized)
+
+        raw = (base_url or "").rstrip("/")
+        if not raw:
+            return candidates
+
+        lower_raw = raw.lower()
+
+        # 仅当用户填的像网站首页/域名，且未包含 v1 或 chat 路径时，才尝试常见前缀
+        if "/v1" not in lower_raw and "chat/completions" not in lower_raw:
+            extra_prefixes = [
+                "/api/v1",
+                "/openai/v1",
+                "/api/openai/v1",
+                "/v1"
+            ]
+            for prefix in extra_prefixes:
+                candidate = f"{raw}{prefix}/chat/completions"
+                if candidate not in candidates:
+                    candidates.append(candidate)
+
+        return candidates
+
     def _should_retry_images_api_with_multipart(self, error_msg: str, has_input_image: bool = False) -> bool:
         """判断 Images API 是否需要回退为 multipart/form-data 方式"""
         if not has_input_image:
@@ -609,169 +637,194 @@ class ApiManager:
             # 使用持久化 Session，避免重复的 TCP/SSL 握手开销
             session = await self._get_session()
             
-            async with session.post(url, json=payload, headers=headers, proxy=proxy, timeout=timeout) as resp:
-                resp_text = await resp.text()
+            candidate_urls = [url]
+            if mode == "generic":
+                candidate_urls = self._build_candidate_generic_chat_urls(base)
 
-                if resp.status != 200:
-                    try:
-                        err_json = json.loads(resp_text)
+            logger.info(f"Generic API 候选地址: {candidate_urls}")
 
-                        # 兼容标准 OpenAI 错误结构: {"error": {...}}
-                        if "error" in err_json:
-                            err_msg = json.dumps(err_json["error"], ensure_ascii=False)
+            resp_text = ""
+            last_status = None
+            active_url = url
 
-                            # 检查是否应自动切换到 Images API（包括部分图编模型兼容层）
-                            if mode == "generic" and self._should_fallback_to_images_api(err_msg, bool(images)):
-                                logger.info(f"模型 {model} 当前错误适合切换到 Images API，自动回退处理")
-                                return await self.call_images_api(images, prompt, model, key, base, proxy)
+            for idx, candidate_url in enumerate(candidate_urls):
+                active_url = candidate_url
+                async with session.post(active_url, json=payload, headers=headers, proxy=proxy, timeout=timeout) as resp:
+                    resp_text = await resp.text()
+                    last_status = resp.status
 
-                            return f"API Error {resp.status}: {err_msg}"
+                    # 如果返回 HTML，且后面还有候选地址，则继续尝试常见 API 前缀
+                    if "<html" in resp_text.lower() and idx < len(candidate_urls) - 1:
+                        logger.warning(f"Generic API 地址返回了 HTML 页面，尝试下一个候选地址: {candidate_urls[idx + 1]}")
+                        continue
 
-                        # 兼容顶层直接报错结构: {"message": "...", "type": "...", "code": "..."}
-                        if any(k in err_json for k in ["message", "type", "code", "param"]):
-                            err_msg = json.dumps(err_json, ensure_ascii=False)
+                    if resp.status != 200:
+                        try:
+                            err_json = json.loads(resp_text)
 
-                            if mode == "generic" and self._should_fallback_to_images_api(err_msg, bool(images)):
-                                logger.info(f"模型 {model} 返回顶层错误结构，自动回退到 Images API")
-                                return await self.call_images_api(images, prompt, model, key, base, proxy)
+                            # 兼容标准 OpenAI 错误结构: {"error": {...}}
+                            if "error" in err_json:
+                                err_msg = json.dumps(err_json["error"], ensure_ascii=False)
 
-                            return f"API Error {resp.status}: {err_msg}"
-                    except:
-                        pass
-                    if "<html" in resp_text.lower():
-                        return f"HTTP {resp.status}: 服务端返回了网页而非数据，请检查URL配置。"
-                    
-                    # 检查原始响应文本是否适合自动切换到 Images API
-                    if mode == "generic" and self._should_fallback_to_images_api(resp_text, bool(images)):
-                        logger.info(f"模型 {model} 当前错误适合切换到 Images API，自动回退处理")
-                        return await self.call_images_api(images, prompt, model, key, base, proxy)
-                    
-                    # Return error if status != 200
-                    return f"HTTP {resp.status}: {resp_text[:200]}"
+                                if mode == "generic" and self._should_fallback_to_images_api(err_msg, bool(images)):
+                                    logger.info(f"模型 {model} 当前错误适合切换到 Images API，自动回退处理")
+                                    return await self.call_images_api(images, prompt, model, key, base, proxy)
 
-                try:
-                    res_data = json.loads(resp_text)
-                except json.JSONDecodeError:
-                        # 兼容：处理被强制流式返回的情况 (SSE format)
-                        if "data: " in resp_text:
-                            full_content = ""
-                            tool_calls_buffer = {} # {index: "arguments"}
-                            
-                            lines = resp_text.splitlines()
-                            valid_stream = False
-                            extracted_images = []
-                            extracted_data_arr = []
-                            extracted_urls = []
-                            
+                                return f"API Error {resp.status}: {err_msg} | URL: {active_url}"
+
+                            # 兼容顶层直接报错结构: {"message": "...", "type": "...", "code": "..."}
+                            if any(k in err_json for k in ["message", "type", "code", "param"]):
+                                err_msg = json.dumps(err_json, ensure_ascii=False)
+
+                                if mode == "generic" and self._should_fallback_to_images_api(err_msg, bool(images)):
+                                    logger.info(f"模型 {model} 返回顶层错误结构，自动回退到 Images API")
+                                    return await self.call_images_api(images, prompt, model, key, base, proxy)
+
+                                return f"API Error {resp.status}: {err_msg} | URL: {active_url}"
+                        except:
+                            pass
+
+                        if "<html" in resp_text.lower():
+                            if mode == "generic":
+                                return (
+                                    f"HTTP {resp.status}: 服务端返回了网页而非数据。当前尝试地址: {active_url}。\n"
+                                    f"请填写 API 基础地址，而不是网站首页。例如应填写接口所在前缀，如 https://域名/api 或 https://域名/openai。"
+                                )
+                            return f"HTTP {resp.status}: 服务端返回了网页而非数据，请检查URL配置。"
+
+                        if mode == "generic" and self._should_fallback_to_images_api(resp_text, bool(images)):
+                            logger.info(f"模型 {model} 当前错误适合切换到 Images API，自动回退处理")
+                            return await self.call_images_api(images, prompt, model, key, base, proxy)
+
+                        return f"HTTP {resp.status}: {resp_text[:200]} | URL: {active_url}"
+
+                    # 命中成功候选地址，跳出循环
+                    url = active_url
+                    break
+
+            if last_status is not None and last_status != 200:
+                return f"HTTP {last_status}: {resp_text[:200]} | URL: {active_url}"
+
+            try:
+                res_data = json.loads(resp_text)
+            except json.JSONDecodeError:
+                # 兼容：处理被强制流式返回的情况 (SSE format)
+                if "data: " in resp_text:
+                    full_content = ""
+                    tool_calls_buffer = {} # {index: "arguments"}
+
+                    lines = resp_text.splitlines()
+                    valid_stream = False
+                    extracted_images = []
+                    extracted_data_arr = []
+                    extracted_urls = []
+
+                    for line in lines:
+                        line = line.strip()
+                        if line.startswith("data: ") and line != "data: [DONE]":
+                            try:
+                                chunk_str = line[6:]
+                                if not chunk_str:
+                                    continue
+                                chunk = json.loads(chunk_str)
+                                valid_stream = True
+                                if "choices" in chunk and chunk["choices"]:
+                                    delta = chunk["choices"][0].get("delta", {})
+
+                                    # 1. 拼接 content
+                                    if "content" in delta and delta["content"]:
+                                        full_content += delta["content"]
+
+                                    # 2. 拼接 tool_calls arguments
+                                    if "tool_calls" in delta and delta["tool_calls"]:
+                                        for tc in delta["tool_calls"]:
+                                            idx = tc.get("index", 0)
+                                            if idx not in tool_calls_buffer:
+                                                tool_calls_buffer[idx] = ""
+
+                                            if "function" in tc and "arguments" in tc["function"]:
+                                                tool_calls_buffer[idx] += tc["function"]["arguments"]
+
+                                    # 3. 捕获 delta 中的非标准图片字段（部分兼容接口会把图片放在 delta 内）
+                                    if "images" in delta and isinstance(delta["images"], list):
+                                        extracted_images.extend(delta["images"])
+                                    if "data" in delta and isinstance(delta["data"], list):
+                                        extracted_data_arr.extend(delta["data"])
+                                    if "image_url" in delta:
+                                        image_url = delta["image_url"]
+                                        if isinstance(image_url, str):
+                                            extracted_urls.append(image_url)
+                                        elif isinstance(image_url, dict) and image_url.get("url"):
+                                            extracted_urls.append(image_url["url"])
+                                    if "url" in delta and isinstance(delta["url"], str):
+                                        extracted_urls.append(delta["url"])
+
+                                # 4. 捕获非标准/跨界的图片字段（部分中转站会将生图直接放在chunk外层）
+                                if "images" in chunk and isinstance(chunk["images"], list):
+                                    extracted_images.extend(chunk["images"])
+                                if "data" in chunk and isinstance(chunk["data"], list):
+                                    extracted_data_arr.extend(chunk["data"])
+                                if "image_url" in chunk:
+                                    image_url = chunk["image_url"]
+                                    if isinstance(image_url, str):
+                                        extracted_urls.append(image_url)
+                                    elif isinstance(image_url, dict) and image_url.get("url"):
+                                        extracted_urls.append(image_url["url"])
+                                if "url" in chunk and isinstance(chunk["url"], str):
+                                    extracted_urls.append(chunk["url"])
+                            except:
+                                pass
+
+                    if valid_stream:
+                        # 重构为非流式结构以便后续处理
+                        msg_obj = {"content": full_content, "role": "assistant"}
+
+                        # 还原 tool_calls
+                        if tool_calls_buffer:
+                            msg_obj["tool_calls"] = []
+                            for idx in sorted(tool_calls_buffer.keys()):
+                                msg_obj["tool_calls"].append({
+                                    "function": {"arguments": tool_calls_buffer[idx]}
+                                })
+
+                        # 将其他提取到的数据并入
+                        if extracted_images:
+                            msg_obj["images"] = extracted_images
+                        if extracted_urls:
+                            msg_obj["images"] = msg_obj.get("images", [])
+                            msg_obj["images"].extend(extracted_urls)
+
+                        res_data = {"choices": [{"message": msg_obj, "finish_reason": "stop"}]}
+                        if extracted_data_arr:
+                            res_data["data"] = extracted_data_arr
+
+                        if not full_content and not tool_calls_buffer and not extracted_images and not extracted_data_arr and not extracted_urls:
                             for line in lines:
-                                line = line.strip()
-                                if line.startswith("data: ") and line != "data: [DONE]":
+                                if '"error"' in line:
                                     try:
-                                        chunk_str = line[6:]
-                                        if not chunk_str: continue
-                                        chunk = json.loads(chunk_str)
-                                        valid_stream = True
-                                        if "choices" in chunk and chunk["choices"]:
-                                            delta = chunk["choices"][0].get("delta", {})
-                                            
-                                            # 1. 拼接 content
-                                            if "content" in delta and delta["content"]:
-                                                full_content += delta["content"]
-                                            
-                                            # 2. 拼接 tool_calls arguments
-                                            if "tool_calls" in delta and delta["tool_calls"]:
-                                                for tc in delta["tool_calls"]:
-                                                    idx = tc.get("index", 0)
-                                                    if idx not in tool_calls_buffer:
-                                                        tool_calls_buffer[idx] = ""
-                                                    
-                                                    if "function" in tc and "arguments" in tc["function"]:
-                                                        tool_calls_buffer[idx] += tc["function"]["arguments"]
-
-                                            # 3. 捕获 delta 中的非标准图片字段（部分兼容接口会把图片放在 delta 内）
-                                            if "images" in delta and isinstance(delta["images"], list):
-                                                extracted_images.extend(delta["images"])
-                                            if "data" in delta and isinstance(delta["data"], list):
-                                                extracted_data_arr.extend(delta["data"])
-                                            if "image_url" in delta:
-                                                image_url = delta["image_url"]
-                                                if isinstance(image_url, str):
-                                                    extracted_urls.append(image_url)
-                                                elif isinstance(image_url, dict) and image_url.get("url"):
-                                                    extracted_urls.append(image_url["url"])
-                                            if "url" in delta and isinstance(delta["url"], str):
-                                                extracted_urls.append(delta["url"])
-                                        
-                                        # 4. 捕获非标准/跨界的图片字段（部分中转站会将生图直接放在chunk外层）
-                                        if "images" in chunk and isinstance(chunk["images"], list):
-                                            extracted_images.extend(chunk["images"])
-                                        if "data" in chunk and isinstance(chunk["data"], list):
-                                            extracted_data_arr.extend(chunk["data"])
-                                        if "image_url" in chunk:
-                                            image_url = chunk["image_url"]
-                                            if isinstance(image_url, str):
-                                                extracted_urls.append(image_url)
-                                            elif isinstance(image_url, dict) and image_url.get("url"):
-                                                extracted_urls.append(image_url["url"])
-                                        if "url" in chunk and isinstance(chunk["url"], str):
-                                            extracted_urls.append(chunk["url"])
+                                        chunk = json.loads(line.replace("data: ", "").strip())
+                                        if "error" in chunk:
+                                            return json.dumps(chunk["error"], ensure_ascii=False)
                                     except:
                                         pass
-                            
-                            if valid_stream:
-                                # 重构为非流式结构以便后续处理
-                                msg_obj = {"content": full_content, "role": "assistant"}
-                                
-                                # 还原 tool_calls
-                                if tool_calls_buffer:
-                                    msg_obj["tool_calls"] = []
-                                    for idx in sorted(tool_calls_buffer.keys()):
-                                        # 针对 OneAPI 类的模型：流式传回来的 arguments 可能是碎片，拼接后可能不是合法的JSON
-                                        # 但后续的 extract_image_url 可以容忍非法 JSON 并进行正则提取
-                                        msg_obj["tool_calls"].append({
-                                            "function": {"arguments": tool_calls_buffer[idx]}
-                                        })
-                                        
-                                # 将其他提取到的数据并入
-                                if extracted_images:
-                                    msg_obj["images"] = extracted_images
-                                if extracted_urls:
-                                    msg_obj["images"] = msg_obj.get("images", [])
-                                    msg_obj["images"].extend(extracted_urls)
-                                
-                                res_data = {"choices": [{"message": msg_obj, "finish_reason": "stop"}]}
-                                if extracted_data_arr:
-                                    res_data["data"] = extracted_data_arr
-                                
-                                # 如果虽然是流式，但是既没有内容也没有工具调用也没有图片，且原始返回里有错误信息
-                                if not full_content and not tool_calls_buffer and not extracted_images and not extracted_data_arr and not extracted_urls:
-                                    # 再次检查是不是把 error 藏在流里了
-                                    for line in lines:
-                                        if '"error"' in line:
-                                            try:
-                                                chunk = json.loads(line.replace("data: ", "").strip())
-                                                if "error" in chunk:
-                                                    return json.dumps(chunk["error"], ensure_ascii=False)
-                                            except: pass
-                            else:
-                                 return f"数据解析失败: 看起来是流式数据但无法解析. 内容: {resp_text[:100]}..."
-                        else:
-                            # 终极兜底：如果连 data: 都没有，但包含图片base64，尝试强行挽救
-                            b64_match = re.search(r'(data:image\/[\w\-\+\.]+(?:;base64)?,[\w\-\+\/=\s]{100,})', resp_text)
-                            if b64_match:
-                                logger.warning("在非JSON/非标准流解析失败分支中找到了base64，已挽救")
-                                res_data = {} # 置空，走后续兜底逻辑
-                                img_url = b64_match.group(1).replace("\\n", "").replace("\\r", "").replace(" ", "").replace("\\", "")
-                                if img_url.startswith("data:"):
-                                    return base64.b64decode(img_url.split(",")[-1])
-                                    
-                            pure_b64_match = re.search(r'"([A-Za-z0-9+/]{1000,}={0,2})"', resp_text)
-                            if pure_b64_match:
-                                logger.warning("在非JSON/非标准流解析失败分支中找到了纯base64，已挽救")
-                                img_url = f"data:image/png;base64,{pure_b64_match.group(1)}"
-                                return base64.b64decode(img_url.split(",")[-1])
-                            
-                            return f"数据解析失败: 返回内容不是 JSON. 内容: {resp_text[:100]}..."
+                    else:
+                        return f"数据解析失败: 看起来是流式数据但无法解析. 内容: {resp_text[:100]}..."
+                else:
+                    # 终极兜底：如果连 data: 都没有，但包含图片base64，尝试强行挽救
+                    b64_match = re.search(r'(data:image\/[\w\-\+\.]+(?:;base64)?,[\w\-\+\/=\s]{100,})', resp_text)
+                    if b64_match:
+                        logger.warning("在非JSON/非标准流解析失败分支中找到了base64，已挽救")
+                        img_url = b64_match.group(1).replace("\\n", "").replace("\\r", "").replace(" ", "").replace("\\", "")
+                        if img_url.startswith("data:"):
+                            return base64.b64decode(img_url.split(",")[-1])
+
+                    pure_b64_match = re.search(r'"([A-Za-z0-9+/]{1000,}={0,2})"', resp_text)
+                    if pure_b64_match:
+                        logger.warning("在非JSON/非标准流解析失败分支中找到了纯base64，已挽救")
+                        img_url = f"data:image/png;base64,{pure_b64_match.group(1)}"
+                        return base64.b64decode(img_url.split(",")[-1])
+
+                    return f"数据解析失败: 返回内容不是 JSON. 内容: {resp_text[:100]}... | URL: {active_url}"
 
                 if "error" in res_data:
                     return json.dumps(res_data["error"], ensure_ascii=False)
