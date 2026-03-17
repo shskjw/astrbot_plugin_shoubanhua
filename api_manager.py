@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import re
+from urllib.parse import urljoin
 import aiohttp
 from typing import List, Dict
 from astrbot import logger
@@ -53,7 +54,13 @@ class ApiManager:
                 if "b64_json" in item:
                     return f"data:image/png;base64,{item['b64_json']}"
                 if "url" in item:
-                    return item["url"]
+                    url_value = item["url"]
+                    if isinstance(url_value, str):
+                        # 兼容某些接口把纯 base64 误放进 url 字段
+                        pure_b64_match = re.fullmatch(r'[A-Za-z0-9+/]{1000,}={0,2}', url_value.strip())
+                        if pure_b64_match:
+                            return f"data:image/jpeg;base64,{url_value.strip()}"
+                    return url_value
 
             # ================== 2. OpenAI Chat Completion ==================
             # 格式: {"choices": [{"message": {"content": "..."}}]}
@@ -84,7 +91,15 @@ class ApiManager:
                             args = json.loads(func_args)
                             # 常见的参数名: url, image_url, images, file_url
                             for k in ["url", "image_url", "file_url", "link", "b64_json", "image", "data", "image_data"]:
-                                if k in args: return args[k]
+                                if k in args:
+                                    value = args[k]
+                                    if k == "b64_json" and isinstance(value, str):
+                                        return f"data:image/png;base64,{value}"
+                                    if isinstance(value, str):
+                                        pure_b64_match = re.fullmatch(r'[A-Za-z0-9+/]{1000,}={0,2}', value.strip())
+                                        if pure_b64_match:
+                                            return f"data:image/jpeg;base64,{value.strip()}"
+                                    return value
                             
                             # 尝试深度遍历寻找 base64 或 url
                             # 有的API返回 {"response": {"url": "..."}}
@@ -92,7 +107,13 @@ class ApiManager:
                                 if isinstance(d, dict):
                                     for k, v in d.items():
                                         if k in ["url", "image_url", "b64_json", "image", "data", "link"]:
-                                            if isinstance(v, str): return v
+                                            if isinstance(v, str):
+                                                if k == "b64_json":
+                                                    return f"data:image/png;base64,{v}"
+                                                pure_b64_match = re.fullmatch(r'[A-Za-z0-9+/]{1000,}={0,2}', v.strip())
+                                                if pure_b64_match:
+                                                    return f"data:image/jpeg;base64,{v.strip()}"
+                                                return v
                                         res = find_url(v)
                                         if res: return res
                                 elif isinstance(d, list):
@@ -159,6 +180,11 @@ class ApiManager:
                     # 简单的有效性检查 (Base64 长度通常较长)
                     if len(found_b64) > 100:
                         return found_b64
+
+                # 0.5 尝试匹配纯 base64 图片内容
+                pure_b64_match = re.search(r'([A-Za-z0-9+/]{1000,}={0,2})', content)
+                if pure_b64_match:
+                    return f"data:image/jpeg;base64,{pure_b64_match.group(1)}"
 
                 # 1. 尝试匹配 Markdown 图片语法 ![...](url) - 这种更精确
                 # 匹配 ![description](http...)
@@ -527,10 +553,34 @@ class ApiManager:
 
         return any(keyword in error_lower for keyword in fallback_keywords)
 
-    async def _download_result_image(self, img_url: str, proxy: str = None) -> bytes | str:
+    def _resolve_result_image_url(self, img_url: str, base_url: str = None) -> str:
+        """将模型返回的结果图地址规范化为可下载的绝对 URL"""
+        if not img_url:
+            return img_url
+
+        if img_url.startswith(("http://", "https://", "data:")):
+            return img_url
+
+        if base_url:
+            normalized_chat_url = self._normalize_generic_chat_url(base_url)
+            api_root = normalized_chat_url
+            if "/chat/completions" in api_root:
+                api_root = api_root.split("/chat/completions", 1)[0] + "/"
+            elif not api_root.endswith("/"):
+                api_root += "/"
+
+            resolved = urljoin(api_root, img_url.lstrip("/"))
+            logger.info(f"检测到相对结果图地址，已自动补全为绝对地址: {resolved}")
+            return resolved
+
+        return img_url
+
+    async def _download_result_image(self, img_url: str, proxy: str = None, base_url: str = None) -> bytes | str:
         """下载模型返回的结果图片，增加重试与容错，避免外链偶发重置导致整次任务失败"""
         if not img_url:
             return "结果图片地址为空"
+
+        img_url = self._resolve_result_image_url(img_url, base_url)
 
         session = await self._get_session()
         retries = max(1, int(self.config.get("result_image_download_retries", 3)))
@@ -961,7 +1011,7 @@ class ApiManager:
                 return base64.b64decode(img_url.split(",")[-1])
 
             # 如果是 URL，需要再次下载（增加重试与容错，避免外链偶发失败）
-            return await self._download_result_image(img_url, proxy)
+            return await self._download_result_image(img_url, proxy, base)
 
         except asyncio.TimeoutError:
             logger.error(f"API Call Timeout after {timeout_val}s")
