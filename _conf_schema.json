@@ -74,8 +74,24 @@
     "text_to_image_model": {
         "description": "【通用】文生图专用模型",
         "type": "string",
-        "hint": "文生图功能使用的模型ID。这里也可以直接填写任意模型名称，不需要出现在【核心】模型列表配置中。留空则使用默认模型。",
+        "hint": "文生图功能使用的专用模型ID。这里也可以直接填写任意模型名称，不需要出现在【核心】模型列表配置中。【非必填】留空时会自动回退使用【通用】默认模型名称，不会影响文生图功能正常使用。",
         "default": ""
+    },
+    "text_to_image_api_url": {
+        "description": "【通用】文生图专用接口地址",
+        "type": "string",
+        "hint": "仅用于文生图功能的专用 API 基础地址。支持填写基础 URL（如 https://api.example.com 或 https://api.example.com/v1），插件会自动拼接 chat/completions、images/generations、images/edits 等路径；也兼容误填完整接口路径并自动修正。【非必填】留空时会自动回退使用当前模式下的普通 API 地址，不会导致文生图不可用。",
+        "default": ""
+    },
+    "text_to_image_api_keys": {
+        "description": "【通用】文生图专用 API Key 池",
+        "type": "list",
+        "hint": "仅用于文生图功能的专用 Key 轮询池。【非必填】留空时会自动回退使用当前模式下的普通 API Key 池，不会导致文生图不可用。",
+        "items": {
+            "type": "string",
+            "description": "API Key"
+        },
+        "default": []
     },
     "image_resolution": {
         "description": "【画质】图像分辨率",

@@ -22,24 +22,52 @@ class ApiManager:
             self._session = aiohttp.ClientSession()
         return self._session
 
-    async def get_key(self, mode: str, is_power: bool) -> str | None:
+    async def get_key(self, mode: str, is_power: bool, use_text_to_image_api: bool = False) -> str | None:
         """获取轮询 Key"""
         async with self.key_lock:
             prefix = "power_" if is_power else ""
 
+            if use_text_to_image_api:
+                if mode == "gemini_official":
+                    keys = self.config.get("text_to_image_api_keys", [])
+                    if not keys:
+                        keys = self.config.get(f"{prefix}gemini_api_keys", [])
+                    if not keys and is_power:
+                        keys = self.config.get("gemini_api_keys", [])
+                    if not keys:
+                        return None
+                    k = keys[self.gemini_idx % len(keys)]
+                    self.gemini_idx += 1
+                    return k
+                else:
+                    keys = self.config.get("text_to_image_api_keys", [])
+                    if not keys:
+                        keys = self.config.get(f"{prefix}generic_api_keys", [])
+                    if not keys and is_power:
+                        keys = self.config.get("generic_api_keys", [])
+                    if not keys:
+                        return None
+                    k = keys[self.generic_idx % len(keys)]
+                    self.generic_idx += 1
+                    return k
+
             if mode == "gemini_official":
                 keys = self.config.get(f"{prefix}gemini_api_keys", [])
-                if not keys and is_power: keys = self.config.get("gemini_api_keys", [])  # Fallback
+                if not keys and is_power:
+                    keys = self.config.get("gemini_api_keys", [])  # Fallback
 
-                if not keys: return None
+                if not keys:
+                    return None
                 k = keys[self.gemini_idx % len(keys)]
                 self.gemini_idx += 1
                 return k
             else:
                 keys = self.config.get(f"{prefix}generic_api_keys", [])
-                if not keys and is_power: keys = self.config.get("generic_api_keys", [])  # Fallback
+                if not keys and is_power:
+                    keys = self.config.get("generic_api_keys", [])  # Fallback
 
-                if not keys: return None
+                if not keys:
+                    return None
                 k = keys[self.generic_idx % len(keys)]
                 self.generic_idx += 1
                 return k
@@ -539,6 +567,12 @@ class ApiManager:
             "images/edits",
             "not a chat model",
             "image generation model",
+            # 中文兼容层常见报错
+            "暂不支持该接口",
+            "不支持该接口",
+            "当前接口不支持",
+            "该接口暂不支持",
+            "接口不支持",
             # 有些兼容层即使是文生图，也会错误地回这类 image edits / missing_image 提示
             "image_url is required for image edits",
             "missing_image",
@@ -617,23 +651,40 @@ class ApiManager:
         return f"结果图片下载失败: {last_error}"
 
     async def call_api(self, images: List[bytes], prompt: str,
-                       model: str, use_power: bool, proxy: str = None) -> bytes | str:
+                       model: str, use_power: bool, proxy: str = None,
+                       use_text_to_image_api: bool = False) -> bytes | str:
         """核心生成逻辑"""
 
         mode = self.config.get("api_mode", "generic")
 
         # 1. 确定 URL
         prefix = "power_" if use_power else ""
-        if mode == "gemini_official":
-            base = self.config.get(f"{prefix}gemini_api_url") or self.config.get("gemini_api_url")
+        if use_text_to_image_api:
+            if mode == "gemini_official":
+                base = (
+                    self.config.get("text_to_image_api_url")
+                    or self.config.get(f"{prefix}gemini_api_url")
+                    or self.config.get("gemini_api_url")
+                )
+            else:
+                base = (
+                    self.config.get("text_to_image_api_url")
+                    or self.config.get(f"{prefix}generic_api_url")
+                    or self.config.get("generic_api_url")
+                )
         else:
-            base = self.config.get(f"{prefix}generic_api_url") or self.config.get("generic_api_url")
+            if mode == "gemini_official":
+                base = self.config.get(f"{prefix}gemini_api_url") or self.config.get("gemini_api_url")
+            else:
+                base = self.config.get(f"{prefix}generic_api_url") or self.config.get("generic_api_url")
 
-        if not base: return "API URL 未配置"
+        if not base:
+            return "API URL 未配置"
 
         # 2. 获取 Key
-        key = await self.get_key(mode, use_power)
-        if not key: return "无可用 API Key"
+        key = await self.get_key(mode, use_power, use_text_to_image_api=use_text_to_image_api)
+        if not key:
+            return "无可用 API Key"
 
         # 3. 构造请求
         headers = {"Content-Type": "application/json"}
