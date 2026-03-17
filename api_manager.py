@@ -197,23 +197,25 @@ class ApiManager:
             return 'image/webp'
         return 'image/png' # 默认
 
-    def _convert_to_images_api_url(self, chat_url: str) -> str:
-        """将 chat/completions URL 转换为 images/generations URL"""
+    def _convert_to_images_api_url(self, chat_url: str, has_input_image: bool = False) -> str:
+        """将 chat/completions URL 转换为图片接口 URL；有输入图时优先使用 edits"""
         url = chat_url.rstrip("/")
+        endpoint = "images/edits" if has_input_image else "images/generations"
         if "chat/completions" in url:
-            return url.replace("chat/completions", "images/generations")
+            return url.replace("chat/completions", endpoint)
         elif url.endswith("/v1"):
-            return f"{url}/images/generations"
+            return f"{url}/{endpoint}"
         elif "/v1" in url:
             idx = url.find("/v1") + 3
-            return f"{url[:idx]}/images/generations"
-        return f"{url}/v1/images/generations"
+            return f"{url[:idx]}/{endpoint}"
+        return f"{url}/v1/{endpoint}"
 
     async def call_images_api(self, images: List[bytes], prompt: str,
                                model: str, key: str, base_url: str, proxy: str = None) -> bytes | str:
         """调用 Images API (DALL-E 风格接口) - 作为 fallback"""
         
-        url = self._convert_to_images_api_url(base_url)
+        has_input_image = bool(images)
+        url = self._convert_to_images_api_url(base_url, has_input_image=has_input_image)
         logger.info(f"Fallback to Images API: {url}")
         
         headers = {
@@ -233,12 +235,17 @@ class ApiManager:
             "response_format": "b64_json"
         }
         
-        # 如果有输入图片，尝试添加 image 参数（某些 API 支持）
+        # 如果有输入图片，兼容不同 Images API 的字段要求
+        # 一些服务要求 image_url；另一些只认 image / input_image / images
         if images:
             img = images[0]
             mime = self.get_mime_type(img)
             b64_img = base64.b64encode(img).decode()
-            payload["image"] = f"data:{mime};base64,{b64_img}"
+            data_uri = f"data:{mime};base64,{b64_img}"
+            payload["image"] = data_uri
+            payload["image_url"] = data_uri
+            payload["input_image"] = data_uri
+            payload["images"] = [data_uri]
         
         try:
             timeout_val = self.config.get("timeout", 120)
@@ -300,6 +307,29 @@ class ApiManager:
             "not a chat model",
             "image generation model"
         ])
+
+    def _should_fallback_to_images_api(self, error_msg: str, has_input_image: bool = False) -> bool:
+        """检查是否应切换到 Images API，包括部分图片编辑兼容报错"""
+        error_lower = (error_msg or "").lower()
+        fallback_keywords = [
+            "does not support chat completions",
+            "not support chat",
+            "chat completions not supported",
+            "use images api",
+            "images/generations",
+            "images/edits",
+            "not a chat model",
+            "image generation model"
+        ]
+        if has_input_image:
+            fallback_keywords.extend([
+                "image_url is required for image edits",
+                "missing_image",
+                "image edits",
+                "input_image",
+                "image_url is required"
+            ])
+        return any(keyword in error_lower for keyword in fallback_keywords)
 
     async def _download_result_image(self, img_url: str, proxy: str = None) -> bytes | str:
         """下载模型返回的结果图片，增加重试与容错，避免外链偶发重置导致整次任务失败"""
@@ -465,9 +495,9 @@ class ApiManager:
                         if "error" in err_json:
                             err_msg = json.dumps(err_json['error'], ensure_ascii=False)
                             
-                            # 检查是否是 chat completions 不支持的错误，自动切换到 Images API
-                            if mode == "generic" and self._is_chat_not_supported_error(err_msg):
-                                logger.info(f"模型 {model} 不支持 chat completions，自动切换到 Images API")
+                            # 检查是否应自动切换到 Images API（包括部分图编模型兼容层）
+                            if mode == "generic" and self._should_fallback_to_images_api(err_msg, bool(images)):
+                                logger.info(f"模型 {model} 当前错误适合切换到 Images API，自动回退处理")
                                 return await self.call_images_api(images, prompt, model, key, base, proxy)
                             
                             return f"API Error {resp.status}: {err_msg}"
@@ -476,9 +506,9 @@ class ApiManager:
                     if "<html" in resp_text.lower():
                         return f"HTTP {resp.status}: 服务端返回了网页而非数据，请检查URL配置。"
                     
-                    # 检查原始响应文本是否包含不支持 chat 的错误
-                    if mode == "generic" and self._is_chat_not_supported_error(resp_text):
-                        logger.info(f"模型 {model} 不支持 chat completions，自动切换到 Images API")
+                    # 检查原始响应文本是否适合自动切换到 Images API
+                    if mode == "generic" and self._should_fallback_to_images_api(resp_text, bool(images)):
+                        logger.info(f"模型 {model} 当前错误适合切换到 Images API，自动回退处理")
                         return await self.call_images_api(images, prompt, model, key, base, proxy)
                     
                     # Return error if status != 200
