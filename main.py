@@ -1603,19 +1603,24 @@ class FigurineProPlugin(Star):
                     feedback += f"\n⏳ 将分别处理 {total_images} 张图片..."
                 await event.send(event.chain_result([Plain(feedback)]))
 
-            # 依次等待每张图片处理完成，避免图片还没发完就提前返回
+            # 多张图片分别处理时也走并发，避免 LLM 识别到多图后仍然一张张串行跑
             await self._register_pending_generation(event.unified_msg_origin, total_images * count)
-            for img in images:
-                if count == 1:
-                    await self._run_background_task(
-                        event, [img], final_prompt, preset_name, deduction, uid, gid, count,
-                        extra_rules, hide_text=hide_llm_progress, charge_quota=False
-                    )
-                else:
-                    await self._run_batch_image_to_image(
-                        event, [img], final_prompt, preset_name, deduction, uid, gid,
-                        count, extra_rules, hide_llm_progress, charge_quota=False
-                    )
+            semaphore = asyncio.Semaphore(max(1, self.conf.get("batch_concurrency", 3)))
+
+            async def process_single_source(img: bytes):
+                async with semaphore:
+                    if count == 1:
+                        await self._run_background_task(
+                            event, [img], final_prompt, preset_name, deduction, uid, gid, count,
+                            extra_rules, hide_text=hide_llm_progress, charge_quota=False
+                        )
+                    else:
+                        await self._run_batch_image_to_image(
+                            event, [img], final_prompt, preset_name, deduction, uid, gid,
+                            count, extra_rules, hide_llm_progress, charge_quota=False
+                        )
+
+            await asyncio.gather(*(process_single_source(img) for img in images))
 
             vip_hint = self._build_master_identity_hint(uid, event, explicit_master=True) if self._is_vip_user(uid, event) else ""
             rebellious_hint = vip_hint or self._get_rebellious_hint(prompt, uid, event)
@@ -3020,6 +3025,15 @@ class FigurineProPlugin(Star):
             max_images(int): 最多处理的图片数量，默认10张
             output_as_pdf(boolean): 用户是否明确要求将生成的多张图片打包成PDF输出，默认False
         '''
+        # 统一转发到并发版本，避免 LLM 误调用本工具时退化成串行处理
+        return await self.batch_process_concurrent_tool(
+            event=event,
+            prompt=prompt,
+            max_images=max_images,
+            concurrency=self.conf.get("batch_concurrency", 3),
+            output_as_pdf=output_as_pdf
+        )
+
         # 0. 读取配置中的限制
         conf_max_images = self.conf.get("batch_max_images", 10)
         max_images = min(max_images, conf_max_images) if max_images > 0 else conf_max_images
