@@ -64,6 +64,33 @@ class ImageManager:
             logger.warning(f"Image conversion/resize failed: {e}")
             return raw
 
+    def _is_avatar_source(self, src: str) -> bool:
+        """判断一个来源是否明显是平台头像，而不是用户主动发送的图片"""
+        if src is None:
+            return False
+
+        try:
+            text = str(src).strip().lower()
+        except Exception:
+            return False
+
+        if not text:
+            return False
+
+        avatar_keywords = [
+            "qlogo.cn",
+            "q1.qlogo.cn",
+            "q2.qlogo.cn",
+            "q3.qlogo.cn",
+            "q4.qlogo.cn",
+            "thirdqq.qlogo.cn",
+            "headimg",
+            "/avatar",
+            "useravatar",
+            "getavatar",
+        ]
+        return any(keyword in text for keyword in avatar_keywords)
+
     def _is_probably_valid_source(self, src: str) -> bool:
         """判断一个图片来源字符串是否值得继续尝试加载"""
         if src is None:
@@ -75,6 +102,9 @@ class ImageManager:
             return False
 
         if not src:
+            return False
+
+        if self._is_avatar_source(src):
             return False
 
         if src.startswith("http://") or src.startswith("https://") or src.startswith("base64://"):
@@ -337,7 +367,8 @@ class ImageManager:
 
         return pdf_bytes
 
-    async def extract_images_from_event(self, event: AstrMessageEvent, ignore_id: str = None, context=None) -> List[bytes]:
+    async def extract_images_from_event(self, event: AstrMessageEvent, ignore_id: str = None, context=None,
+                                        include_at_avatar: bool = True) -> List[bytes]:
         """从消息事件中提取所有图片 - 并发加速"""
         tasks = []
         at_users = set()  # 使用集合去重
@@ -403,7 +434,7 @@ class ImageManager:
             at_users.add(qq)
 
         # 4. 头像任务 (去重后)
-        if at_users:
+        if include_at_avatar and at_users:
             logger.debug(f"At users to fetch avatars: {at_users}")
             for uid in at_users:
                 tasks.append(self.get_avatar(uid))

@@ -2539,7 +2539,8 @@ class FigurineProPlugin(Star):
 
     # ================= 批量处理图片功能 =================
 
-    async def _collect_images_from_context(self, session_id: str, count: int = 10, include_bot: bool = False) -> List[Tuple[str, List[str]]]:
+    async def _collect_images_from_context(self, session_id: str, count: int = 10,
+                                           include_bot: bool = False) -> List[Tuple[str, List[str]]]:
         """
         从上下文中收集图片
 
@@ -2558,9 +2559,58 @@ class FigurineProPlugin(Star):
             if msg.has_image and msg.image_urls:
                 if not include_bot and msg.is_bot:
                     continue
-                result.append((msg.msg_id, msg.image_urls))
+
+                filtered_urls = []
+                seen_urls = set()
+                for url in msg.image_urls:
+                    if not self.img_mgr._is_probably_valid_source(url):
+                        continue
+                    if url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+                    filtered_urls.append(url)
+
+                if filtered_urls:
+                    result.append((msg.msg_id, filtered_urls))
 
         return result
+
+    def _merge_batch_image_urls(self, current_urls: List[str], context_image_sources: List[Tuple[str, List[str]]],
+                                max_images: int = 10, prefer_current: bool = True) -> List[str]:
+        """
+        批量任务统一的图片顺序整理逻辑：
+        1. 优先使用当前消息中的图片，保持用户发送顺序
+        2. 当前消息没有图片时，再回退到上下文中的历史图片
+        3. 全程过滤头像/无效来源并去重
+        """
+        all_image_urls = []
+        seen_urls = set()
+
+        def add_url(url: str):
+            if not self.img_mgr._is_probably_valid_source(url):
+                return
+            if url in seen_urls:
+                return
+            seen_urls.add(url)
+            all_image_urls.append(url)
+
+        has_current_inputs = bool(current_urls) and prefer_current
+
+        if has_current_inputs:
+            for url in current_urls:
+                add_url(url)
+        else:
+            for _, urls in reversed(context_image_sources):
+                for url in urls:
+                    add_url(url)
+
+            # 上面是从最新消息开始收集，为了让最终处理顺序符合用户看到的时间线，这里反转回来
+            all_image_urls.reverse()
+
+        if max_images > 0:
+            all_image_urls = all_image_urls[:max_images]
+
+        return all_image_urls
 
     async def _gather_images_for_pdf(self, event: AstrMessageEvent, max_images: int = 10,
                                      wait_for_generation: bool = True) -> List[bytes]:
@@ -2978,43 +3028,9 @@ class FigurineProPlugin(Star):
         if not image_sources and not current_urls and not pdf_extracted_urls:
             return "❌ 未在上下文中找到图片或PDF。请先发送图片/PDF，然后再使用批量处理功能。"
 
-        # 3. 收集所有图片URL（去重，优先当前消息；当前消息有图时，不再混入历史上下文图片）
-        all_image_urls = []
-        seen_urls = set()
-
-        has_current_inputs = bool(current_urls or pdf_extracted_urls)
-
-        # 先添加当前消息中从 PDF 提取的图片
-        for url in pdf_extracted_urls:
-            if url not in seen_urls:
-                all_image_urls.append(url)
-                seen_urls.add(url)
-
-        # 添加当前消息的普通图片
-        for url in current_urls:
-            if url not in seen_urls:
-                all_image_urls.append(url)
-                seen_urls.add(url)
-
-        # 只有当前消息没有提供图片/PDF时，才回退到上下文中找历史图片
-        if not has_current_inputs:
-            # 倒序遍历上下文（从最新消息开始）
-            for msg_id, urls in reversed(image_sources):
-                # 一条消息内的图片按正常顺序遍历
-                for url in urls:
-                    if url not in seen_urls:
-                        all_image_urls.append(url)
-                        seen_urls.add(url)
-
-        # 限制数量（保留最新的 max_images 张）
-        if max_images > 0:
-            all_image_urls = all_image_urls[:max_images]
-
-        # 仅在回退使用历史上下文图片时才反转顺序；
-        # 当前消息自带图片时，保持用户原始上传顺序不变
-        if not has_current_inputs:
-            all_image_urls.reverse()
-
+        # 3. 收集所有图片URL（统一过滤头像、去重并按顺序整理）
+        merged_current_urls = list(pdf_extracted_urls) + list(current_urls)
+        all_image_urls = self._merge_batch_image_urls(merged_current_urls, image_sources, max_images=max_images)
         total_images = len(all_image_urls)
         if total_images == 0:
             return "❌ 未找到有效的图片URL。"
@@ -3303,42 +3319,9 @@ class FigurineProPlugin(Star):
         if not image_sources and not current_urls and not pdf_extracted_urls:
             return "❌ 未在上下文中找到图片或PDF。请先发送图片/PDF，然后再使用批量处理功能。"
 
-        # 3. 收集所有图片URL（去重，优先当前消息；当前消息有图时，不再混入历史上下文图片）
-        all_image_urls = []
-        seen_urls = set()
-
-        has_current_inputs = bool(current_urls or pdf_extracted_urls)
-
-        # 先添加当前消息中从 PDF 提取的图片
-        for url in pdf_extracted_urls:
-            if url not in seen_urls:
-                all_image_urls.append(url)
-                seen_urls.add(url)
-
-        # 添加当前消息的普通图片
-        for url in current_urls:
-            if url not in seen_urls:
-                all_image_urls.append(url)
-                seen_urls.add(url)
-
-        # 只有当前消息没有提供图片/PDF时，才回退到上下文中找历史图片
-        if not has_current_inputs:
-            # 倒序遍历上下文（从最新消息开始）
-            for msg_id, urls in reversed(image_sources):
-                for url in urls:
-                    if url not in seen_urls:
-                        all_image_urls.append(url)
-                        seen_urls.add(url)
-
-        # 限制数量（保留最新的 max_images 张）
-        if max_images > 0:
-            all_image_urls = all_image_urls[:max_images]
-
-        # 仅在回退使用历史上下文图片时才反转顺序；
-        # 当前消息自带图片时，保持用户原始上传顺序不变
-        if not has_current_inputs:
-            all_image_urls.reverse()
-
+        # 3. 收集所有图片URL（统一过滤头像、去重并按顺序整理）
+        merged_current_urls = list(pdf_extracted_urls) + list(current_urls)
+        all_image_urls = self._merge_batch_image_urls(merged_current_urls, image_sources, max_images=max_images)
         total_images = len(all_image_urls)
         if total_images == 0:
             return "❌ 未找到有效的图片URL。"
@@ -3950,37 +3933,9 @@ class FigurineProPlugin(Star):
             yield event.chain_result([Plain("❌ 未在上下文中找到图片。请先发送图片，然后再使用批量处理功能。")])
             return
 
-        # 3. 收集所有图片URL（优先当前消息；当前消息有图时，不再混入历史上下文图片）
-        all_image_urls = []
-        seen_urls = set()
-
-        has_current_inputs = bool(current_urls)
-
-        # 先添加当前消息的图片
-        for url in current_urls:
-            if url not in seen_urls:
-                all_image_urls.append(url)
-                seen_urls.add(url)
-
-        # 只有当前消息没有提供图片时，才回退到上下文中找历史图片
-        if not has_current_inputs:
-            # 倒序遍历上下文
-            for msg_id, urls in reversed(image_sources):
-                for url in urls:
-                    if url not in seen_urls:
-                        all_image_urls.append(url)
-                        seen_urls.add(url)
-
-        # 限制数量
+        # 3. 收集所有图片URL（统一过滤头像、去重并按顺序整理）
         max_images = self.conf.get("batch_max_images", 10)
-        if max_images > 0:
-            all_image_urls = all_image_urls[:max_images]
-
-        # 仅在回退使用历史上下文图片时才反转顺序；
-        # 当前消息自带图片时，保持用户原始上传顺序不变
-        if not has_current_inputs:
-            all_image_urls.reverse()
-
+        all_image_urls = self._merge_batch_image_urls(current_urls, image_sources, max_images=max_images)
         total_images = len(all_image_urls)
         if total_images == 0:
             yield event.chain_result([Plain("❌ 未找到有效的图片。")])
