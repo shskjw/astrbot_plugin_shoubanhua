@@ -838,6 +838,27 @@ class FigurineProPlugin(Star):
                 task["running"] = False
                 task["finished_at"] = datetime.now().isoformat(timespec="seconds")
 
+    def _build_active_task_reply(self, active_task: Optional[Dict[str, Any]]) -> str:
+        """构建进行中任务的统一回复，避免用户催促时重复开新任务"""
+        if not active_task:
+            return ""
+
+        task_type = active_task.get("task_type", "批量任务")
+        current = max(0, int(active_task.get("current", 0) or 0))
+        total = max(0, int(active_task.get("total", 0) or 0))
+        success = max(0, int(active_task.get("success", 0) or 0))
+        fail = max(0, int(active_task.get("fail", 0) or 0))
+
+        if total > 0:
+            return (
+                f"当前已有进行中的{task_type}，"
+                f"进度 {current}/{total}，"
+                f"成功 {success} 张，失败 {fail} 张。"
+                f"这次先别重复开新任务，继续等我把这批处理完。"
+            )
+
+        return f"当前已有进行中的{task_type}，先别重复开新任务，继续等待即可。"
+
     async def _can_pack_pdf_now(self, event: AstrMessageEvent, gathered_images: Optional[List[bytes]] = None) -> Tuple[bool, str]:
         """校验当前是否满足打包 PDF 的前置条件：必须有成功生成结果或当前上下文存在明确有效图片"""
         session_id = event.unified_msg_origin
@@ -1512,10 +1533,25 @@ class FigurineProPlugin(Star):
             bot_id = self._get_bot_id(event)
             images = await self.img_mgr.extract_images_from_event(event, ignore_id=bot_id, context=self.context)
 
-        # 检查上下文图片
+        # 检查上下文图片（优先最近生成缓存，再回退到上下文，且允许取到 Bot 刚发送的图）
         if not images:
             session_id = event.unified_msg_origin
-            image_sources = await self._collect_images_from_context(session_id, count=self._context_rounds)
+
+            # 1. 优先使用当前会话最近成功生成的图片缓存，避免“刚发的图”还没稳定进入上下文时丢失
+            cached_limit = 3 if merge_multiple_images else 1
+            recent_generated = await self._get_recent_generated_images(session_id, max_images=cached_limit)
+            if recent_generated:
+                if merge_multiple_images:
+                    images.extend(recent_generated[-3:])
+                else:
+                    images.append(recent_generated[-1])
+
+        if not images:
+            # 2. 再从上下文中回退，并允许包含 Bot 发出的最近图片
+            session_id = event.unified_msg_origin
+            image_sources = await self._collect_images_from_context(
+                session_id, count=self._context_rounds, include_bot=True
+            )
 
             all_urls = []
             for _, urls in image_sources:
@@ -2265,7 +2301,13 @@ class FigurineProPlugin(Star):
             bot_id = self._get_bot_id(event)
             images = await self.img_mgr.extract_images_from_event(event, ignore_id=bot_id, context=self.context)
 
-            # 如果当前消息没有图片，尝试从上下文获取
+            # 如果当前消息没有图片，优先尝试使用会话内最近成功生成的图片缓存
+            if not images:
+                recent_generated = await self._get_recent_generated_images(event.unified_msg_origin, max_images=3)
+                if recent_generated:
+                    images.extend(recent_generated[-3:])
+
+            # 如果仍然没有图片，再尝试从上下文获取最后一条带图消息（包含 Bot 刚发送的图）
             if not images and context_messages:
                 last_img_msg = self.ctx_mgr.get_last_image_message(context_messages)
                 if last_img_msg and last_img_msg.image_urls:
@@ -2988,12 +3030,7 @@ class FigurineProPlugin(Star):
 
         active_task = await self._get_active_session_task(event.unified_msg_origin)
         if active_task:
-            return (
-                f"[TOOL_SUCCESS] 当前已有进行中的{active_task.get('task_type', '批量任务')}，"
-                f"进度 {active_task.get('current', 0)}/{active_task.get('total', 0)}，"
-                f"成功 {active_task.get('success', 0)} 张，失败 {active_task.get('fail', 0)} 张。"
-                f"请不要重复创建任务，继续等待即可。"
-            )
+            return f"[TOOL_SUCCESS] {self._build_active_task_reply(active_task)}"
 
         # 0.1 检查图片生成冷却时间
         uid = norm_id(event.get_sender_id())
@@ -3280,12 +3317,7 @@ class FigurineProPlugin(Star):
 
         active_task = await self._get_active_session_task(event.unified_msg_origin)
         if active_task:
-            return (
-                f"[TOOL_SUCCESS] 当前已有进行中的{active_task.get('task_type', '批量任务')}，"
-                f"进度 {active_task.get('current', 0)}/{active_task.get('total', 0)}，"
-                f"成功 {active_task.get('success', 0)} 张，失败 {active_task.get('fail', 0)} 张。"
-                f"请不要重复创建任务，继续等待即可。"
-            )
+            return f"[TOOL_SUCCESS] {self._build_active_task_reply(active_task)}"
 
         # 0.1 检查图片生成冷却时间
         uid = norm_id(event.get_sender_id())
@@ -3920,6 +3952,11 @@ class FigurineProPlugin(Star):
 
         # 阻止事件继续传递给 on_figurine_request
         event.stop_event()
+
+        active_task = await self._get_active_session_task(event.unified_msg_origin)
+        if active_task:
+            yield event.chain_result([Plain(self._build_active_task_reply(active_task))])
+            return
 
         # 1. 提取当前消息的图片 URL（包括引用消息中的图片）
         msg_info = self._extract_message_info(event)
