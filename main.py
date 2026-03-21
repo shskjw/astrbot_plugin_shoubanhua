@@ -800,6 +800,22 @@ class FigurineProPlugin(Star):
             return cached[-max_images:]
         return cached
 
+    async def _get_recent_generated_image_sources(self, session_id: str, max_images: int = 0) -> List[str]:
+        """将最近成功生成的图片缓存转换为可复用的 base64 来源。"""
+        cached = await self._get_recent_generated_images(session_id, max_images=max_images)
+        if not cached:
+            return []
+
+        import base64
+
+        sources: List[str] = []
+        for image_bytes in cached:
+            if not isinstance(image_bytes, bytes) or not image_bytes:
+                continue
+            sources.append(f"base64://{base64.b64encode(image_bytes).decode()}")
+
+        return sources
+
     def _get_conf_bool(self, key: str, default: bool = False) -> bool:
         """兼容字符串/数字形式的布尔配置，避免 bool('false') 误判为 True。"""
         value = self.conf.get(key, default)
@@ -822,22 +838,14 @@ class FigurineProPlugin(Star):
         return self._get_conf_bool("debug_mode", False)
 
     def _format_success_timing(self, elapsed: float | None = None) -> str:
-        """统一格式化成功耗时，优先显示上游/下载拆分。"""
+        """统一格式化成功耗时，对外仅显示总耗时。"""
         metrics = self.api_mgr.get_last_metrics() if hasattr(self.api_mgr, "get_last_metrics") else {}
 
         total_duration = float(metrics.get("total_duration", 0.0) or 0.0)
-        upstream_duration = float(metrics.get("upstream_duration", 0.0) or 0.0)
-        download_duration = float(metrics.get("download_duration", 0.0) or 0.0)
 
         total = total_duration or float(elapsed or 0.0)
         if total <= 0:
             return ""
-
-        if upstream_duration > 0 and download_duration > 0.01:
-            return f"总{total:.2f}s | 上游{upstream_duration:.2f}s | 下载{download_duration:.2f}s"
-
-        if upstream_duration > 0:
-            return f"总{total:.2f}s | 上游{upstream_duration:.2f}s"
 
         return f"{total:.2f}s"
 
@@ -3288,13 +3296,18 @@ class FigurineProPlugin(Star):
                 
         # 2. 获取上下文中的图片
         session_id = event.unified_msg_origin
-        image_sources = await self._collect_images_from_context(session_id, count=self._context_rounds)
+        image_sources = await self._collect_images_from_context(
+            session_id,
+            count=self._context_rounds,
+            include_bot=True
+        )
+        cached_image_sources = await self._get_recent_generated_image_sources(session_id, max_images=max_images)
 
-        if not image_sources and not current_urls and not pdf_extracted_urls:
+        if not image_sources and not current_urls and not pdf_extracted_urls and not cached_image_sources:
             return "❌ 未在上下文中找到图片或PDF。请先发送图片/PDF，然后再使用批量处理功能。"
 
         # 3. 收集所有图片URL（统一过滤头像、去重并按顺序整理）
-        merged_current_urls = list(pdf_extracted_urls) + list(current_urls)
+        merged_current_urls = list(pdf_extracted_urls) + list(current_urls) + list(cached_image_sources)
         all_image_urls = self._merge_batch_image_urls(merged_current_urls, image_sources, max_images=max_images)
         total_images = len(all_image_urls)
         if total_images == 0:
@@ -3557,13 +3570,18 @@ class FigurineProPlugin(Star):
                 
         # 2. 获取上下文中的图片
         session_id = event.unified_msg_origin
-        image_sources = await self._collect_images_from_context(session_id, count=self._context_rounds)
+        image_sources = await self._collect_images_from_context(
+            session_id,
+            count=self._context_rounds,
+            include_bot=True
+        )
+        cached_image_sources = await self._get_recent_generated_image_sources(session_id, max_images=max_images)
 
-        if not image_sources and not current_urls and not pdf_extracted_urls:
+        if not image_sources and not current_urls and not pdf_extracted_urls and not cached_image_sources:
             return "❌ 未在上下文中找到图片或PDF。请先发送图片/PDF，然后再使用批量处理功能。"
 
         # 3. 收集所有图片URL（统一过滤头像、去重并按顺序整理）
-        merged_current_urls = list(pdf_extracted_urls) + list(current_urls)
+        merged_current_urls = list(pdf_extracted_urls) + list(current_urls) + list(cached_image_sources)
         all_image_urls = self._merge_batch_image_urls(merged_current_urls, image_sources, max_images=max_images)
         total_images = len(all_image_urls)
         if total_images == 0:
@@ -4168,18 +4186,24 @@ class FigurineProPlugin(Star):
         # 1. 提取当前消息的图片 URL（包括引用消息中的图片）
         msg_info = self._extract_message_info(event)
         current_urls = msg_info.get("image_urls", [])
+        max_images = self.conf.get("batch_max_images", 10)
 
         # 2. 获取上下文中的图片
         session_id = event.unified_msg_origin
-        image_sources = await self._collect_images_from_context(session_id, count=self._context_rounds)
+        image_sources = await self._collect_images_from_context(
+            session_id,
+            count=self._context_rounds,
+            include_bot=True
+        )
+        cached_image_sources = await self._get_recent_generated_image_sources(session_id, max_images=max_images)
 
-        if not image_sources and not current_urls:
+        if not image_sources and not current_urls and not cached_image_sources:
             yield event.chain_result([Plain("❌ 未在上下文中找到图片。请先发送图片，然后再使用批量处理功能。")])
             return
 
         # 3. 收集所有图片URL（统一过滤头像、去重并按顺序整理）
-        max_images = self.conf.get("batch_max_images", 10)
-        all_image_urls = self._merge_batch_image_urls(current_urls, image_sources, max_images=max_images)
+        merged_current_urls = list(current_urls) + list(cached_image_sources)
+        all_image_urls = self._merge_batch_image_urls(merged_current_urls, image_sources, max_images=max_images)
         total_images = len(all_image_urls)
         if total_images == 0:
             yield event.chain_result([Plain("❌ 未找到有效的图片。")])
