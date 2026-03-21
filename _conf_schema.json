@@ -214,6 +214,18 @@
         "hint": "API 请求和图片下载的最大等待时间。",
         "default": 120
     },
+    "result_image_download_timeout": {
+        "description": "【网络】结果图下载超时 (秒)",
+        "type": "int",
+        "hint": "用于下载模型返回的最终图片地址。留空或设为0时自动跟随【网络】请求超时时间。遇到 Google Storage 等外链较慢时可适当调大，如 180-300 秒。",
+        "default": 0
+    },
+    "result_image_download_retries": {
+        "description": "【网络】结果图下载重试次数",
+        "type": "int",
+        "hint": "下载模型返回的结果图片失败时的自动重试次数。若启用了代理，针对部分 Google 外链还会额外尝试一次直连回退。",
+        "default": 4
+    },
     "use_stream": {
         "description": "【网络】启用流式请求（仅generic模式）",
         "type": "bool",

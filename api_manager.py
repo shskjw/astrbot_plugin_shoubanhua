@@ -3,6 +3,7 @@ import base64
 import json
 import re
 from urllib.parse import urljoin
+from urllib.parse import urlparse
 import aiohttp
 from typing import List, Dict
 from astrbot import logger
@@ -617,35 +618,63 @@ class ApiManager:
         img_url = self._resolve_result_image_url(img_url, base_url)
 
         session = await self._get_session()
-        retries = max(1, int(self.config.get("result_image_download_retries", 3)))
-        timeout_val = max(10, int(self.config.get("result_image_download_timeout", 60)))
-        timeout = aiohttp.ClientTimeout(total=timeout_val)
+        request_timeout = max(30, int(self.config.get("timeout", 120)))
+        configured_timeout = int(self.config.get("result_image_download_timeout", 0) or 0)
+        timeout_val = max(30, configured_timeout or request_timeout, request_timeout)
+        retries = max(2, int(self.config.get("result_image_download_retries", 4)))
+        timeout = aiohttp.ClientTimeout(
+            total=timeout_val,
+            sock_read=timeout_val,
+        )
 
         headers = {
             "User-Agent": self.config.get(
                 "result_image_user_agent",
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
-            )
+            ),
+            "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            "Connection": "keep-alive",
         }
 
-        last_error = ""
-        for attempt in range(1, retries + 1):
-            try:
-                async with session.get(img_url, proxy=proxy, timeout=timeout, headers=headers) as img_resp:
-                    if img_resp.status != 200:
-                        last_error = f"下载结果图失败，HTTP {img_resp.status}"
-                    else:
-                        data = await img_resp.read()
-                        if data:
-                            return data
-                        last_error = "下载结果图失败，返回内容为空"
-            except asyncio.TimeoutError:
-                last_error = f"下载结果图超时 ({timeout_val}s)"
-            except Exception as e:
-                last_error = str(e) or type(e).__name__
+        parsed = urlparse(img_url)
+        host = (parsed.netloc or "").lower()
+        should_try_direct_fallback = bool(proxy) and any(
+            keyword in host for keyword in [
+                "googleapis.com",
+                "googleusercontent.com",
+                "gstatic.com",
+                "storage.googleapis.com",
+            ]
+        )
 
-            if attempt < retries:
-                await asyncio.sleep(min(2 * attempt, 5))
+        proxy_candidates = [proxy]
+        if should_try_direct_fallback:
+            proxy_candidates.append(None)
+
+        last_error = ""
+        for proxy_index, current_proxy in enumerate(proxy_candidates, 1):
+            for attempt in range(1, retries + 1):
+                try:
+                    async with session.get(img_url, proxy=current_proxy, timeout=timeout, headers=headers) as img_resp:
+                        if img_resp.status != 200:
+                            last_error = f"下载结果图失败，HTTP {img_resp.status}"
+                        else:
+                            data = await img_resp.read()
+                            if data:
+                                if proxy_index > 1:
+                                    logger.info(f"结果图下载通过直连回退成功: {img_url[:120]}")
+                                return data
+                            last_error = "下载结果图失败，返回内容为空"
+                except asyncio.TimeoutError:
+                    last_error = f"下载结果图超时 ({timeout_val}s)"
+                except Exception as e:
+                    last_error = str(e) or type(e).__name__
+
+                if attempt < retries:
+                    await asyncio.sleep(min(2 * attempt, 5))
+
+            if proxy_index == 1 and should_try_direct_fallback:
+                logger.warning(f"结果图经代理下载失败，准备尝试直连回退: {img_url[:120]} | {last_error}")
 
         logger.error(f"结果图下载失败: {img_url[:120]} | {last_error}")
         return f"结果图片下载失败: {last_error}"
