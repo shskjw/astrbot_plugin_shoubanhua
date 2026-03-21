@@ -860,9 +860,15 @@ class ApiManager:
         url = base.rstrip("/")
 
         # 对于明确使用 Generic 图片接口的站点，可配置为优先直连 Images API
+        # 但当输入为多图时，优先走 chat/completions 以保留全部参考图（Images API 常只接受单图编辑）。
         if mode == "generic" and self.config.get("generic_prefer_images_api", False):
-            logger.info("已启用 generic_prefer_images_api，优先直接走 Images API")
-            return await self.call_images_api(images, prompt, model, key, base, proxy)
+            if len(images) <= 1:
+                logger.info("已启用 generic_prefer_images_api，优先直接走 Images API")
+                return await self.call_images_api(images, prompt, model, key, base, proxy)
+            logger.info(
+                "generic_prefer_images_api 已启用，但检测到多图输入，"
+                "为保留全部参考图改走 chat/completions"
+            )
 
         # 画质强化 Prompt
         res_set = self.config.get("image_resolution", "1K")

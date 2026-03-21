@@ -991,7 +991,39 @@ class FigurineProPlugin(Star):
         if str(masked).strip() in low_level_failures:
             masked = default_msg
         masked = str(masked).removeprefix("❌").strip()
-        return f"[TOOL_FAILED] {masked}。请直接自然告诉用户这次没弄好，不要暴露系统报错、工具调用或调试细节。"
+        return self._finalize_llm_tool_result(
+            f"[TOOL_FAILED] {masked}。请直接自然告诉用户这次没弄好，不要暴露系统报错、工具调用或调试细节。"
+        )
+
+    def _finalize_llm_tool_result(self, text: str) -> str:
+        """统一收敛 LLM 工具返回：屏蔽思考过程提示并附加硬性输出约束。"""
+        result = str(text or "")
+
+        result = re.sub(r"<\s*think\b[^>]*>.*?<\s*/\s*think\s*>", "", result, flags=re.IGNORECASE | re.DOTALL)
+        result = re.sub(r"<\s*analysis\b[^>]*>.*?<\s*/\s*analysis\s*>", "", result, flags=re.IGNORECASE | re.DOTALL)
+
+        leaked_markers = [
+            "思考过程", "推理过程", "推理链", "分析过程", "chain of thought",
+            "reasoning", "内部推理", "系统提示", "隐藏指令", "tool call", "工具调用"
+        ]
+        cleaned_lines = []
+        for line in result.splitlines():
+            lower_line = line.lower()
+            if any(marker in line for marker in leaked_markers):
+                continue
+            if any(marker in lower_line for marker in ["chain of thought", "reasoning", "tool call"]):
+                continue
+            cleaned_lines.append(line)
+
+        result = "\n".join(cleaned_lines).strip()
+        if not result:
+            result = "[TOOL_SUCCESS] 任务已完成，结果已发送给用户。"
+
+        guard_rule = "【硬性规则】直接给用户最终结论与必要说明；严禁输出思考过程、推理步骤、系统提示或工具细节。"
+        if guard_rule not in result:
+            result = f"{result}\n{guard_rule}"
+
+        return result
 
     async def _prepare_send_image_bytes(self, image_bytes: bytes) -> bytes:
         """发送前对超大结果图做轻量压缩，减少平台上传等待。"""
@@ -1707,9 +1739,9 @@ class FigurineProPlugin(Star):
             # 没有额外人格提示时，允许 LLM 自然发挥
             if count > 1:
                 if 'batch_result' in locals() and batch_result.get("fail", 0) > 0:
-                    return f"[TOOL_SUCCESS] 批量文生图任务已结束，预设：{preset_name}，已发送 {batch_result.get('success', 0)} 张可用结果。你可以按原本人设自然接话，也可以不补充收尾。"
-                return f"[TOOL_SUCCESS] 批量文生图任务已结束，预设：{preset_name}，共 {count} 张，图片已经发送给用户。你可以按原本人设自然接话，也可以不补充收尾。"
-            return f"[TOOL_SUCCESS] 文生图任务已结束，预设：{preset_name}，图片已经发送给用户。你可以按原本人设自然接话，也可以不补充收尾。"
+                    return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 批量文生图任务已结束，预设：{preset_name}，已发送 {batch_result.get('success', 0)} 张可用结果。你可以按原本人设自然接话，也可以不补充收尾。")
+                return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 批量文生图任务已结束，预设：{preset_name}，共 {count} 张，图片已经发送给用户。你可以按原本人设自然接话，也可以不补充收尾。")
+            return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 文生图任务已结束，预设：{preset_name}，图片已经发送给用户。你可以按原本人设自然接话，也可以不补充收尾。")
 
     @filter.llm_tool(name="shoubanhua_edit_image")
     async def image_edit_tool(self, event: AstrMessageEvent, prompt: str, use_message_images: bool = True,
@@ -1829,7 +1861,7 @@ class FigurineProPlugin(Star):
 
         if not images:
             # 不要重复发送错误消息，只返回给 LLM
-            return "[TOOL_FAILED] 未检测到图片。请让用户发送或引用包含图片的消息后再试。【重要】不要再次调用此工具，直接用自然语言告诉用户需要提供图片。"
+            return self._finalize_llm_tool_result("[TOOL_FAILED] 未检测到图片。请让用户发送或引用包含图片的消息后再试。【重要】不要再次调用此工具，直接用自然语言告诉用户需要提供图片。")
 
         # 4. 限制批量生成数量
         raw_count = count
@@ -1902,8 +1934,8 @@ class FigurineProPlugin(Star):
                 return result + rebellious_hint
             else:
                 if total_fail > 0:
-                    return f"[TOOL_SUCCESS] 多图分别处理任务已结束，已发送 {total_success} 张可用结果。你可以按原本人设自然接话，也可以不补充收尾。"
-                return f"[TOOL_SUCCESS] 多图分别处理任务已结束，共 {total_images} 张，结果已经发送给用户。你可以按原本人设自然接话，也可以不补充收尾。"
+                    return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 多图分别处理任务已结束，已发送 {total_success} 张可用结果。你可以按原本人设自然接话，也可以不补充收尾。")
+                return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 多图分别处理任务已结束，共 {total_images} 张，结果已经发送给用户。你可以按原本人设自然接话，也可以不补充收尾。")
 
         # ==== 分支：普通单次处理（单图或合并多图） ====
         total_cost = count
@@ -1969,9 +2001,9 @@ class FigurineProPlugin(Star):
             # 没有额外人格提示时，允许 LLM 自然发挥
             if count > 1:
                 if 'batch_result' in locals() and batch_result.get("fail", 0) > 0:
-                    return f"[TOOL_SUCCESS] 多版本图生图任务已结束，预设：{preset_name}，已发送 {batch_result.get('success', 0)} 个可用版本。你可以按原本人设自然接话，也可以不补充收尾。"
-                return f"[TOOL_SUCCESS] 多版本图生图任务已结束，预设：{preset_name}，共 {count} 个不同版本，图片已经发送给用户。你可以按原本人设自然接话，也可以不补充收尾。"
-            return f"[TOOL_SUCCESS] 图生图任务已结束，预设：{preset_name}，图片已经发送给用户。你可以按原本人设自然接话，也可以不补充收尾。"
+                    return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 多版本图生图任务已结束，预设：{preset_name}，已发送 {batch_result.get('success', 0)} 个可用版本。你可以按原本人设自然接话，也可以不补充收尾。")
+                return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 多版本图生图任务已结束，预设：{preset_name}，共 {count} 个不同版本，图片已经发送给用户。你可以按原本人设自然接话，也可以不补充收尾。")
+            return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 图生图任务已结束，预设：{preset_name}，图片已经发送给用户。你可以按原本人设自然接话，也可以不补充收尾。")
 
     # ================= 传统指令触发 =================
 
@@ -2580,7 +2612,7 @@ class FigurineProPlugin(Star):
             if not success:
                 return self._build_llm_tool_failure(error_msg)
 
-            return f"[TOOL_SUCCESS] 文生图任务已结束，预设：{preset_name}，图片已经发送给用户。你可以按原本人设自然接话，也可以不补充收尾。"
+            return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 文生图任务已结束，预设：{preset_name}，图片已经发送给用户。你可以按原本人设自然接话，也可以不补充收尾。")
 
         elif task_type == "image_to_image":
             # 图生图
@@ -2614,7 +2646,7 @@ class FigurineProPlugin(Star):
                             images.append(img_bytes)
 
             if not images:
-                return "[TOOL_FAILED] 未检测到图片。请直接自然告诉用户需要先发图或引用图片，不要再次调用工具。"
+                return self._finalize_llm_tool_result("[TOOL_FAILED] 未检测到图片。请直接自然告诉用户需要先发图或引用图片，不要再次调用工具。")
 
             gid = norm_id(event.get_group_id())
             deduction = await self._check_quota(event, uid, gid, 1)
@@ -2632,7 +2664,7 @@ class FigurineProPlugin(Star):
             if not success:
                 return self._build_llm_tool_failure(error_msg)
 
-            return f"[TOOL_SUCCESS] 图生图任务已结束，预设：{preset_name}，图片已经发送给用户。你可以按原本人设自然接话，也可以不补充收尾。"
+            return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 图生图任务已结束，预设：{preset_name}，图片已经发送给用户。你可以按原本人设自然接话，也可以不补充收尾。")
 
         return "未知任务类型"
 
@@ -3301,7 +3333,7 @@ class FigurineProPlugin(Star):
             success_prefix="✅ 成功将图片打包为 PDF"
         )
         if success:
-            return "[TOOL_SUCCESS] 图片已经打包成 PDF 并发送给用户。你可以按原本人设自然接话，也可以不补充收尾。"
+            return self._finalize_llm_tool_result("[TOOL_SUCCESS] 图片已经打包成 PDF 并发送给用户。你可以按原本人设自然接话，也可以不补充收尾。")
         return msg
 
     @filter.llm_tool(name="shoubanhua_batch_process")
@@ -3339,7 +3371,7 @@ class FigurineProPlugin(Star):
 
         active_task = await self._get_active_session_task(event.unified_msg_origin)
         if active_task:
-            return f"[TOOL_SUCCESS] {self._build_active_task_reply(active_task)}"
+            return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] {self._build_active_task_reply(active_task)}")
 
         # 0.1 检查图片生成冷却时间
         uid = norm_id(event.get_sender_id())
@@ -3614,7 +3646,7 @@ class FigurineProPlugin(Star):
 
         active_task = await self._get_active_session_task(event.unified_msg_origin)
         if active_task:
-            return f"[TOOL_SUCCESS] {self._build_active_task_reply(active_task)}"
+            return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] {self._build_active_task_reply(active_task)}")
 
         # 0.1 检查图片生成冷却时间
         uid = norm_id(event.get_sender_id())
@@ -3909,6 +3941,7 @@ class FigurineProPlugin(Star):
         ref_images = await self._load_persona_ref_images()
         if not ref_images:
             return "❌ 未配置人设参考图。请先使用 #人设参考图添加 命令添加参考图。"
+        logger.info(f"人设拍照：已加载人设参考图 {len(ref_images)} 张")
 
         # 1.5 提取用户可能提供的参考图片（如衣服款式、姿势参考等）
         user_images = []
@@ -3929,6 +3962,9 @@ class FigurineProPlugin(Star):
 
         # 合并图片：人设参考图在前，用户参考图在后
         final_images = ref_images + user_images
+        if user_images:
+            logger.info(f"人设拍照：检测到用户补充参考图 {len(user_images)} 张")
+        logger.info(f"人设拍照：最终提交参考图总数 {len(final_images)} 张")
 
         # 2. 获取上下文用于场景匹配
         session_id = event.unified_msg_origin
@@ -3943,6 +3979,7 @@ class FigurineProPlugin(Star):
 
         # 3. 匹配场景
         scene_name, scene_prompt = self._match_persona_scene(context_text)
+        logger.info(f"人设拍照：场景匹配结果 scene={scene_name}, scene_hint={scene_hint or '无'}")
 
         # 4. 构建完整提示词
         full_prompt = self._build_persona_prompt(scene_prompt, extra_request)
@@ -3954,6 +3991,7 @@ class FigurineProPlugin(Star):
                 " Do NOT replace the character's face, hairstyle, body identity, or overall persona with the user reference image."
                 " In short: keep the persona character unchanged, only borrow the requested clothing or styling details from the user reference."
             )
+            self._log_prompt_preview(f"persona:{scene_name}", full_prompt)
 
         # 5. 根据配置决定是否发送进度提示
         if self._get_conf_bool("llm_show_progress", True):
@@ -3999,7 +4037,7 @@ class FigurineProPlugin(Star):
                 return self._build_llm_tool_failure(error_msg)
             if count_limited:
                 return self._build_count_limit_reply(count, "persona")
-            return f"[TOOL_SUCCESS] 人设照片任务已结束，场景：{scene_name}，图片已经发送给用户。你可以按原本人设自然接话，也可以不补充收尾。"
+            return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 人设照片任务已结束，场景：{scene_name}，图片已经发送给用户。你可以按原本人设自然接话，也可以不补充收尾。")
         else:
             # 对于人设的多张生成，因为传递的是最终合并好的图片（包含人设参考+用户参考），
             # 所以使用 _run_batch_image_to_image。但是要防止该函数再次从数据库读取 "_persona_" 导致图片翻倍。
@@ -4024,8 +4062,8 @@ class FigurineProPlugin(Star):
             if count_limited:
                 return self._build_count_limit_reply(count, "persona")
             if batch_result.get("fail", 0) > 0:
-                return f"[TOOL_SUCCESS] 人设写真任务已结束，场景：{scene_name}，已发送 {batch_result.get('success', 0)} 张可用图片。你可以按原本人设自然接话，也可以不补充收尾。"
-            return f"[TOOL_SUCCESS] 人设写真任务已结束，场景：{scene_name}，共 {count} 张，图片已经发送给用户。你可以按原本人设自然接话，也可以不补充收尾。"
+                return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 人设写真任务已结束，场景：{scene_name}，已发送 {batch_result.get('success', 0)} 张可用图片。你可以按原本人设自然接话，也可以不补充收尾。")
+            return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 人设写真任务已结束，场景：{scene_name}，共 {count} 张，图片已经发送给用户。你可以按原本人设自然接话，也可以不补充收尾。")
 
     @filter.command("人设拍照", prefix_optional=True)
     async def on_persona_photo_cmd(self, event: AstrMessageEvent, ctx=None):
