@@ -124,8 +124,8 @@ class FigurineProPlugin(Star):
         self._rebellious_mode = config.get("enable_rebellious_mode", True)
         self._rebellious_probability = config.get("rebellious_probability", 0.3)
 
-        # 图片生成冷却时间（只针对图片生成，不影响正常聊天）
-        self._image_cooldown_seconds = config.get("llm_cooldown_seconds", 60)
+        # 图片生成冷却时间（只针对图片生成，不影响正常聊天） 
+        self._image_cooldown_seconds = config.get("llm_cooldown_seconds", 60) 
         self._user_last_image_gen: Dict[str, datetime] = {}  # 用户ID -> 上次图片生成时间
 
         # 消息去重缓存（防止多平台重复处理同一消息）
@@ -133,8 +133,8 @@ class FigurineProPlugin(Star):
         self._msg_dedup_ttl = 60  # 去重缓存保留时间（秒）
         self._msg_dedup_max_size = 1000  # 最大缓存数量
 
-        # 后台生成任务状态跟踪（用于 PDF 等待“全部生成完成”）
-        self._pending_generation_tasks: Dict[str, int] = {}  # session_id -> pending count
+        # 后台生成任务状态跟踪（用于 PDF 等待“全部生成完成”） 
+        self._pending_generation_tasks: Dict[str, int] = {}  # session_id -> pending count 
         self._pending_generation_lock = asyncio.Lock()
 
         # 会话级成功生成记录（用于限制 PDF 工具只能在图片成功生成后调用）
@@ -146,8 +146,8 @@ class FigurineProPlugin(Star):
         self._session_generated_images_lock = asyncio.Lock()
         self._session_generated_images_max = max(1, int(config.get("pdf_session_image_cache", 20)))
 
-        # 会话级任务进度表（用于催促时优先返回当前任务状态，避免重复开新任务）
-        self._session_task_status: Dict[str, Dict[str, Any]] = {}
+        # 会话级任务进度表（用于催促时优先返回当前任务状态，避免重复开新任务） 
+        self._session_task_status: Dict[str, Dict[str, Any]] = {} 
         self._session_task_status_lock = asyncio.Lock()
 
     def _is_message_processed(self, msg_id: str) -> bool:
@@ -698,11 +698,14 @@ class FigurineProPlugin(Star):
 
         return prompt, "自定义", ""
 
-    def _get_quota_str(self, deduction: dict, uid: str) -> str:
+    def _get_quota_str(self, deduction: dict, uid: str, gid: Optional[str] = None) -> str:
+        user_count = self.data_mgr.get_user_count(uid)
+        group_count = self.data_mgr.get_group_count(norm_id(gid)) if gid else 0
+
         if deduction["source"] == "free":
-            return "∞"
-        else:
-            return str(self.data_mgr.get_user_count(uid))
+            return f"用户: ∞ | 群组: {group_count}"
+
+        return f"用户: {user_count} | 群组: {group_count}"
 
     def _get_generation_count_limit(self, task_type: str = "generic") -> int:
         """获取不同任务类型的数量上限"""
@@ -730,6 +733,63 @@ class FigurineProPlugin(Star):
         if task_type == "edit":
             return f"这么多可不行，我最多先给你处理{actual_count}张。剩下的下次再说。"
         return f"一下要这么多也太贪心了，我最多先给你弄{actual_count}张。"
+
+    def _looks_like_persona_photo_request(self, message: str) -> bool:
+        """识别“看你本人照片/自拍/写真”这类请求，避免被通用工具误接。"""
+        text = str(message or "").strip().lower()
+        if not text:
+            return False
+
+        compact = re.sub(r"\s+", "", text)
+        explicit_phrases = [
+            "发你的自拍", "发你自拍", "你的自拍", "看你自拍", "发你的照片", "发你照片",
+            "你的照片", "看你照片", "看看你", "看看你长啥样", "看看你长什么样",
+            "你长啥样", "你长什么样", "你的写真", "写真集", "私房照", "营业照",
+            "自拍照", "露脸照", "发几张你", "来几张你", "发张你", "来张你",
+            "你本人", "你自己的照片", "看看你本人",
+        ]
+        if any(phrase in compact for phrase in explicit_phrases):
+            return True
+
+        self_terms = ["你", "你的", "你自己", "你本人", "本人"]
+        photo_terms = ["自拍", "照片", "写真", "写真集", "私房照", "相片", "样子", "长啥样", "长什么样", "露脸"]
+        has_self = any(term in compact for term in self_terms)
+        has_photo = any(term in compact for term in photo_terms)
+        return has_self and has_photo
+
+    def _infer_requested_count_from_text(self, message: str, default: int = 1, multi_default: int = 3) -> int:
+        """从自然语言里尽量推断用户想要的张数。"""
+        text = str(message or "").strip().lower()
+        if not text:
+            return default
+
+        digit_match = re.search(r"(\d{1,2})\s*张", text)
+        if digit_match:
+            try:
+                return max(1, int(digit_match.group(1)))
+            except Exception:
+                pass
+
+        cn_match = re.search(r"([一二三四五六七八九十两]+)\s*张", text)
+        if cn_match:
+            cn_num = cn_match.group(1)
+            cn_map = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+            if cn_num == "十":
+                return 10
+            if cn_num.endswith("十") and len(cn_num) == 2:
+                return cn_map.get(cn_num[0], 1) * 10
+            if cn_num.startswith("十") and len(cn_num) == 2:
+                return 10 + cn_map.get(cn_num[1], 0)
+            if "十" in cn_num and len(cn_num) == 3:
+                return cn_map.get(cn_num[0], 1) * 10 + cn_map.get(cn_num[2], 0)
+            if cn_num in cn_map:
+                return cn_map[cn_num]
+
+        multi_keywords = ["多来几张", "多拍几张", "多发几张", "来几张", "发几张", "写真集", "多来点", "多来一些"]
+        if any(keyword in text for keyword in multi_keywords):
+            return multi_default
+
+        return default
 
     async def _register_pending_generation(self, session_id: str, count: int = 1):
         """登记后台待完成生成任务"""
@@ -892,7 +952,7 @@ class FigurineProPlugin(Star):
             if preset_display:
                 lines.append(f"这次按 {preset_display} 来。")
         elif action == "persona":
-            lines.append("我去给你拍几张。" if count <= 1 else "我去给你多拍几张。")
+            lines.append("我去给你拍一张。" if count <= 1 else "我去给你拍几张。")
             if scene_name:
                 lines.append(f"场景先放在 {scene_name}。")
         elif action == "auto_text":
@@ -1097,8 +1157,10 @@ class FigurineProPlugin(Star):
                 res["allowed"] = True;
                 res["source"] = "group";
                 return res
+        else:
+            g_bal = 0
 
-        res["msg"] = f"❌ 次数不足 (需{cost}次)。用户剩余:{u_bal}"
+        res["msg"] = f"❌ 次数不足 (需{cost}次)。用户剩余:{u_bal} | 群组剩余:{g_bal}"
         return res
 
     async def _load_preset_ref_images(self, preset_name: str) -> List[bytes]:
@@ -1166,7 +1228,7 @@ class FigurineProPlugin(Star):
                 # 5. 主动发送结果
                 chain_nodes = [Image.fromBytes(res)]
                 if not hide_text:
-                    quota_str = self._get_quota_str(deduction, uid)
+                    quota_str = self._get_quota_str(deduction, uid, gid)
                     # 构建成功文案
                     timing_text = self._format_success_timing(elapsed)
                     info_text = f"\n✅ 生成成功 ({timing_text}) | 预设: {preset_name}"
@@ -1315,7 +1377,7 @@ class FigurineProPlugin(Star):
 
             # 5. 发送完成汇总
             if not hide_text:
-                quota_str = self._get_quota_str(deduction, uid)
+                quota_str = self._get_quota_str(deduction, uid, gid)
                 summary = f"\n📊 批量生成完成: 成功 {results['success']}/{count} 张 | 剩余: {quota_str}"
                 await event.send(event.chain_result([Plain(summary)]))
             return results
@@ -1444,7 +1506,7 @@ class FigurineProPlugin(Star):
 
             # 5. 发送完成汇总
             if not hide_text:
-                quota_str = self._get_quota_str(deduction, uid)
+                quota_str = self._get_quota_str(deduction, uid, gid)
                 summary = f"\n📊 多版本生成完成: 成功 {results['success']}/{count} 张 | 剩余: {quota_str}"
                 await event.send(event.chain_result([Plain(summary)]))
             return results
@@ -2045,7 +2107,7 @@ class FigurineProPlugin(Star):
             await self.data_mgr.record_usage(uid, gid)
             if not is_bnn: await self.data_mgr.save_preset_image(base_cmd, res)
 
-            quota_str = self._get_quota_str(deduction, uid)
+            quota_str = self._get_quota_str(deduction, uid, gid)
             timing_text = self._format_success_timing(elapsed)
             info = f"\n✅ 生成成功 ({timing_text}) | 预设: {preset_name} | 剩余: {quota_str}"
             if self.conf.get("show_model_info", False):
@@ -2099,7 +2161,7 @@ class FigurineProPlugin(Star):
             res = await self._prepare_send_image_bytes(res)
             elapsed = (datetime.now() - start).total_seconds()
             await self.data_mgr.record_usage(uid, norm_id(event.get_group_id()))
-            quota_str = self._get_quota_str(deduction, uid)
+            quota_str = self._get_quota_str(deduction, uid, norm_id(event.get_group_id()))
             timing_text = self._format_success_timing(elapsed)
             info = f"\n✅ 生成成功 ({timing_text}) | 预设: {preset_name}"
             if extra_rules:
@@ -2428,6 +2490,7 @@ class FigurineProPlugin(Star):
         1. 用户是否明确要求生成/画/创作/处理图片？
         2. 如果用户只是闲聊、询问问题、分享图片但没有要求处理，请不要调用此工具
         3. 如果用户的意图不明确，请先询问用户是否需要生成图片
+        4. 如果用户是在索要你自己的照片、自拍、写真、长相，请不要用这个工具，必须改用 shoubanhua_persona_photo
 
         此工具会消耗用户的使用次数，请谨慎调用。
 
@@ -2457,6 +2520,16 @@ class FigurineProPlugin(Star):
         msg_info = self._extract_message_info(event)
         current_message = user_request or msg_info["content"]
         has_current_image = msg_info["has_image"]
+
+        # 2.5 对“看你本人照片/自拍/写真”做强制分流，避免 LLM 误走通用智能工具
+        if self._persona_mode and self._looks_like_persona_photo_request(current_message):
+            inferred_count = self._infer_requested_count_from_text(current_message, default=1, multi_default=3)
+            return await self.persona_photo_tool(
+                event=event,
+                scene_hint="",
+                extra_request=current_message,
+                count=inferred_count,
+            )
 
         # 3. 分析任务类型
         analysis = LLMTaskAnalyzer.analyze_task_type(
@@ -3805,6 +3878,7 @@ class FigurineProPlugin(Star):
 
         【唯一指定用途】
         只要用户是要求看**你的**照片、写真集、自拍等，无论要求多少张，都【必须且只能】使用此工具，绝对不能使用 shoubanhua_draw_image。
+        典型触发语包括："发你的自拍"、"看看你"、"让我看看你长什么样"、"来几张你的写真"、"发你本人照片"。
 
         【重要】调用条件（请严格遵守）：
         1. 用户明确要求看照片时才调用，例如："发你的自拍"、"发10张你的写真集"、"看看你"、"让我看看你长什么样"
@@ -4024,7 +4098,7 @@ class FigurineProPlugin(Star):
             elapsed = (datetime.now() - start).total_seconds()
             await self.data_mgr.record_usage(uid, gid)
 
-            quota_str = self._get_quota_str(deduction, uid)
+            quota_str = self._get_quota_str(deduction, uid, gid)
             timing_text = self._format_success_timing(elapsed)
             info = f"\n✅ 生成成功 ({timing_text}) | 场景: {scene_name} | 剩余: {quota_str}"
             yield event.chain_result([Image.fromBytes(res), Plain(info)])
@@ -4329,7 +4403,7 @@ class FigurineProPlugin(Star):
             await asyncio.gather(*tasks)
 
             # 发送完成汇总
-            quota_str = self._get_quota_str(deduction, uid)
+            quota_str = self._get_quota_str(deduction, uid, gid)
             summary = f"\n📊 批量处理完成\n"
             summary += f"✅ 成功: {results['success']} 张\n"
             summary += f"❌ 失败: {results['fail']} 张\n"
