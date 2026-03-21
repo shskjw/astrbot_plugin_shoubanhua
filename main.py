@@ -442,21 +442,31 @@ class FigurineProPlugin(Star):
         persona_desc = self.conf.get("persona_description", "一个可爱的二次元女孩")
         photo_style = self.conf.get("persona_photo_style", "日常生活风格，自然光线，真实感")
 
-        # 构建提示词 - 移除手机相关内容，强调日常自然场景
-        prompt_parts = [
-            f"Generate a natural daily life photo of {persona_name}.",
-            f"Character description: {persona_desc}",
-            f"Scene: {scene_prompt}",
-            f"Style: {photo_style}",
-            "The character identity must strictly remain the same as the persona reference image.",
-            "Preserve the original face, hairstyle, hair color, body shape, age appearance, and core character features from the persona reference.",
-            "The output must still clearly be the same character from the persona reference, not a different girl with similar clothes.",
-            "Natural pose and expression, candid moment, high quality, detailed.",
-            "Do NOT include any phones, cameras, or selfie elements in the image."
-        ]
+        # [修复] 清理人设描述，防止包含框架系统指令
+        # 仅保留纯描述部分，截断遇到的 '# 标题' 或 JSON 结构
+        if persona_desc and ("# Persona" in persona_desc or "# 任务" in persona_desc or "{" in persona_desc or "# 角色" in persona_desc):
+            clean_lines = []
+            for line in persona_desc.split('\n'):
+                line = line.strip()
+                if not line: continue
+                # 遇到框架指令标记就截断
+                if line.startswith(('# Persona', '# 任务', '# 角色', '# 外观', '# 经历', '# 性格', 'Persona Instructions')):
+                    break
+                # 遇到 JSON 结构就跳过
+                if line.startswith('{') or line.startswith('"') or line.startswith('}'):
+                    continue
+                clean_lines.append(line)
+            if clean_lines:
+                persona_desc = " ".join(clean_lines)
 
+        # [修复] 清理 extra_request，防止 LLM 幻觉将系统指令作为参数传入
         if extra_request:
-            prompt_parts.append(f"Additional requirements: {extra_request}")
+            markers = ["# Persona", "# 任务", "# 角色", "Persona Instructions"]
+            for marker in markers:
+                if marker in extra_request:
+                     extra_request = extra_request.split(marker)[0]
+            extra_request = extra_request.strip()
+
 
         return " ".join(prompt_parts)
 
@@ -482,16 +492,9 @@ class FigurineProPlugin(Star):
                 skipped_count = 0
 
                 for k, v in dynamic_conf.items():
-                    current_value = self.conf.get(k, None)
-
-                    should_restore = (
-                        current_value is None
-                        or current_value == ""
-                        or current_value == []
-                        or current_value == {}
-                    )
-
-                    if should_restore:
+                    # 强制恢复动态配置，解决重启或重载后模型回退到默认值的问题
+                    # dynamic_config.json 保存的是用户最后一次通过指令修改的配置，优先级应高于默认值
+                    if v is not None and v != "" and v != [] and v != {}:
                         self.conf[k] = v
                         restored_count += 1
                     else:
