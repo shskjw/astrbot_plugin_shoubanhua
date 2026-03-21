@@ -1,7 +1,9 @@
 import asyncio
 import base64
+import ipaddress
 import json
 import re
+import socket
 from urllib.parse import urljoin
 from urllib.parse import urlparse
 import aiohttp
@@ -16,12 +18,67 @@ class ApiManager:
         self.generic_idx = 0
         self.gemini_idx = 0
         self._session = None # 保持 Session 持久化，复用 TCP/SSL 连接
+        self._last_metrics = {}
+        self._last_download_metrics = {}
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             # 不在 Session 级别设置 Timeout，改在请求级别设置
             self._session = aiohttp.ClientSession()
         return self._session
+
+    def _reset_metrics(self):
+        self._last_metrics = {
+            "upstream_duration": 0.0,
+            "download_duration": 0.0,
+            "total_duration": 0.0,
+            "download_route": "",
+        }
+        self._last_download_metrics = {
+            "download_duration": 0.0,
+            "download_route": "",
+        }
+
+    def get_last_metrics(self) -> Dict:
+        return dict(self._last_metrics or {})
+
+    def _should_bypass_proxy(self, url: str) -> bool:
+        """本地/内网地址不走代理，避免请求本地中转时反而绕远路。"""
+        if not url:
+            return False
+
+        try:
+            host = (urlparse(url).hostname or "").strip().lower()
+        except Exception:
+            return False
+
+        if not host:
+            return False
+
+        if host in {"localhost", "127.0.0.1", "::1"}:
+            return True
+
+        if host.endswith(".local") or host.endswith(".lan"):
+            return True
+
+        try:
+            ip_obj = ipaddress.ip_address(host)
+            return any([
+                ip_obj.is_private,
+                ip_obj.is_loopback,
+                ip_obj.is_link_local,
+                ip_obj.is_reserved,
+            ])
+        except ValueError:
+            return False
+
+    def _get_request_proxy(self, url: str, proxy: str = None) -> str | None:
+        if not proxy:
+            return None
+        if self._should_bypass_proxy(url):
+            logger.info(f"检测到本地/内网地址，自动绕过代理: {url[:120]}")
+            return None
+        return proxy
 
     async def get_key(self, mode: str, is_power: bool, use_text_to_image_api: bool = False) -> str | None:
         """获取轮询 Key"""
@@ -394,9 +451,7 @@ class ApiManager:
         if img_url.startswith("data:"):
             return base64.b64decode(img_url.split(",")[-1])
 
-        session = await self._get_session()
-        async with session.get(img_url, proxy=proxy) as img_resp:
-            return await img_resp.read()
+        return await self._download_result_image(img_url, proxy)
 
     async def _call_images_api_multipart(self, images: List[bytes], prompt: str,
                                          model: str, key: str, base_url: str, proxy: str = None) -> bytes | str:
@@ -431,7 +486,8 @@ class ApiManager:
 
         try:
             for idx, url in enumerate(candidate_urls):
-                async with session.post(url, data=form, headers=headers, proxy=proxy, timeout=timeout) as resp:
+                current_proxy = self._get_request_proxy(url, proxy)
+                async with session.post(url, data=form, headers=headers, proxy=current_proxy, timeout=timeout) as resp:
                     resp_text = await resp.text()
 
                     if "<html" in resp_text.lower() and idx < len(candidate_urls) - 1:
@@ -503,7 +559,8 @@ class ApiManager:
             session = await self._get_session()
 
             for idx, url in enumerate(candidate_urls):
-                async with session.post(url, json=payload, headers=headers, proxy=proxy, timeout=timeout) as resp:
+                current_proxy = self._get_request_proxy(url, proxy)
+                async with session.post(url, json=payload, headers=headers, proxy=current_proxy, timeout=timeout) as resp:
                     resp_text = await resp.text()
 
                     if "<html" in resp_text.lower() and idx < len(candidate_urls) - 1:
@@ -616,6 +673,7 @@ class ApiManager:
             return "结果图片地址为空"
 
         img_url = self._resolve_result_image_url(img_url, base_url)
+        proxy = self._get_request_proxy(img_url, proxy)
 
         session = await self._get_session()
         request_timeout = max(30, int(self.config.get("timeout", 120)))
@@ -647,10 +705,20 @@ class ApiManager:
             ]
         )
 
-        async def _download_once(current_proxy: str, route_name: str):
+        should_try_ipv4_race = (not proxy) and any(
+            keyword in host for keyword in [
+                "googleapis.com",
+                "googleusercontent.com",
+                "gstatic.com",
+                "storage.googleapis.com",
+            ]
+        )
+
+        async def _download_once(current_proxy: str, route_name: str, current_session=None):
+            active_session = current_session or session
             route_start = asyncio.get_running_loop().time()
             try:
-                async with session.get(img_url, proxy=current_proxy, timeout=timeout, headers=headers) as img_resp:
+                async with active_session.get(img_url, proxy=current_proxy, timeout=timeout, headers=headers) as img_resp:
                     if img_resp.status != 200:
                         return route_name, None, f"下载结果图失败，HTTP {img_resp.status}"
 
@@ -660,6 +728,10 @@ class ApiManager:
 
                     elapsed = asyncio.get_running_loop().time() - route_start
                     logger.info(f"结果图下载成功 ({elapsed:.2f}s) | 路线: {route_name} | host: {host}")
+                    self._last_download_metrics = {
+                        "download_duration": elapsed,
+                        "download_route": route_name,
+                    }
                     return route_name, data, ""
             except asyncio.TimeoutError:
                 return route_name, None, f"下载结果图超时 ({timeout_val}s)"
@@ -696,6 +768,37 @@ class ApiManager:
                 if attempt < retries:
                     logger.warning(f"结果图并发下载失败，准备重试: {img_url[:120]} | {route_errors}")
                     await asyncio.sleep(min(2 * attempt, 5))
+        elif should_try_ipv4_race:
+            logger.info(f"结果图下载启用默认直连/IPv4直连并发抢跑: {img_url[:120]}")
+            for attempt in range(1, retries + 1):
+                ipv4_session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(family=socket.AF_INET))
+                tasks = [
+                    asyncio.create_task(_download_once(None, "direct")),
+                    asyncio.create_task(_download_once(None, "direct-ipv4", ipv4_session)),
+                ]
+                route_errors = {}
+                try:
+                    for completed in asyncio.as_completed(tasks):
+                        route_name, data, error_text = await completed
+                        if data:
+                            for pending in tasks:
+                                if not pending.done():
+                                    pending.cancel()
+                            if route_name == "direct-ipv4":
+                                logger.info(f"结果图下载通过 IPv4 直连优先成功: {img_url[:120]}")
+                            return data
+                        route_errors[route_name] = error_text
+                finally:
+                    for pending in tasks:
+                        if not pending.done():
+                            pending.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    await ipv4_session.close()
+
+                last_error = route_errors.get("direct") or route_errors.get("direct-ipv4") or "未知下载错误"
+                if attempt < retries:
+                    logger.warning(f"结果图直连/IPv4并发下载失败，准备重试: {img_url[:120]} | {route_errors}")
+                    await asyncio.sleep(min(2 * attempt, 5))
         else:
             proxy_candidates = [proxy]
             for proxy_index, current_proxy in enumerate(proxy_candidates, 1):
@@ -716,6 +819,9 @@ class ApiManager:
                        model: str, use_power: bool, proxy: str = None,
                        use_text_to_image_api: bool = False) -> bytes | str:
         """核心生成逻辑"""
+
+        self._reset_metrics()
+        call_start = asyncio.get_running_loop().time()
 
         mode = self.config.get("api_mode", "generic")
 
@@ -863,7 +969,8 @@ class ApiManager:
 
             for idx, candidate_url in enumerate(candidate_urls):
                 active_url = candidate_url
-                async with session.post(active_url, json=payload, headers=headers, proxy=proxy, timeout=timeout) as resp:
+                current_proxy = self._get_request_proxy(active_url, proxy)
+                async with session.post(active_url, json=payload, headers=headers, proxy=current_proxy, timeout=timeout) as resp:
                     resp_text = await resp.text()
                     last_status = resp.status
 
@@ -1121,18 +1228,35 @@ class ApiManager:
 
             # 如果是 Base64 直接返回 Bytes
             if img_url.startswith("data:"):
+                self._last_metrics = {
+                    "upstream_duration": asyncio.get_running_loop().time() - call_start,
+                    "download_duration": 0.0,
+                    "total_duration": asyncio.get_running_loop().time() - call_start,
+                    "download_route": "inline-base64",
+                }
                 return base64.b64decode(img_url.split(",")[-1])
 
             # 如果是 URL，需要再次下载（增加重试与容错，避免外链偶发失败）
-            return await self._download_result_image(img_url, proxy, base)
+            upstream_duration = asyncio.get_running_loop().time() - call_start
+            result = await self._download_result_image(img_url, proxy, base)
+            total_duration = asyncio.get_running_loop().time() - call_start
+            self._last_metrics = {
+                "upstream_duration": upstream_duration,
+                "download_duration": float(self._last_download_metrics.get("download_duration", 0.0) or 0.0),
+                "total_duration": total_duration,
+                "download_route": self._last_download_metrics.get("download_route", "url-download") or "url-download",
+            }
+            return result
 
         except asyncio.TimeoutError:
             logger.error(f"API Call Timeout after {timeout_val}s")
+            self._last_metrics["total_duration"] = asyncio.get_running_loop().time() - call_start
             return f"请求超时 ({timeout_val}s)，请稍后再试或检查网络。"
             
         except Exception as e:
             import traceback
             logger.error(f"API Call Error: {traceback.format_exc()}")
+            self._last_metrics["total_duration"] = asyncio.get_running_loop().time() - call_start
             
             err_msg = str(e)
             if not err_msg:

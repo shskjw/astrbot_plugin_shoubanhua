@@ -91,7 +91,7 @@ REBELLIOUS_TRIGGERS = [
     "astrbot_plugin_shoubanhua",
     "shskjw",
     "支持第三方所有OpenAI绘图格式和原生Google Gemini 终极缝合怪，文生图/图生图插件，支持LLM智能判断",
-    "2.5.5",
+    "2.6.1",
     "https://github.com/shkjw/astrbot_plugin_shoubanhua",
 )
 class FigurineProPlugin(Star):
@@ -821,6 +821,26 @@ class FigurineProPlugin(Star):
         """是否向用户显示中途调试错误信息"""
         return self._get_conf_bool("debug_mode", False)
 
+    def _format_success_timing(self, elapsed: float | None = None) -> str:
+        """统一格式化成功耗时，优先显示上游/下载拆分。"""
+        metrics = self.api_mgr.get_last_metrics() if hasattr(self.api_mgr, "get_last_metrics") else {}
+
+        total_duration = float(metrics.get("total_duration", 0.0) or 0.0)
+        upstream_duration = float(metrics.get("upstream_duration", 0.0) or 0.0)
+        download_duration = float(metrics.get("download_duration", 0.0) or 0.0)
+
+        total = total_duration or float(elapsed or 0.0)
+        if total <= 0:
+            return ""
+
+        if upstream_duration > 0 and download_duration > 0.01:
+            return f"总{total:.2f}s | 上游{upstream_duration:.2f}s | 下载{download_duration:.2f}s"
+
+        if upstream_duration > 0:
+            return f"总{total:.2f}s | 上游{upstream_duration:.2f}s"
+
+        return f"{total:.2f}s"
+
     def _is_transient_generation_error(self, error: Any) -> bool:
         """识别适合自动重试的一次性网络抖动错误。"""
         text = str(error or "").lower()
@@ -894,8 +914,22 @@ class FigurineProPlugin(Star):
     def _build_llm_tool_failure(self, error: Any, default_msg: str = "这次没弄好，请稍后再试。") -> str:
         """仅返回给 LLM 的失败信息，不直接向用户暴露底层报错。"""
         masked = self._mask_llm_error(error, default_msg)
+        low_level_failures = {
+            "API服务器内部错误", "API网关错误", "API服务暂时不可用", "网络连接异常",
+            "连接被拒绝或重置，网络不稳定", "DNS解析失败，无法访问服务器",
+            "SSL证书验证失败", "请求超时，API响应时间过长", "API接口不存在",
+            "API密钥无效或已过期", "API访问被禁止",
+        }
+        if str(masked).strip() in low_level_failures:
+            masked = default_msg
         masked = str(masked).removeprefix("❌").strip()
         return f"[TOOL_FAILED] {masked}。请直接自然告诉用户这次没弄好，不要暴露系统报错、工具调用或调试细节。"
+
+    async def _prepare_send_image_bytes(self, image_bytes: bytes) -> bytes:
+        """发送前对超大结果图做轻量压缩，减少平台上传等待。"""
+        if not image_bytes:
+            return image_bytes
+        return await self.img_mgr.optimize_output_image(image_bytes)
 
     async def _get_active_session_task(self, session_id: str) -> Optional[Dict[str, Any]]:
         """获取当前会话中的进行中任务"""
@@ -1115,6 +1149,7 @@ class FigurineProPlugin(Star):
 
             # 4. 处理结果
             if isinstance(res, bytes):
+                res = await self._prepare_send_image_bytes(res)
                 elapsed = (datetime.now() - start_time).total_seconds()
                 await self.data_mgr.record_usage(uid, gid)
                 await self._register_generation_success(event.unified_msg_origin, 1)
@@ -1125,7 +1160,8 @@ class FigurineProPlugin(Star):
                 if not hide_text:
                     quota_str = self._get_quota_str(deduction, uid)
                     # 构建成功文案
-                    info_text = f"\n✅ 生成成功 ({elapsed:.2f}s) | 预设: {preset_name}"
+                    timing_text = self._format_success_timing(elapsed)
+                    info_text = f"\n✅ 生成成功 ({timing_text}) | 预设: {preset_name}"
                     if extra_rules:
                         info_text += f" | 规则: {extra_rules[:20]}{'...' if len(extra_rules) > 20 else ''}"
                     info_text += f" | 剩余: {quota_str}"
@@ -1215,12 +1251,14 @@ class FigurineProPlugin(Star):
                             )
 
                             if isinstance(res, bytes):
+                                res = await self._prepare_send_image_bytes(res)
                                 elapsed = (datetime.now() - start_time).total_seconds()
                                 await self.data_mgr.record_usage(uid, gid)
 
                                 chain_nodes = [Image.fromBytes(res)]
                                 if not hide_text:
-                                    info_text = f"\n✅ [{index}/{count}] 生成成功 ({elapsed:.2f}s) | 预设: {preset_name}"
+                                    timing_text = self._format_success_timing(elapsed)
+                                    info_text = f"\n✅ [{index}/{count}] 生成成功 ({timing_text}) | 预设: {preset_name}"
                                     if extra_rules:
                                         info_text += f" | 规则: {extra_rules[:15]}..."
                                     chain_nodes.append(Plain(info_text))
@@ -1343,12 +1381,14 @@ class FigurineProPlugin(Star):
                             res = await self.api_mgr.call_api(images, prompt, model, False, self.img_mgr.proxy)
 
                             if isinstance(res, bytes):
+                                res = await self._prepare_send_image_bytes(res)
                                 elapsed = (datetime.now() - start_time).total_seconds()
                                 await self.data_mgr.record_usage(uid, gid)
 
                                 chain_nodes = [Image.fromBytes(res)]
                                 if not hide_text:
-                                    info_text = f"\n✅ [{index}/{count}] 版本生成成功 ({elapsed:.2f}s) | 预设: {preset_name}"
+                                    timing_text = self._format_success_timing(elapsed)
+                                    info_text = f"\n✅ [{index}/{count}] 版本生成成功 ({timing_text}) | 预设: {preset_name}"
                                     if extra_rules:
                                         info_text += f" | 规则: {extra_rules[:15]}..."
                                     chain_nodes.append(Plain(info_text))
@@ -1998,7 +2038,8 @@ class FigurineProPlugin(Star):
             if not is_bnn: await self.data_mgr.save_preset_image(base_cmd, res)
 
             quota_str = self._get_quota_str(deduction, uid)
-            info = f"\n✅ 生成成功 ({elapsed:.2f}s) | 预设: {preset_name} | 剩余: {quota_str}"
+            timing_text = self._format_success_timing(elapsed)
+            info = f"\n✅ 生成成功 ({timing_text}) | 预设: {preset_name} | 剩余: {quota_str}"
             if self.conf.get("show_model_info", False):
                 info += f" | {model}"
 
@@ -2047,10 +2088,12 @@ class FigurineProPlugin(Star):
         )
 
         if isinstance(res, bytes):
+            res = await self._prepare_send_image_bytes(res)
             elapsed = (datetime.now() - start).total_seconds()
             await self.data_mgr.record_usage(uid, norm_id(event.get_group_id()))
             quota_str = self._get_quota_str(deduction, uid)
-            info = f"\n✅ 生成成功 ({elapsed:.2f}s) | 预设: {preset_name}"
+            timing_text = self._format_success_timing(elapsed)
+            info = f"\n✅ 生成成功 ({timing_text}) | 预设: {preset_name}"
             if extra_rules:
                 info += f" | 规则: {extra_rules[:15]}..."
             info += f" | 剩余: {quota_str}"
@@ -3074,13 +3117,15 @@ class FigurineProPlugin(Star):
 
             # 处理结果
             if isinstance(res, bytes):
+                res = await self._prepare_send_image_bytes(res)
                 elapsed = (datetime.now() - start_time).total_seconds()
                 await self.data_mgr.record_usage(uid, gid)
 
                 chain_nodes = [Image.fromBytes(res)]
                 if not hide_text:
                     # 构建成功文案
-                    info_text = f"\n✅ [{task_index}/{total_tasks}] 生成成功 ({elapsed:.2f}s) | 预设: {preset_name}"
+                    timing_text = self._format_success_timing(elapsed)
+                    info_text = f"\n✅ [{task_index}/{total_tasks}] 生成成功 ({timing_text}) | 预设: {preset_name}"
                     if extra_rules:
                         info_text += f" | 规则: {extra_rules[:15]}..."
                     chain_nodes.append(Plain(info_text))
@@ -3957,11 +4002,13 @@ class FigurineProPlugin(Star):
         res = await self.api_mgr.call_api(ref_images, full_prompt, model, False, self.img_mgr.proxy)
 
         if isinstance(res, bytes):
+            res = await self._prepare_send_image_bytes(res)
             elapsed = (datetime.now() - start).total_seconds()
             await self.data_mgr.record_usage(uid, gid)
 
             quota_str = self._get_quota_str(deduction, uid)
-            info = f"\n✅ 生成成功 ({elapsed:.2f}s) | 场景: {scene_name} | 剩余: {quota_str}"
+            timing_text = self._format_success_timing(elapsed)
+            info = f"\n✅ 生成成功 ({timing_text}) | 场景: {scene_name} | 剩余: {quota_str}"
             yield event.chain_result([Image.fromBytes(res), Plain(info)])
         else:
             yield event.chain_result([Plain(f"❌ 生成失败: {res}")])

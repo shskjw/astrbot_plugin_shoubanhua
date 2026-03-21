@@ -38,6 +38,44 @@ class ImageManager:
                     await asyncio.sleep(1)
         return None
 
+    def _optimize_output_image_sync(self, raw: bytes) -> bytes:
+        """对超大结果图做轻量压缩，降低后续平台上传耗时。"""
+        if not raw or len(raw) < 1_500_000:
+            return raw
+
+        try:
+            with PILImage.open(io.BytesIO(raw)) as img:
+                original_mode = img.mode
+                width, height = img.size
+                max_side = 1920
+
+                working = img.copy()
+                if width > max_side or height > max_side:
+                    working.thumbnail((max_side, max_side), PILImage.Resampling.LANCZOS)
+
+                out = io.BytesIO()
+                has_alpha = "A" in working.getbands()
+                if not has_alpha and original_mode not in {"P", "1"}:
+                    working = working.convert("RGB")
+                    working.save(out, format="JPEG", quality=88, optimize=False)
+                else:
+                    working = working.convert("RGBA")
+                    working.save(out, format="PNG", optimize=False)
+
+                optimized = out.getvalue()
+                if optimized and len(optimized) < len(raw):
+                    logger.info(
+                        f"结果图发送前已压缩: {len(raw) / 1024:.1f}KB -> {len(optimized) / 1024:.1f}KB"
+                    )
+                    return optimized
+        except Exception as e:
+            logger.warning(f"Output image optimize failed: {e}")
+
+        return raw
+
+    async def optimize_output_image(self, raw: bytes) -> bytes:
+        return await asyncio.to_thread(self._optimize_output_image_sync, raw)
+
     def _extract_first_frame_sync(self, raw: bytes) -> bytes:
         """(同步) 提取第一帧、转PNG并压缩"""
         try:
