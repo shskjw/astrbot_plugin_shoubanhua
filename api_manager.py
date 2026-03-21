@@ -638,7 +638,7 @@ class ApiManager:
 
         parsed = urlparse(img_url)
         host = (parsed.netloc or "").lower()
-        should_try_direct_fallback = bool(proxy) and any(
+        should_try_dual_route = bool(proxy) and any(
             keyword in host for keyword in [
                 "googleapis.com",
                 "googleusercontent.com",
@@ -647,34 +647,67 @@ class ApiManager:
             ]
         )
 
-        proxy_candidates = [proxy]
-        if should_try_direct_fallback:
-            proxy_candidates.append(None)
+        async def _download_once(current_proxy: str, route_name: str):
+            route_start = asyncio.get_running_loop().time()
+            try:
+                async with session.get(img_url, proxy=current_proxy, timeout=timeout, headers=headers) as img_resp:
+                    if img_resp.status != 200:
+                        return route_name, None, f"下载结果图失败，HTTP {img_resp.status}"
+
+                    data = await img_resp.read()
+                    if not data:
+                        return route_name, None, "下载结果图失败，返回内容为空"
+
+                    elapsed = asyncio.get_running_loop().time() - route_start
+                    logger.info(f"结果图下载成功 ({elapsed:.2f}s) | 路线: {route_name} | host: {host}")
+                    return route_name, data, ""
+            except asyncio.TimeoutError:
+                return route_name, None, f"下载结果图超时 ({timeout_val}s)"
+            except Exception as e:
+                return route_name, None, str(e) or type(e).__name__
 
         last_error = ""
-        for proxy_index, current_proxy in enumerate(proxy_candidates, 1):
+        if should_try_dual_route:
+            logger.info(f"结果图下载启用直连/代理并发抢跑: {img_url[:120]}")
             for attempt in range(1, retries + 1):
+                tasks = [
+                    asyncio.create_task(_download_once(None, "direct")),
+                    asyncio.create_task(_download_once(proxy, "proxy")),
+                ]
+                route_errors = {}
                 try:
-                    async with session.get(img_url, proxy=current_proxy, timeout=timeout, headers=headers) as img_resp:
-                        if img_resp.status != 200:
-                            last_error = f"下载结果图失败，HTTP {img_resp.status}"
-                        else:
-                            data = await img_resp.read()
-                            if data:
-                                if proxy_index > 1:
-                                    logger.info(f"结果图下载通过直连回退成功: {img_url[:120]}")
-                                return data
-                            last_error = "下载结果图失败，返回内容为空"
-                except asyncio.TimeoutError:
-                    last_error = f"下载结果图超时 ({timeout_val}s)"
-                except Exception as e:
-                    last_error = str(e) or type(e).__name__
+                    for completed in asyncio.as_completed(tasks):
+                        route_name, data, error_text = await completed
+                        if data:
+                            for pending in tasks:
+                                if not pending.done():
+                                    pending.cancel()
+                            if route_name == "direct":
+                                logger.info(f"结果图下载通过直连优先成功: {img_url[:120]}")
+                            return data
+                        route_errors[route_name] = error_text
+                finally:
+                    for pending in tasks:
+                        if not pending.done():
+                            pending.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
 
+                last_error = route_errors.get("direct") or route_errors.get("proxy") or "未知下载错误"
                 if attempt < retries:
+                    logger.warning(f"结果图并发下载失败，准备重试: {img_url[:120]} | {route_errors}")
                     await asyncio.sleep(min(2 * attempt, 5))
+        else:
+            proxy_candidates = [proxy]
+            for proxy_index, current_proxy in enumerate(proxy_candidates, 1):
+                route_name = "proxy" if current_proxy else "direct"
+                for attempt in range(1, retries + 1):
+                    _, data, error_text = await _download_once(current_proxy, route_name)
+                    if data:
+                        return data
+                    last_error = error_text
 
-            if proxy_index == 1 and should_try_direct_fallback:
-                logger.warning(f"结果图经代理下载失败，准备尝试直连回退: {img_url[:120]} | {last_error}")
+                    if attempt < retries:
+                        await asyncio.sleep(min(2 * attempt, 5))
 
         logger.error(f"结果图下载失败: {img_url[:120]} | {last_error}")
         return f"结果图片下载失败: {last_error}"
