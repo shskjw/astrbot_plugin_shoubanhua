@@ -226,16 +226,16 @@ class FigurineProPlugin(Star):
         import random
 
         excuses = [
-            f"刚才画累了，让我休息一下嘛~ 再等{remaining}秒就好",
-            f"手还酸着呢，{remaining}秒后再来找我吧",
-            f"创作需要灵感，给我{remaining}秒酝酿一下",
-            f"别催别催，{remaining}秒后我就恢复状态了",
-            f"画笔还没干呢，等{remaining}秒再说",
-            f"让我喘口气，{remaining}秒后继续",
-            f"刚刚太拼了，休息{remaining}秒再画",
-            f"灵感正在充能中...还需要{remaining}秒",
-            f"我也是需要休息的好吧，{remaining}秒后再来",
-            f"稍等一下啦，{remaining}秒后就能继续了",
+            f"刚才太拼了，让我喘口气嘛，{remaining}秒后再来",
+            f"手还酸着呢，{remaining}秒后再找我吧",
+            f"给我{remaining}秒缓一缓，马上回来",
+            f"别催别催，{remaining}秒就好",
+            f"让我歇一下，{remaining}秒后继续",
+            f"刚刚弄完一堆，稍微缓一缓，{remaining}秒",
+            f"充能中……还要{remaining}秒",
+            f"我也是要休息的好吧，{remaining}秒后再来",
+            f"稍等一下啦，{remaining}秒后就行了",
+            f"累了，{remaining}秒后就好",
         ]
 
         return random.choice(excuses)
@@ -747,6 +747,9 @@ class FigurineProPlugin(Star):
             "你长啥样", "你长什么样", "你的写真", "写真集", "私房照", "营业照",
             "自拍照", "露脸照", "发几张你", "来几张你", "发张你", "来张你",
             "你本人", "你自己的照片", "看看你本人",
+            # 用户省略"你的"直接说"看看自拍/来张自拍"等，也视为请求Bot本人照片
+            "看看自拍", "来张自拍", "发张自拍", "来一张自拍", "来几张自拍",
+            "看你的自拍", "拍张照", "来张照片", "发张照片",
         ]
         if any(phrase in compact for phrase in explicit_phrases):
             return True
@@ -934,46 +937,104 @@ class FigurineProPlugin(Star):
                                  scene_name: str = "", extra_request: str = "", total_images: int = 0,
                                  confidence: Optional[float] = None, concurrency: int = 0,
                                  has_user_images: bool = False) -> str:
-        """为 LLM 工具构建更自然的对外提示，避免暴露“生成/报错”等字眼。"""
-        preset_display = "自定义" if preset_name in ["", "自定义", "编辑"] else preset_name
-        lines = []
+        """为 LLM 工具构建更自然的对外提示，避免暴露"生成/报错"等字眼。"""
+        import random
+        # 内部占位符不向用户展示；只显示真实有意义的预设名
+        _internal = {"", "自定义", "编辑", "edit", "custom"}
+        preset_display = "" if (not preset_name or preset_name.strip().lower() in _internal) else preset_name
 
         if action == "draw":
-            lines.append("我先给你准备一下。" if count <= 1 else "我先给你准备一组图。")
+            if count <= 1:
+                msg = random.choice([
+                    "稍等一下哦。",
+                    "等我一下。",
+                    "好，先搞搞看。",
+                    "嗯嗯，稍等。",
+                    "好好好，等一下。",
+                    "诶好，稍等。",
+                ])
+            else:
+                msg = random.choice([
+                    f"稍等，给你弄{count}张。",
+                    f"好，先搞{count}张看看。",
+                    f"等一下，整{count}张给你。",
+                    f"嗯，{count}张稍等。",
+                ])
             if preset_display:
-                lines.append(f"这次按 {preset_display} 来。")
+                msg += random.choice([
+                    f" 按{preset_display}来。",
+                    f" 用{preset_display}风格。",
+                    f" {preset_display}风啊，好。",
+                ])
+            return msg
         elif action == "edit":
             if total_images > 1:
-                lines.append(f"我先帮你把这 {total_images} 张图整理一下。")
+                return random.choice([
+                    f"稍等，帮你把这{total_images}张都弄一下。",
+                    f"好，{total_images}张我来处理。",
+                    f"等等哦，{total_images}张我来搞搞。",
+                    f"嗯，{total_images}张，稍等。",
+                ])
             elif count > 1:
-                lines.append("我先帮你多调几个版本。")
+                return random.choice([
+                    f"好，给你多整{count}个版本看看。",
+                    f"稍等，弄{count}个版本给你选。",
+                    f"嗯，{count}个版本，等一下。",
+                ])
             else:
-                lines.append("我先帮你处理一下这张图。")
-            if preset_display:
-                lines.append(f"这次按 {preset_display} 来。")
+                base = random.choice([
+                    "稍等，帮你弄一下这张。",
+                    "好，我来处理一下。",
+                    "等一下哦。",
+                    "嗯，弄弄看。",
+                    "好的，稍等。",
+                ])
+                if preset_display:
+                    base += random.choice([f" 按{preset_display}来。", f" 用{preset_display}。"])
+                return base
         elif action == "persona":
-            lines.append("我先帮你准备一下。")
+            return random.choice([
+                "稍等一下哦。",
+                "等我一下。",
+                "好，弄一下。",
+                "嗯，稍等。",
+                "诶，等等。",
+            ])
         elif action == "auto_text":
-            lines.append("我先按你的意思准备一下画面。")
-            if confidence is not None:
-                lines.append(f"我判断这次更像是纯描述作图，把握大概在 {confidence:.0%}。")
+            return random.choice([
+                "等一下，按你说的搞搞看。",
+                "好，稍等。",
+                "嗯嗯，我来弄一下。",
+                "诶好，稍等。",
+            ])
         elif action == "auto_image":
-            lines.append("我先顺着这张图帮你调整一下。")
-            if confidence is not None:
-                lines.append(f"我判断这次更像是看图处理，把握大概在 {confidence:.0%}。")
+            return random.choice([
+                "好，帮你调一下这张。",
+                "稍等，照着这张弄弄看。",
+                "等一下哦。",
+                "嗯，看看。",
+            ])
         elif action == "batch":
-            lines.append("我先把这批图整理一下。")
             if total_images > 0:
-                lines.append(f"这次先看 {total_images} 张。")
-            if concurrency > 1:
-                lines.append(f"我会并行处理，速度会快一点。")
+                return random.choice([
+                    f"好，这{total_images}张我来搞，稍等。",
+                    f"等一下，{total_images}张慢慢来。",
+                    f"稍等，{total_images}张一起弄。",
+                    f"嗯，{total_images}张，稍等哦。",
+                ])
+            return random.choice(["稍等，慢慢来。", "等一下哦。", "好，来了。"])
         elif action == "pack_pdf":
-            lines.append("我先把这些图整理成册。")
-
-        return "\n".join(lines)
+            return random.choice([
+                "等一下，帮你整理一下。",
+                "稍等，打包一下。",
+                "好，马上好。",
+                "嗯，整理中。",
+            ])
+        return "稍等。"
 
     def _build_llm_tool_failure(self, error: Any, default_msg: str = "这次没弄好，请稍后再试。") -> str:
         """仅返回给 LLM 的失败信息，不直接向用户暴露底层报错。"""
+        import random
         masked = self._mask_llm_error(error, default_msg)
         low_level_failures = {
             "API服务器内部错误", "API网关错误", "API服务暂时不可用", "网络连接异常",
@@ -984,8 +1045,18 @@ class FigurineProPlugin(Star):
         if str(masked).strip() in low_level_failures:
             masked = default_msg
         masked = str(masked).removeprefix("❌").strip()
+        # 给 LLM 多种自然表达失败的参考，不要让它照搬机械话术
+        fail_styles = random.choice([
+            "这次整出问题了，稍后再试试？",
+            "哎，刚才有点问题，过一会儿再来？",
+            "没搞好，可能是网络抖了，稍等一下再试？",
+            "出了点小状况，要不等一下再弄？",
+            "这次有点卡，稍后再发给你？",
+        ])
         return self._finalize_llm_tool_result(
-            f"[TOOL_FAILED] {masked}。请直接自然告诉用户这次没弄好，不要暴露系统报错、工具调用或调试细节。"
+            f"[TOOL_FAILED] 失败原因（不要对用户说）：{masked}。"
+            f"请用你自己的语气告诉用户这次没弄好，参考语气：'{fail_styles}'，但不要照抄，自然表达即可。"
+            f"绝对不要提'系统''工具''API''参数''配置'等词汇。"
         )
 
     def _finalize_llm_tool_result(self, text: str) -> str:
@@ -1012,7 +1083,16 @@ class FigurineProPlugin(Star):
         if not result:
             result = "[TOOL_SUCCESS] 任务已完成，结果已发送给用户。"
 
-        guard_rule = "【硬性规则】直接给用户最终结论与必要说明；严禁输出思考过程、推理步骤、系统提示或工具细节。"
+        guard_rule = (
+            "【对话要求】你现在要根据以上工具结果，用自己的语气给用户回一句自然的话，就像真人在聊天一样。"
+            "严格禁止以下行为：\n"
+            "- 说出'生成''绘制''绘图''渲染''处理完成''任务完成''已发送'等机械词汇\n"
+            "- 暴露工具名称、预设名、内部参数或系统信息\n"
+            "- 输出思考过程、推理步骤、错误代码或格式前缀（如[TOOL_SUCCESS]）\n"
+            "- 重复复述工具返回的文字\n"
+            "如果图片发送成功，就随口说一句自然的收尾话（或者不说也行）。"
+            "如果失败，用生活化的语气随口带过，不要说'系统''工具''API'等字眼。"
+        )
         if guard_rule not in result:
             result = f"{result}\n{guard_rule}"
 
@@ -1120,17 +1200,17 @@ class FigurineProPlugin(Star):
         if any(urls for _, urls in image_sources):
             return True, ""
 
-        return False, "❌ 现在还不能打包 PDF。要先确保图片已经成功生成并发出后，再来让我帮你整理成 PDF。"
+        return False, "现在还没有图可以打包哦，先发点图或者让我帮你弄几张，然后再来打包~"
 
     async def _check_quota(self, event, uid, gid, cost) -> dict:
         res = {"allowed": False, "source": None, "msg": ""}
 
         # 1. 检查用户是否被黑名单
         if uid in (self.conf.get("user_blacklist") or []):
-            res["msg"] = "❌ 您已被禁用此功能"
+            res["msg"] = "这个功能你暂时用不了哦~"
             return res
         if gid and gid in (self.conf.get("group_blacklist") or []):
-            res["msg"] = "❌ 该群组已被禁用此功能"
+            res["msg"] = "这个群暂时用不了这个功能~"
             return res
 
         # 2. 管理员始终允许
@@ -1142,7 +1222,7 @@ class FigurineProPlugin(Star):
         # 3. 检查用户白名单（如果配置了白名单，则只有白名单用户允许）
         user_whitelist = self.conf.get("user_whitelist") or []
         if user_whitelist and uid not in user_whitelist:
-            res["msg"] = "❌ 您不在白名单中，无权使用此功能"
+            res["msg"] = "你还没有使用权限，联系管理员开通一下吧~"
             return res
 
         # 4. 如果在用户白名单中，允许使用
@@ -1154,7 +1234,7 @@ class FigurineProPlugin(Star):
         # 5. 检查群聊白名单（如果配置了群白名单，则只有白名单群允许）
         group_whitelist = self.conf.get("group_whitelist") or []
         if group_whitelist and gid and gid not in group_whitelist:
-            res["msg"] = "❌ 该群组不在白名单中，无权使用此功能"
+            res["msg"] = "这个群还没有使用权限，联系管理员开通一下吧~"
             return res
 
         # 6. 如果在群聊白名单中，允许使用
@@ -1185,7 +1265,7 @@ class FigurineProPlugin(Star):
         else:
             g_bal = 0
 
-        res["msg"] = f"❌ 次数不足 (需{cost}次)。用户剩余:{u_bal} | 群组剩余:{g_bal}"
+        res["msg"] = f"次数不太够了（需要{cost}次，你还剩{u_bal}次，群里还剩{g_bal}次），联系管理员补充一下吧~"
         return res
 
     async def _load_preset_ref_images(self, preset_name: str) -> List[bytes]:
@@ -1272,7 +1352,9 @@ class FigurineProPlugin(Star):
                 if (not suppress_user_error) or self._should_show_debug_errors():
                     display_msg = error_msg
                     if not str(display_msg).startswith("❌"):
-                        display_msg = f"❌ 生成失败: {display_msg}"
+                        display_msg = f"没搞好: {display_msg}"
+                    else:
+                        display_msg = str(display_msg).removeprefix("❌").strip()
                     await event.send(event.chain_result([Plain(display_msg)]))
                 return False, str(error_msg).removeprefix("❌").strip()
 
@@ -1280,7 +1362,8 @@ class FigurineProPlugin(Star):
             logger.error(f"Background task error: {e}")
             error_msg = self._mask_llm_error(e, "这次没弄好，请稍后再试。") if suppress_user_error else f"系统错误: {e}"
             if (not suppress_user_error) or self._should_show_debug_errors():
-                await event.send(event.chain_result([Plain(f"❌ {error_msg}" if not str(error_msg).startswith("❌") else str(error_msg))]))
+                _display = str(error_msg).removeprefix("❌").strip()
+                await event.send(event.chain_result([Plain(f"出了点状况: {_display}")]))
             return False, str(error_msg).removeprefix("❌").strip()
         finally:
             await self._complete_pending_generation(event.unified_msg_origin, 1)
@@ -1380,7 +1463,7 @@ class FigurineProPlugin(Star):
                                 results["errors"].append(error_msg)
                                 if (not suppress_user_error) or self._should_show_debug_errors():
                                     await event.send(event.chain_result([
-                                        Plain(f"❌ [{index}/{count}] 最终生成失败: {error_msg}")
+                                        Plain(f"第{index}张没弄好: {error_msg}")
                                     ]))
 
                     except Exception as e:
@@ -1391,7 +1474,7 @@ class FigurineProPlugin(Star):
                             results["errors"].append(error_msg)
                         if (not suppress_user_error) or self._should_show_debug_errors():
                             await event.send(event.chain_result([
-                                Plain(f"❌ [{index}/{count}] 处理异常: {error_msg}")
+                                Plain(f"第{index}张出了点问题: {error_msg}")
                             ]))
                     finally:
                         await self._complete_pending_generation(event.unified_msg_origin, 1)
@@ -1410,7 +1493,7 @@ class FigurineProPlugin(Star):
         except Exception as e:
             logger.error(f"Batch text-to-image task error: {e}")
             if (not suppress_user_error) or self._should_show_debug_errors():
-                await event.send(event.chain_result([Plain(f"❌ 批量生成任务异常: {e}")]))
+                await event.send(event.chain_result([Plain(f"这批出了点状况: {e}")]))
             return {"success": 0, "fail": count, "errors": [self._mask_llm_error(e, "这次没弄好，请稍后再试。")]}
 
     # ================= 批量图生图功能（同一张图片生成多个版本） =================
@@ -1510,7 +1593,7 @@ class FigurineProPlugin(Star):
                                 results["errors"].append(error_msg)
                                 if (not suppress_user_error) or self._should_show_debug_errors():
                                     await event.send(event.chain_result([
-                                        Plain(f"❌ [{index}/{count}] 最终生成失败: {error_msg}")
+                                        Plain(f"第{index}个版本没弄好: {error_msg}")
                                     ]))
 
                     except Exception as e:
@@ -1521,7 +1604,7 @@ class FigurineProPlugin(Star):
                             results["errors"].append(error_msg)
                         if (not suppress_user_error) or self._should_show_debug_errors():
                             await event.send(event.chain_result([
-                                Plain(f"❌ [{index}/{count}] 处理异常: {error_msg}")
+                                Plain(f"第{index}个版本出了点问题: {error_msg}")
                             ]))
                     finally:
                         await self._complete_pending_generation(event.unified_msg_origin, 1)
@@ -1539,7 +1622,7 @@ class FigurineProPlugin(Star):
         except Exception as e:
             logger.error(f"Batch image-to-image task error: {e}")
             if (not suppress_user_error) or self._should_show_debug_errors():
-                await event.send(event.chain_result([Plain(f"❌ 多版本生成任务异常: {e}")]))
+                await event.send(event.chain_result([Plain(f"多版本处理出了点状况: {e}")]))
             return {"success": 0, "fail": count, "errors": [self._mask_llm_error(e, "这次没弄好，请稍后再试。")]}
 
     # ================= LLM 工具调用 (Tool Calling) =================
@@ -1624,7 +1707,7 @@ class FigurineProPlugin(Star):
         '''根据文本描述生成图片（文生图）。
 
         【排他性条件（极度重要！）】
-        - 如果用户是向你要**你自己的**照片（例如："发你的自拍"、"你的私房照"、"看看你长啥样"），【严禁】调用此工具！必须使用 shoubanhua_persona_photo 工具！
+        - 如果用户是向你要**你自己的**照片（例如："发你的自拍"、"看看自拍"、"来张自拍"、"你的私房照"、"看看你长啥样"），【严禁】调用此工具！必须使用 shoubanhua_persona_photo 工具！
         - 本工具仅用于生成除你自己以外的其他角色或事物的图片！
 
         调用前请判断用户是否明确要求生成图片。如果用户只是闲聊则不要调用。
@@ -1644,7 +1727,7 @@ class FigurineProPlugin(Star):
         '''
         # 0. 检查 LLM 工具开关
         if not self._get_conf_bool("enable_llm_tool", True):
-            return "❌ LLM 工具已禁用，请使用指令模式调用此功能。"
+            return self._finalize_llm_tool_result("[TOOL_UNAVAILABLE] 当前功能暂时不可用。请用自己平时的语气告诉用户现在不方便，别提功能禁用、指令模式等词汇，要自然。")
 
         # 0.1 检查图片生成冷却时间
         uid = norm_id(event.get_sender_id())
@@ -1677,9 +1760,11 @@ class FigurineProPlugin(Star):
         total_cost = count
         deduction = await self._check_quota(event, uid, gid, total_cost)
         if not deduction["allowed"]:
-            if count > 1:
-                return f"❌ 次数不足。生成 {count} 张图片需要 {total_cost} 次。{deduction['msg']}"
-            return deduction["msg"]
+            return self._finalize_llm_tool_result(
+                "[TOOL_FAILED] 用户次数不足，无法完成。"
+                "请用你自己平时的语气告诉用户现在搞不了，"
+                "别提'次数''配额''限制'等词汇，随口带过就好，可以让TA联系管理员或等等再来。"
+            )
 
         # 4. 更新图片生成冷却时间
         self._update_image_cooldown(uid)
@@ -1713,28 +1798,22 @@ class FigurineProPlugin(Star):
 
         if rebellious_hint:
             # 有叛逆提示时，让 LLM 可以用叛逆语气回复
-            if count > 1:
-                result = f"任务已受理，预设：{preset_name}，共 {count} 张。"
-            else:
-                result = f"任务已受理，预设：{preset_name}。"
+            # 有叛逆提示：给 LLM 只提供最精简的事实 + 人格引导
+            _draw_hint = "[TOOL_SUCCESS] 图已发出去了。"
             if count > 1 and 'batch_result' in locals() and batch_result.get("fail", 0) > 0:
-                result += f" 这次先弄好了 {batch_result.get('success', 0)} 张。"
-            if extra_rules:
-                result += f" 追加规则：{extra_rules[:30]}。"
+                _draw_hint = f"[TOOL_SUCCESS] 发出去了{batch_result.get('success', 0)}张，有{batch_result.get('fail', 0)}张没弄好。"
             if count_limit_reply:
-                result += count_limit_reply
-            result += "图片已经生成并发送完成。"
-            result += rebellious_hint
-            return result
+                _draw_hint += " " + count_limit_reply
+            _draw_hint += rebellious_hint
+            return _draw_hint
         else:
             if count_limit_reply:
-                return count_limit_reply
-            # 没有额外人格提示时，允许 LLM 自然发挥
+                return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 图已发出。{count_limit_reply}")
             if count > 1:
                 if 'batch_result' in locals() and batch_result.get("fail", 0) > 0:
-                    return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 批量文生图任务已结束，预设：{preset_name}，已发送 {batch_result.get('success', 0)} 张可用结果。你可以按原本人设自然接话，也可以不补充收尾。")
-                return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 批量文生图任务已结束，预设：{preset_name}，共 {count} 张，图片已经发送给用户。你可以按原本人设自然接话，也可以不补充收尾。")
-            return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 文生图任务已结束，预设：{preset_name}，图片已经发送给用户。你可以按原本人设自然接话，也可以不补充收尾。")
+                    return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 图已发出，成功{batch_result.get('success', 0)}张，有{batch_result.get('fail', 0)}张没弄好。用你自己的语气随口说一下就行。")
+                return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] {count}张图都发出去了。用你自己的语气随口带过，别说'生成'等词汇。")
+            return self._finalize_llm_tool_result("[TOOL_SUCCESS] 图发出去了。用你自己的语气随口带过，也可以什么都不说。")
 
     @filter.llm_tool(name="shoubanhua_edit_image")
     async def image_edit_tool(self, event: AstrMessageEvent, prompt: str, use_message_images: bool = True,
@@ -1773,7 +1852,7 @@ class FigurineProPlugin(Star):
         '''
         # 0. 检查 LLM 工具开关
         if not self._get_conf_bool("enable_llm_tool", True):
-            return "❌ LLM 工具已禁用，请使用指令模式调用此功能。"
+            return self._finalize_llm_tool_result("[TOOL_UNAVAILABLE] 当前功能暂时不可用。请用自己平时的语气告诉用户现在不方便，别提功能禁用、指令模式等词汇，要自然。")
 
         # 0.1 检查图片生成冷却时间
         uid = norm_id(event.get_sender_id())
@@ -1867,7 +1946,11 @@ class FigurineProPlugin(Star):
             total_cost = total_images * count
             deduction = await self._check_quota(event, uid, gid, total_cost)
             if not deduction["allowed"]:
-                return f"❌ 次数不足。分别处理 {total_images} 张图片(每张{count}个版本)需要 {total_cost} 次。{deduction['msg']}"
+                return self._finalize_llm_tool_result(
+                    "[TOOL_FAILED] 用户次数不足，无法完成。"
+                    "请用你自己平时的语气告诉用户现在搞不了，"
+                    "别提'次数''配额''限制'等词汇，随口带过就好，可以让TA联系管理员或等等再来。"
+                )
 
             self._update_image_cooldown(uid)
 
@@ -1919,24 +2002,24 @@ class FigurineProPlugin(Star):
             vip_hint = self._build_master_identity_hint(uid, event, explicit_master=True) if self._is_vip_user(uid, event) else ""
             rebellious_hint = vip_hint or self._get_rebellious_hint(prompt, uid, event)
             if rebellious_hint:
-                result = f"这次的处理已经结束，预设：{preset_name}。"
+                _multi_hint = "[TOOL_SUCCESS] 这批图处理完发出去了。"
                 if total_fail > 0:
-                    result += f" 这次先整理好了 {total_success} 张。"
-                else:
-                    result += f" 共 {total_images} 张图片分别处理完毕。"
-                return result + rebellious_hint
+                    _multi_hint = f"[TOOL_SUCCESS] 发出去了{total_success}张，有{total_fail}张没弄好。"
+                return _multi_hint + rebellious_hint
             else:
                 if total_fail > 0:
-                    return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 多图分别处理任务已结束，已发送 {total_success} 张可用结果。你可以按原本人设自然接话，也可以不补充收尾。")
-                return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 多图分别处理任务已结束，共 {total_images} 张，结果已经发送给用户。你可以按原本人设自然接话，也可以不补充收尾。")
+                    return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 发出去了{total_success}张，有{total_fail}张没弄好。用你自己的语气随口带过。")
+                return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] {total_images}张图都弄好发出去了。用你自己的语气随口带过，也可以什么都不说。")
 
         # ==== 分支：普通单次处理（单图或合并多图） ====
         total_cost = count
         deduction = await self._check_quota(event, uid, gid, total_cost)
         if not deduction["allowed"]:
-            if count > 1:
-                return f"❌ 次数不足。生成 {count} 个版本需要 {total_cost} 次。{deduction['msg']}"
-            return deduction["msg"]
+            return self._finalize_llm_tool_result(
+                "[TOOL_FAILED] 用户次数不足，无法完成。"
+                "请用你自己平时的语气告诉用户现在搞不了，"
+                "别提'次数''配额''限制'等词汇，随口带过就好，可以让TA联系管理员或等等再来。"
+            )
 
         # 2. 根据配置决定是否发送进度提示
         if show_llm_progress:
@@ -1975,28 +2058,22 @@ class FigurineProPlugin(Star):
 
         if rebellious_hint:
             # 有叛逆提示时，让 LLM 可以用叛逆语气回复
-            if count > 1:
-                result = f"任务已受理，预设：{preset_name}，共 {count} 个不同版本。"
-            else:
-                result = f"任务已受理，预设：{preset_name}。"
+            # 有叛逆提示：给 LLM 只提供最精简的事实 + 人格引导
+            _edit_hint = "[TOOL_SUCCESS] 图处理完发出去了。"
             if count > 1 and 'batch_result' in locals() and batch_result.get("fail", 0) > 0:
-                result += f" 这次先弄好了 {batch_result.get('success', 0)} 个版本。"
-            if extra_rules:
-                result += f" 追加规则：{extra_rules[:30]}。"
+                _edit_hint = f"[TOOL_SUCCESS] 发出去了{batch_result.get('success', 0)}个版本，有{batch_result.get('fail', 0)}个没弄好。"
             if count_limit_reply:
-                result += count_limit_reply
-            result += "图片已经生成并发送完成。"
-            result += rebellious_hint
-            return result
+                _edit_hint += " " + count_limit_reply
+            _edit_hint += rebellious_hint
+            return _edit_hint
         else:
             if count_limit_reply:
-                return count_limit_reply
-            # 没有额外人格提示时，允许 LLM 自然发挥
+                return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 图处理完了。{count_limit_reply}")
             if count > 1:
                 if 'batch_result' in locals() and batch_result.get("fail", 0) > 0:
-                    return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 多版本图生图任务已结束，预设：{preset_name}，已发送 {batch_result.get('success', 0)} 个可用版本。你可以按原本人设自然接话，也可以不补充收尾。")
-                return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 多版本图生图任务已结束，预设：{preset_name}，共 {count} 个不同版本，图片已经发送给用户。你可以按原本人设自然接话，也可以不补充收尾。")
-            return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 图生图任务已结束，预设：{preset_name}，图片已经发送给用户。你可以按原本人设自然接话，也可以不补充收尾。")
+                    return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 处理完了，成功{batch_result.get('success', 0)}个版本，有{batch_result.get('fail', 0)}个没弄好。用你自己的语气随口说一下。")
+                return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] {count}个版本都弄好发出去了。用你自己的语气随口带过，别说'生成'等词汇。")
+            return self._finalize_llm_tool_result("[TOOL_SUCCESS] 图弄好发出去了。用你自己的语气随口带过，也可以什么都不说。")
 
     # ================= 传统指令触发 =================
 
@@ -2075,9 +2152,10 @@ class FigurineProPlugin(Star):
 
         # 指令模式：立刻反馈
         mode_str = "增强" if is_power else ""
-        preset_display = "自定义" if preset_name in ["自定义", "编辑"] else preset_name
+        _internal = {"自定义", "编辑", "edit", "custom"}
+        preset_display = "" if (not preset_name or preset_name.strip().lower() in _internal) else preset_name
         template = self.conf.get("generating_msg_template", "🎨 收到请求，正在生成 [{preset}]...")
-        feedback = template.replace("{preset}", preset_display)
+        feedback = template.replace("{preset}", preset_display) if preset_display else template.replace(" [{preset}]", "").replace("[{preset}]", "")
         if mode_str and "收到请求" in feedback:
             feedback = feedback.replace("收到请求", f"收到{mode_str}请求")
         yield event.chain_result([Plain(feedback)])
@@ -2140,7 +2218,7 @@ class FigurineProPlugin(Star):
 
             yield event.chain_result([Image.fromBytes(res), Plain(info)])
         else:
-            yield event.chain_result([Plain(f"❌ 失败: {res}")])
+            yield event.chain_result([Plain(f"没弄好: {res}")])
 
     @filter.command("文生图", prefix_optional=True)
     async def on_txt2img(self, event: AstrMessageEvent, ctx=None):
@@ -2155,9 +2233,10 @@ class FigurineProPlugin(Star):
 
         final_prompt, preset_name, extra_rules = self._process_prompt_and_preset(prompt)
 
-        preset_display = "自定义" if preset_name in ["自定义", "编辑"] else preset_name
+        _internal2 = {"自定义", "编辑", "edit", "custom"}
+        preset_display = "" if (not preset_name or preset_name.strip().lower() in _internal2) else preset_name
         template = self.conf.get("generating_msg_template", "🎨 收到请求，正在生成 [{preset}]...")
-        feedback = template.replace("{preset}", preset_display)
+        feedback = template.replace("{preset}", preset_display) if preset_display else template.replace(" [{preset}]", "").replace("[{preset}]", "")
         yield event.chain_result([Plain(feedback)])
 
         if deduction["source"] == "user":
@@ -2194,7 +2273,7 @@ class FigurineProPlugin(Star):
             info += f" | 剩余: {quota_str}"
             yield event.chain_result([Image.fromBytes(res), Plain(info)])
         else:
-            yield event.chain_result([Plain(f"❌ {res}")])
+            yield event.chain_result([Plain(str(res))])
 
     # 辅助方法
     def _get_help_node(self, event):
@@ -2224,7 +2303,7 @@ class FigurineProPlugin(Star):
         k, v = k.strip(), v.strip()
 
         if not k or not v:
-            yield event.chain_result([Plain("❌ 触发词和提示词都不能为空")])
+            yield event.chain_result([Plain("触发词和提示词都不能为空哦")])
             return
 
         # 使用 DataManager 进行持久化保存
@@ -2247,7 +2326,7 @@ class FigurineProPlugin(Star):
         if len(parts) < 2: yield event.chain_result([Plain("用法: #lm查看 <关键词>")]); return
         kw = parts[1].strip()
         prompt = self.data_mgr.get_prompt(kw)
-        msg = f"🔍 [{kw}]:\n{prompt}" if prompt else f"❌ 未找到 [{kw}]"
+        msg = f"🔍 [{kw}]:\n{prompt}" if prompt else f"没找到 [{kw}]"
         yield event.chain_result([Plain(msg)])
 
     @filter.command("手办化签到", prefix_optional=True)
@@ -2302,7 +2381,7 @@ class FigurineProPlugin(Star):
                 self._save_config()
                 yield event.chain_result([Plain(f"✅ 已切换为预设模型: {all_m[idx]}")])
             else:
-                yield event.chain_result([Plain("❌ 序号超出范围。")])
+                yield event.chain_result([Plain("序号超出范围了")])
         else:
             # 直接按名称写入任意模型
             self.conf["model"] = target
@@ -2524,7 +2603,7 @@ class FigurineProPlugin(Star):
         '''
         # 0. 检查 LLM 工具开关
         if not self._get_conf_bool("enable_llm_tool", True):
-            return "❌ LLM 工具已禁用，请使用指令模式调用此功能。"
+            return self._finalize_llm_tool_result("[TOOL_UNAVAILABLE] 当前功能暂时不可用。请用自己平时的语气告诉用户现在不方便，别提功能禁用、指令模式等词汇，要自然。")
 
         # 0.1 检查图片生成冷却时间
         uid = norm_id(event.get_sender_id())
@@ -2753,7 +2832,7 @@ class FigurineProPlugin(Star):
 
         # 检查预设是否存在
         if preset_name not in self.data_mgr.prompt_map:
-            yield event.chain_result([Plain(f"❌ 预设 [{preset_name}] 不存在\n请先使用 #lm添加 创建预设")])
+            yield event.chain_result([Plain(f"预设 [{preset_name}] 不存在，先用 #lm添加 创建一个吧")])
             return
 
         # 提取图片
@@ -2761,7 +2840,7 @@ class FigurineProPlugin(Star):
         images = await self.img_mgr.extract_images_from_event(event, ignore_id=bot_id, context=self.context)
 
         if not images:
-            yield event.chain_result([Plain("❌ 未检测到图片，请发送或引用图片")])
+            yield event.chain_result([Plain("没检测到图片，发送或引用一下图片再试")])
             return
 
         # 保存参考图
@@ -2772,7 +2851,7 @@ class FigurineProPlugin(Star):
             yield event.chain_result(
                 [Plain(f"✅ 已为预设 [{preset_name}] 添加 {count} 张参考图\n当前共 {total} 张参考图")])
         else:
-            yield event.chain_result([Plain("❌ 保存参考图失败")])
+            yield event.chain_result([Plain("参考图保存失败了，再试试？")])
 
     @filter.command("预设参考图查看", aliases={"lmref查看", "查看参考图"}, prefix_optional=True)
     async def on_view_preset_ref(self, event: AstrMessageEvent, ctx=None):
@@ -2848,7 +2927,7 @@ class FigurineProPlugin(Star):
         preset_name = parts[1].strip()
 
         if not parts[2].isdigit():
-            yield event.chain_result([Plain("❌ 序号必须是数字")])
+            yield event.chain_result([Plain("序号得填数字啊")])
             return
 
         index = int(parts[2]) - 1  # 转为0开始的索引
@@ -2860,7 +2939,7 @@ class FigurineProPlugin(Star):
             yield event.chain_result(
                 [Plain(f"✅ 已删除预设 [{preset_name}] 的第 {index + 1} 张参考图\n剩余 {remaining} 张")])
         else:
-            yield event.chain_result([Plain(f"❌ 删除失败，请检查预设名和序号是否正确")])
+            yield event.chain_result([Plain("删除失败了，检查一下预设名和序号对不对？")])
 
     @filter.command("预设参考图统计", aliases={"lmref统计", "参考图统计"}, prefix_optional=True)
     async def on_preset_ref_stats(self, event: AstrMessageEvent, ctx=None):
@@ -3114,11 +3193,11 @@ class FigurineProPlugin(Star):
         try:
             valid_images = [img for img in images_bytes if isinstance(img, bytes) and len(img) > 0]
             if not valid_images:
-                return False, "❌ 未检测到有效的图片。"
+                return False, "没检测到有效的图片。"
 
             pdf_bytes = self.img_mgr.images_to_pdf(valid_images)
             if not pdf_bytes:
-                return False, "❌ 打包 PDF 失败，可能图片格式不支持。"
+                return False, "打包 PDF 失败了，可能图片格式不支持。"
 
             import uuid
             import os
@@ -3133,7 +3212,7 @@ class FigurineProPlugin(Star):
             return True, f"成功将 {len(valid_images)} 张图片打包为 PDF"
         except Exception as e:
             logger.error(f"独立打包 PDF 异常: {e}", exc_info=True)
-            return False, f"❌ {self._mask_llm_error(e, '打包 PDF 失败，请稍后再试。')}"
+            return False, f"{self._mask_llm_error(e, '打包 PDF 失败了，请稍后再试。')}"
 
     def _translate_error_to_chinese(self, error: str) -> str:
         """将错误信息翻译为中文"""
@@ -3261,7 +3340,7 @@ class FigurineProPlugin(Star):
             yield event.chain_result([Plain(block_msg)])
             return
 
-        yield event.chain_result([Plain("📦 正在检测图片是否已生成完成，请稍候...")])
+        yield event.chain_result([Plain("📦 正在检测可用图片，请稍候...")])
 
         valid_images_bytes = await self._gather_images_for_pdf(event, max_images=0, wait_for_generation=True)
 
@@ -3271,7 +3350,7 @@ class FigurineProPlugin(Star):
             return
 
         if not valid_images_bytes:
-            yield event.chain_result([Plain("❌ 未检测到有效的图片。若图片仍在生成中，请稍后再试。")])
+            yield event.chain_result([Plain("没检测到有效的图片，如果还在弄的话稍等一下再试~")])
             return
 
         yield event.chain_result([Plain(f"📦 已检测到 {len(valid_images_bytes)} 张图片，正在打包为 PDF，请稍候...")])
@@ -3303,20 +3382,20 @@ class FigurineProPlugin(Star):
         if not can_pack:
             return block_msg
 
-        await event.send(event.chain_result([Plain("📦 正在等待图片生成完成并收集图片，请稍候...")]))
+        await event.send(event.chain_result([Plain("📦 正在收集图片，请稍候...")]))
 
         try:
             valid_images_bytes = await self._gather_images_for_pdf(event, max_images=max_images, wait_for_generation=True)
         except Exception as e:
             logger.error(f"收集 PDF 图片异常: {e}", exc_info=True)
-            return f"❌ {self._mask_llm_error(e, '收集图片失败，请稍后再试。')}"
+            return self._finalize_llm_tool_result(f"[TOOL_FAILED] {self._mask_llm_error(e, '收集图片失败')}\n请用你自己的语气告诉用户现在搞不了，稍后再试试。")
 
         can_pack, block_msg = await self._can_pack_pdf_now(event, valid_images_bytes)
         if not can_pack:
             return block_msg
 
         if not valid_images_bytes:
-            return "❌ 在等待一段时间后仍未检测到可用于打包的图片。请稍等图片全部生成完成后再试。"
+            return self._finalize_llm_tool_result("[TOOL_FAILED] 等了一会儿还是没找到可用的图片。\n请用你自己的语气告诉用户现在没有图可以打包，稍后再来。")
 
         await event.send(event.chain_result([Plain(f"📦 已收集到 {len(valid_images_bytes)} 张图片，正在打包为 PDF，请稍候...")]))
 
@@ -3360,7 +3439,7 @@ class FigurineProPlugin(Star):
 
         # 0. 检查 LLM 工具开关
         if not self._get_conf_bool("enable_llm_tool", True):
-            return "❌ LLM 工具已禁用，请使用指令模式调用此功能。"
+            return self._finalize_llm_tool_result("[TOOL_UNAVAILABLE] 当前功能暂时不可用。请用自己平时的语气告诉用户现在不方便，别提功能禁用、指令模式等词汇，要自然。")
 
         active_task = await self._get_active_session_task(event.unified_msg_origin)
         if active_task:
@@ -3402,14 +3481,14 @@ class FigurineProPlugin(Star):
         cached_image_sources = await self._get_recent_generated_image_sources(session_id, max_images=max_images)
 
         if not image_sources and not current_urls and not pdf_extracted_urls and not cached_image_sources:
-            return "❌ 未在上下文中找到图片或PDF。请先发送图片/PDF，然后再使用批量处理功能。"
+            return self._finalize_llm_tool_result("[TOOL_FAILED] 上下文里没找到图片或PDF。\n请用你自己的语气让用户先发图再试。")
 
         # 3. 收集所有图片URL（统一过滤头像、去重并按顺序整理）
         merged_current_urls = list(pdf_extracted_urls) + list(current_urls) + list(cached_image_sources)
         all_image_urls = self._merge_batch_image_urls(merged_current_urls, image_sources, max_images=max_images)
         total_images = len(all_image_urls)
         if total_images == 0:
-            return "❌ 未找到有效的图片URL。"
+            return self._finalize_llm_tool_result("[TOOL_FAILED] 没找到有效的图片。\n请用你自己的语气告诉用户没找到图，发几张再来。")
 
         # 3. 计算预设和追加规则
         final_prompt, preset_name, extra_rules = self._process_prompt_and_preset(prompt)
@@ -3420,7 +3499,11 @@ class FigurineProPlugin(Star):
 
         deduction = await self._check_quota(event, uid, gid, total_cost)
         if not deduction["allowed"]:
-            return f"❌ 次数不足。批量处理 {total_images} 张图片需要 {total_cost} 次。{deduction['msg']}"
+            return self._finalize_llm_tool_result(
+                "[TOOL_FAILED] 用户次数不足，无法完成。"
+                "请用你自己平时的语气告诉用户现在搞不了，"
+                "别提'次数''配额''限制'等词汇，随口带过就好，可以让TA联系管理员或等等再来。"
+            )
 
         # 4.1 更新冷却时间
         self._update_image_cooldown(uid)
@@ -3471,7 +3554,7 @@ class FigurineProPlugin(Star):
                         # 发送单条失败提示（仅调试模式显示）
                         if self._should_show_debug_errors():
                             await event.send(event.chain_result([
-                                Plain(f"❌ 第 {i}/{total_images} 张图片处理失败\n📍 原因: {error_msg}")
+                                Plain(f"第 {i}/{total_images} 张没弄好: {error_msg}")
                             ]))
                         continue
 
@@ -3543,7 +3626,7 @@ class FigurineProPlugin(Star):
                         # 发送单条失败提示（仅调试模式显示）
                         if self._should_show_debug_errors():
                             await event.send(event.chain_result([
-                                Plain(f"❌ 第 {i}/{total_images} 张图片最终处理失败\n📍 原因: {error_msg}")
+                                Plain(f"第 {i}/{total_images} 张最终没弄好: {error_msg}")
                             ]))
 
                     await self._update_session_task_progress(
@@ -3568,7 +3651,7 @@ class FigurineProPlugin(Star):
                     )
                     if self._should_show_debug_errors():
                         await event.send(event.chain_result([
-                            Plain(f"❌ 第 {i}/{total_images} 张图片处理异常\n📍 原因: {error_msg}")
+                            Plain(f"第 {i}/{total_images} 张出了点问题: {error_msg}")
                         ]))
 
             if output_as_pdf:
@@ -3590,10 +3673,10 @@ class FigurineProPlugin(Star):
                     except Exception as e:
                         logger.error(f"打包 PDF 失败: {e}")
                         if self._should_show_debug_errors():
-                            await event.send(event.chain_result([Plain(f"❌ 打包 PDF 失败: {e}")]))
+                            await event.send(event.chain_result([Plain(f"PDF 打包出了点问题: {e}")]))
                 else:
                     if self._should_show_debug_errors():
-                        await event.send(event.chain_result([Plain("❌ 抱歉，所有图片生成均失败，无法打包为 PDF。")]))
+                        await event.send(event.chain_result([Plain("抱歉，这批图都没弄好，打包不了 PDF。")]))
             elif show_llm_progress:
                 summary = "这批图我先整理完了，能发出来的都已经给你了。"
                 await event.send(event.chain_result([Plain(summary)]))
@@ -3607,7 +3690,7 @@ class FigurineProPlugin(Star):
 
         asyncio.create_task(wrapped_process_all())
 
-        return f"批量处理任务已启动，共 {total_images} 张图片，预设：{preset_name}。每张图片将独立处理并发送结果。"
+        return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 批量处理任务已启动，共 {total_images} 张图片，预设：{preset_name}。图片将陆续发出，请用自然语言告知用户稍等即可，不要用'生成'等机械词汇。")
 
     @filter.llm_tool(name="shoubanhua_batch_process_concurrent")
     async def batch_process_concurrent_tool(self, event: AstrMessageEvent, prompt: str, max_images: int = 10,
@@ -3635,7 +3718,7 @@ class FigurineProPlugin(Star):
 
         # 0. 检查 LLM 工具开关
         if not self._get_conf_bool("enable_llm_tool", True):
-            return "❌ LLM 工具已禁用，请使用指令模式调用此功能。"
+            return self._finalize_llm_tool_result("[TOOL_UNAVAILABLE] 当前功能暂时不可用。请用自己平时的语气告诉用户现在不方便，别提功能禁用、指令模式等词汇，要自然。")
 
         active_task = await self._get_active_session_task(event.unified_msg_origin)
         if active_task:
@@ -3676,14 +3759,14 @@ class FigurineProPlugin(Star):
         cached_image_sources = await self._get_recent_generated_image_sources(session_id, max_images=max_images)
 
         if not image_sources and not current_urls and not pdf_extracted_urls and not cached_image_sources:
-            return "❌ 未在上下文中找到图片或PDF。请先发送图片/PDF，然后再使用批量处理功能。"
+            return self._finalize_llm_tool_result("[TOOL_FAILED] 上下文里没找到图片或PDF。\n请用你自己的语气让用户先发图再试。")
 
         # 3. 收集所有图片URL（统一过滤头像、去重并按顺序整理）
         merged_current_urls = list(pdf_extracted_urls) + list(current_urls) + list(cached_image_sources)
         all_image_urls = self._merge_batch_image_urls(merged_current_urls, image_sources, max_images=max_images)
         total_images = len(all_image_urls)
         if total_images == 0:
-            return "❌ 未找到有效的图片URL。"
+            return self._finalize_llm_tool_result("[TOOL_FAILED] 没找到有效的图片。\n请用你自己的语气告诉用户没找到图，发几张再来。")
 
         # 3. 计算预设和追加规则
         final_prompt, preset_name, extra_rules = self._process_prompt_and_preset(prompt)
@@ -3694,7 +3777,11 @@ class FigurineProPlugin(Star):
 
         deduction = await self._check_quota(event, uid, gid, total_cost)
         if not deduction["allowed"]:
-            return f"❌ 次数不足。批量处理 {total_images} 张图片需要 {total_cost} 次。{deduction['msg']}"
+            return self._finalize_llm_tool_result(
+                "[TOOL_FAILED] 用户次数不足，无法完成。"
+                "请用你自己平时的语气告诉用户现在搞不了，"
+                "别提'次数''配额''限制'等词汇，随口带过就好，可以让TA联系管理员或等等再来。"
+            )
 
         # 4.1 更新冷却时间
         self._update_image_cooldown(uid)
@@ -3747,7 +3834,7 @@ class FigurineProPlugin(Star):
                         )
                         if self._should_show_debug_errors():
                             await event.send(event.chain_result([
-                                Plain(f"❌ 第 {index}/{total_images} 张图片处理失败\n📍 原因: {error_msg}")
+                                Plain(f"第 {index}/{total_images} 张没弄好: {error_msg}")
                             ]))
                         return
 
@@ -3817,7 +3904,7 @@ class FigurineProPlugin(Star):
                             })
                             if self._should_show_debug_errors():
                                 await event.send(event.chain_result([
-                                    Plain(f"❌ 第 {index}/{total_images} 张图片最终处理失败\n📍 原因: {error_msg}")
+                                    Plain(f"第 {index}/{total_images} 张最终没弄好: {error_msg}")
                                 ]))
                         await self._update_session_task_progress(
                             event.unified_msg_origin, current=index, success=results["success"], fail=results["fail"]
@@ -3838,7 +3925,7 @@ class FigurineProPlugin(Star):
                     )
                     if self._should_show_debug_errors():
                         await event.send(event.chain_result([
-                            Plain(f"❌ 第 {index}/{total_images} 张图片处理异常\n📍 原因: {error_msg}")
+                            Plain(f"第 {index}/{total_images} 张出了点问题: {error_msg}")
                         ]))
 
         async def process_all():
@@ -3869,15 +3956,15 @@ class FigurineProPlugin(Star):
                             
                             summary = f"\n📊 并发批量处理完成，已打包为 PDF\n"
                             summary += f"✅ 成功: {results['success']} 张\n"
-                            summary += f"❌ 失败: {results['fail']} 张"
+                            summary += f"失败: {results['fail']} 张"
                             await event.send(event.chain_result([Plain("这批图我已经先整理成册发你了。")]))
                     except Exception as e:
                         logger.error(f"打包 PDF 失败: {e}")
                         if self._should_show_debug_errors():
-                            await event.send(event.chain_result([Plain(f"❌ 打包 PDF 失败: {e}")]))
+                            await event.send(event.chain_result([Plain(f"PDF 打包出了点问题: {e}")]))
                 else:
                     if self._should_show_debug_errors():
-                        await event.send(event.chain_result([Plain("❌ 抱歉，所有图片生成均失败，无法打包为 PDF。")]))
+                        await event.send(event.chain_result([Plain("抱歉，这批图都没弄好，打包不了 PDF。")]))
             elif show_llm_progress:
                 # 发送完成汇总
                 summary = "这批图我先整理完了，能发出来的都已经给你了。"
@@ -3892,7 +3979,7 @@ class FigurineProPlugin(Star):
 
         asyncio.create_task(wrapped_process_all())
 
-        return f"并发批量处理任务已启动，共 {total_images} 张图片，并发数 {concurrency}，预设：{preset_name}。"
+        return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 并发批量处理任务已启动，共 {total_images} 张图片，预设：{preset_name}。图片将陆续发出，请用自然语言告知用户稍等即可，不要用'生成'等机械词汇。")
 
     # ================= 日常人设功能 =================
 
@@ -3903,7 +3990,7 @@ class FigurineProPlugin(Star):
 
         【唯一指定用途】
         只要用户是要求看**你的**照片、写真集、自拍等，无论要求多少张，都【必须且只能】使用此工具，绝对不能使用 shoubanhua_draw_image。
-        典型触发语包括："发你的自拍"、"看看你"、"让我看看你长什么样"、"来几张你的写真"、"发你本人照片"。
+        典型触发语包括："发你的自拍"、"看看自拍"、"来张自拍"、"看看你"、"让我看看你长什么样"、"来几张你的写真"、"发你本人照片"。
 
         【重要】调用条件（请严格遵守）：
         1. 用户明确要求看照片时才调用，例如："发你的自拍"、"发10张你的写真集"、"看看你"、"让我看看你长什么样"
@@ -3917,10 +4004,10 @@ class FigurineProPlugin(Star):
         '''
         # 0. 检查功能开关
         if not self._persona_mode:
-            return "❌ 日常人设功能未启用。请在配置中开启 enable_persona_mode。"
+            return self._finalize_llm_tool_result("[TOOL_UNAVAILABLE] 人设功能当前未启用。请用自己平时的语气告诉用户现在不方便，别提配置开关等技术词汇。")
 
         if not self._get_conf_bool("enable_llm_tool", True):
-            return "❌ LLM 工具已禁用，请使用指令模式调用此功能。"
+            return self._finalize_llm_tool_result("[TOOL_UNAVAILABLE] 当前功能暂时不可用。请用自己平时的语气告诉用户现在不方便，别提功能禁用、指令模式等词汇，要自然。")
 
         # 0.1 检查图片生成冷却时间
         uid = norm_id(event.get_sender_id())
@@ -3933,7 +4020,7 @@ class FigurineProPlugin(Star):
         # 1. 加载人设参考图
         ref_images = await self._load_persona_ref_images()
         if not ref_images:
-            return "❌ 未配置人设参考图。请先使用 #人设参考图添加 命令添加参考图。"
+            return self._finalize_llm_tool_result("[TOOL_UNAVAILABLE] 人设参考图还没配置好。请用自己平时的语气告诉用户现在还没办法，不要提指令或命令。")
         logger.info(f"人设拍照：已加载人设参考图 {len(ref_images)} 张")
 
         # 1.5 提取用户可能提供的参考图片（如衣服款式、姿势参考等）
@@ -3998,7 +4085,10 @@ class FigurineProPlugin(Star):
         gid = norm_id(event.get_group_id())
         deduction = await self._check_quota(event, uid, gid, count)
         if not deduction["allowed"]:
-            return deduction["msg"]
+            return self._finalize_llm_tool_result(
+                "[TOOL_FAILED] 用户次数不足，无法完成。"
+                "请用你自己平时的语气告诉用户现在搞不了，随口带过就好。"
+            )
 
         # 7. 限制数量
         raw_count = count
@@ -4030,7 +4120,7 @@ class FigurineProPlugin(Star):
                 return self._build_llm_tool_failure(error_msg)
             if count_limited:
                 return self._build_count_limit_reply(count, "persona")
-            return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 人设照片任务已结束，场景：{scene_name}，图片已经发送给用户。你可以按原本人设自然接话，也可以不补充收尾。")
+            return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 照片发出去了（场景：{scene_name}）。用你自己的语气随口带过，也可以什么都不说。")
         else:
             # 对于人设的多张生成，因为传递的是最终合并好的图片（包含人设参考+用户参考），
             # 所以使用 _run_batch_image_to_image。但是要防止该函数再次从数据库读取 "_persona_" 导致图片翻倍。
@@ -4055,8 +4145,8 @@ class FigurineProPlugin(Star):
             if count_limited:
                 return self._build_count_limit_reply(count, "persona")
             if batch_result.get("fail", 0) > 0:
-                return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 人设写真任务已结束，场景：{scene_name}，已发送 {batch_result.get('success', 0)} 张可用图片。你可以按原本人设自然接话，也可以不补充收尾。")
-            return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 人设写真任务已结束，场景：{scene_name}，共 {count} 张，图片已经发送给用户。你可以按原本人设自然接话，也可以不补充收尾。")
+                return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 发出去了{batch_result.get('success', 0)}张，有{batch_result.get('fail', 0)}张没弄好。用你自己的语气随口带过。")
+            return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] {count}张照片都发出去了。用你自己的语气随口带过，也可以什么都不说。")
 
     @filter.command("人设拍照", prefix_optional=True)
     async def on_persona_photo_cmd(self, event: AstrMessageEvent, ctx=None):
@@ -4066,13 +4156,14 @@ class FigurineProPlugin(Star):
         示例: #人设拍照 咖啡店 穿白色连衣裙
         """
         if not self._persona_mode:
-            yield event.chain_result([Plain("❌ 日常人设功能未启用")])
+            yield event.chain_result([Plain("人设功能还没开，联系管理员设置一下吧")])
             return
 
         # 加载人设参考图
         ref_images = await self._load_persona_ref_images()
         if not ref_images:
-            yield event.chain_result([Plain("❌ 未配置人设参考图\n请先使用 #人设参考图添加 命令添加参考图")])
+            yield event.chain_result([Plain("人设参考图还没配置好，先用 #人设参考图添加 添加几张吧")])
+            return
             return
 
         # 解析参数
@@ -4134,7 +4225,7 @@ class FigurineProPlugin(Star):
             info = f"\n✅ 生成成功 ({timing_text}) | 场景: {scene_name} | 剩余: {quota_str}"
             yield event.chain_result([Image.fromBytes(res), Plain(info)])
         else:
-            yield event.chain_result([Plain(f"❌ 生成失败: {res}")])
+            yield event.chain_result([Plain(f"没弄好: {res}")])
 
     @filter.command("人设参考图添加", aliases={"添加人设图"}, prefix_optional=True)
     async def on_add_persona_ref(self, event: AstrMessageEvent, ctx=None):
@@ -4149,7 +4240,7 @@ class FigurineProPlugin(Star):
         images = await self.img_mgr.extract_images_from_event(event, ignore_id=bot_id, context=self.context)
 
         if not images:
-            yield event.chain_result([Plain("❌ 未检测到图片，请发送或引用图片")])
+            yield event.chain_result([Plain("没检测到图片，发送或引用一下图片再试")])
             return
 
         # 保存到特殊预设 "_persona_"
@@ -4159,7 +4250,7 @@ class FigurineProPlugin(Star):
             total = len(self.data_mgr.get_preset_ref_image_paths("_persona_"))
             yield event.chain_result([Plain(f"✅ 已添加 {count} 张人设参考图\n当前共 {total} 张参考图")])
         else:
-            yield event.chain_result([Plain("❌ 保存参考图失败")])
+            yield event.chain_result([Plain("参考图保存失败了，再试试？")])
 
     @filter.command("人设参考图查看", aliases={"查看人设图"}, prefix_optional=True)
     async def on_view_persona_ref(self, event: AstrMessageEvent, ctx=None):
@@ -4303,7 +4394,7 @@ class FigurineProPlugin(Star):
         cached_image_sources = await self._get_recent_generated_image_sources(session_id, max_images=max_images)
 
         if not image_sources and not current_urls and not cached_image_sources:
-            yield event.chain_result([Plain("❌ 未在上下文中找到图片。请先发送图片，然后再使用批量处理功能。")])
+            yield event.chain_result([Plain("上下文里没找到图片，先发点图再来批量处理吧~")])
             return
 
         # 3. 收集所有图片URL（统一过滤头像、去重并按顺序整理）
@@ -4311,7 +4402,7 @@ class FigurineProPlugin(Star):
         all_image_urls = self._merge_batch_image_urls(merged_current_urls, image_sources, max_images=max_images)
         total_images = len(all_image_urls)
         if total_images == 0:
-            yield event.chain_result([Plain("❌ 未找到有效的图片。")])
+            yield event.chain_result([Plain("没找到有效的图片。")])
             return
 
         # 计算预设和追加规则
@@ -4325,17 +4416,19 @@ class FigurineProPlugin(Star):
         deduction = await self._check_quota(event, uid, gid, total_cost)
         if not deduction["allowed"]:
             yield event.chain_result(
-                [Plain(f"❌ 次数不足。批量处理 {total_images} 张图片需要 {total_cost} 次。\n{deduction['msg']}")])
+                [Plain("这会儿先帮不了你啦，今天有点忙不过来。你可以稍后再来，或者联系管理员看下配额设置。")])
             return
 
         concurrency = max(1, self.conf.get("batch_concurrency", 3))
 
         # 发送开始提示
-        preset_display = "自定义" if preset_name in ["自定义", "编辑"] else preset_name
+        _internal3 = {"自定义", "编辑", "edit", "custom"}
+        preset_display = "" if (not preset_name or preset_name.strip().lower() in _internal3) else preset_name
         feedback = f"📦 批量处理任务开始\n"
         feedback += f"📷 共 {total_images} 张图片 | 并发: {concurrency}\n"
-        feedback += f"🎨 预设: {preset_display}"
-        feedback += f"\n⏳ 图片将并发处理，请耐心等待..."
+        if preset_display:
+            feedback += f"🎨 预设: {preset_display}\n"
+        feedback += f"⏳ 图片将并发处理，请耐心等待..."
         yield event.chain_result([Plain(feedback)])
 
         # 扣费
@@ -4366,7 +4459,7 @@ class FigurineProPlugin(Star):
                                 "url_preview": url[:50] + "..." if len(url) > 50 else url
                             })
                         await event.send(event.chain_result([
-                            Plain(f"❌ 第 {index}/{total_images} 张图片处理失败\n📍 原因: {error_msg}")
+                            Plain(f"第 {index}/{total_images} 张没弄好: {error_msg}")
                         ]))
                         return
 
@@ -4412,7 +4505,7 @@ class FigurineProPlugin(Star):
                                 "url_preview": url[:50] + "..." if len(url) > 50 else url
                             })
                             await event.send(event.chain_result([
-                                Plain(f"❌ 第 {index}/{total_images} 张图片最终处理失败\n📍 原因: {error_msg}")
+                                Plain(f"第 {index}/{total_images} 张最终没弄好: {error_msg}")
                             ]))
 
                 except Exception as e:
@@ -4426,7 +4519,7 @@ class FigurineProPlugin(Star):
                             "url_preview": url[:50] + "..." if len(url) > 50 else url
                         })
                     await event.send(event.chain_result([
-                        Plain(f"❌ 第 {index}/{total_images} 张图片处理异常\n📍 原因: {error_msg}")
+                        Plain(f"第 {index}/{total_images} 张出了点问题: {error_msg}")
                     ]))
 
         async def process_all():
@@ -4437,7 +4530,7 @@ class FigurineProPlugin(Star):
             quota_str = self._get_quota_str(deduction, uid, gid)
             summary = f"\n📊 批量处理完成\n"
             summary += f"✅ 成功: {results['success']} 张\n"
-            summary += f"❌ 失败: {results['fail']} 张\n"
+            summary += f"失败: {results['fail']} 张\n"
             summary += f"💰 剩余次数: {quota_str}"
 
             if failed_details:
