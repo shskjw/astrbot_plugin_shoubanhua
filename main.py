@@ -84,6 +84,18 @@ REBELLIOUS_TRIGGERS = [
     "必须", "一定要", "给我",
     "垃圾", "难看", "丑", "不行",
     "看看你", "自拍", "发照片", "你长啥样",
+    "换衣服", "换装", "穿上", "换一套",
+]
+
+# 换衣/穿搭意图关键词
+_CLOTHING_KEYWORDS = [
+    "换衣", "换装", "穿上", "穿着", "换一套", "换一身", "换个造型",
+    "衣服", "裙子", "制服", "校服", "女仆", "和服", "旗袍",
+    "JK", "jk", "洛丽塔", "lolita", "婚纱", "西装", "礼服",
+    "泳装", "比基尼", "丝袜", "水手服", "死库水",
+    "同款", "这件", "那件", "这套", "那套",
+    "cosplay", "cos", "穿这个", "穿那个",
+    "换件", "试试这套", "试试这件", "穿同款",
 ]
 
 
@@ -943,6 +955,9 @@ class FigurineProPlugin(Star):
         _internal = {"", "自定义", "编辑", "edit", "custom"}
         preset_display = "" if (not preset_name or preset_name.strip().lower() in _internal) else preset_name
 
+        # 检测是否为换衣/穿搭相关请求
+        _is_clothing = extra_request and any(kw in extra_request for kw in _CLOTHING_KEYWORDS)
+
         if action == "draw":
             if count <= 1:
                 msg = random.choice([
@@ -968,6 +983,17 @@ class FigurineProPlugin(Star):
                 ])
             return msg
         elif action == "edit":
+            if _is_clothing:
+                return random.choice([
+                    "那我去翻下柜子…等一下哦。",
+                    "行，我去换一套。",
+                    "好好好，等我换个衣服。",
+                    "稍等，先让我找找衣服。",
+                    "好吧，我去试试这套。",
+                    "行行行，换就换。",
+                    "得嘞，我去换。",
+                    "嗯，我去找找看有没有。",
+                ])
             if total_images > 1:
                 return random.choice([
                     f"稍等，帮你把这{total_images}张都弄一下。",
@@ -993,12 +1019,30 @@ class FigurineProPlugin(Star):
                     base += random.choice([f" 按{preset_display}来。", f" 用{preset_display}。"])
                 return base
         elif action == "persona":
+            if _is_clothing:
+                return random.choice([
+                    "那我去翻下柜子，等我一下哦。",
+                    "好，等我换件衣服先。",
+                    "嗯嗯，我先去换个造型，稍等。",
+                    "行吧，先让我翻翻衣柜。",
+                    "稍等哦，换好了就来。",
+                    "好好好，我去换一套。",
+                    "等我一下，先去换个衣服。",
+                    "行，我去试试看。",
+                ])
+            if has_user_images:
+                return random.choice([
+                    "嗯，我看看你给的图，稍等。",
+                    "收到，我参考一下，等我哦。",
+                    "好的好的，照着来，稍等。",
+                    "嗯嗯，我看看，等一下。",
+                ])
             return random.choice([
-                "稍等一下哦。",
-                "等我一下。",
-                "好，弄一下。",
-                "嗯，稍等。",
-                "诶，等等。",
+                "稍等一下哦，马上好。",
+                "好，等我一下。",
+                "嗯嗯，稍等，我弄一下。",
+                "好的，稍等哦。",
+                "收到，等我一下。",
             ])
         elif action == "auto_text":
             return random.choice([
@@ -1957,7 +2001,7 @@ class FigurineProPlugin(Star):
             # 发送进度提示
             if show_llm_progress:
                 feedback = self._build_llm_progress_text(
-                    "edit", preset_name=preset_name, count=count, total_images=total_images, extra_request=extra_rules
+                    "edit", preset_name=preset_name, count=count, total_images=total_images, extra_request=extra_rules or prompt
                 )
                 await event.send(event.chain_result([Plain(feedback)]))
 
@@ -2024,7 +2068,7 @@ class FigurineProPlugin(Star):
         # 2. 根据配置决定是否发送进度提示
         if show_llm_progress:
             feedback = self._build_llm_progress_text(
-                "edit", preset_name=preset_name, count=count, extra_request=extra_rules
+                "edit", preset_name=preset_name, count=count, extra_request=extra_rules or prompt
             )
             await event.send(event.chain_result([Plain(feedback)]))
 
@@ -4028,8 +4072,15 @@ class FigurineProPlugin(Star):
         bot_id = self._get_bot_id(event)
         user_images = await self.img_mgr.extract_images_from_event(event, ignore_id=bot_id, context=self.context)
 
-        # 如果当前消息没有图片，尝试从上下文获取
-        if not user_images:
+        # 如果当前消息没有图片，仅在用户明确表达了参考图意图时才回溯上下文
+        # 避免用户只说"看看自拍"时误取历史无关图片
+        _ref_intent_keywords = [
+            "同款", "这件", "那件", "这套", "那套", "穿这个", "穿那个",
+            "照着", "参考", "模仿", "一样的", "跟这个",
+            "换衣", "换装", "穿上", "换一套", "换一身", "cos",
+        ]
+        _has_ref_intent = extra_request and any(kw in extra_request for kw in _ref_intent_keywords)
+        if not user_images and _has_ref_intent:
             session_id = event.unified_msg_origin
             context_messages_full = await self.ctx_mgr.get_recent_messages(session_id, count=self._context_rounds)
             if context_messages_full:
