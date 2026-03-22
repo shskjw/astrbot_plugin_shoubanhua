@@ -952,9 +952,7 @@ class FigurineProPlugin(Star):
             if preset_display:
                 lines.append(f"这次按 {preset_display} 来。")
         elif action == "persona":
-            lines.append("我去给你拍一张。" if count <= 1 else "我去给你拍几张。")
-            if scene_name:
-                lines.append(f"场景先放在 {scene_name}。")
+            lines.append("我先帮你准备一下。")
         elif action == "auto_text":
             lines.append("我先按你的意思准备一下画面。")
             if confidence is not None:
@@ -971,11 +969,6 @@ class FigurineProPlugin(Star):
                 lines.append(f"我会并行处理，速度会快一点。")
         elif action == "pack_pdf":
             lines.append("我先把这些图整理成册。")
-
-        if extra_request:
-            lines.append("你补充的要求我记住了。")
-        if has_user_images:
-            lines.append("我也会顺便参考你给的那张图。")
 
         return "\n".join(lines)
 
