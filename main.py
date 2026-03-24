@@ -518,16 +518,21 @@ class FigurineProPlugin(Star):
                 skipped_count = 0
 
                 for k, v in dynamic_conf.items():
-                    # 强制恢复动态配置，解决重启或重载后模型回退到默认值的问题
-                    # dynamic_config.json 保存的是用户最后一次通过指令修改的配置，优先级应高于默认值
-                    if v is not None and v != "" and v != [] and v != {}:
+                    # 仅在当前配置缺失或为空时，才从 dynamic_config.json 回填。
+                    # 这样可以避免用户手动修改主配置文件后，在重载时又被旧备份覆盖回去。
+                    if v is None or v == "" or v == [] or v == {}:
+                        skipped_count += 1
+                        continue
+
+                    current_value = self.conf.get(k, None)
+                    if current_value is None or current_value == "" or current_value == [] or current_value == {}:
                         self.conf[k] = v
                         restored_count += 1
                     else:
                         skipped_count += 1
 
                 logger.info(
-                    f"FigurinePro: dynamic_config.json 恢复完成，恢复 {restored_count} 项，跳过 {skipped_count} 项（保留手动配置）"
+                    f"FigurinePro: dynamic_config.json 恢复完成，恢复 {restored_count} 项，跳过 {skipped_count} 项（已有主配置值时不覆盖）"
                 )
             except Exception as e:
                 logger.error(f"FigurinePro: 恢复动态配置失败 {e}")
