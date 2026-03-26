@@ -1024,6 +1024,26 @@ class FigurineProPlugin(Star):
                     base += random.choice([f" 按{preset_display}来。", f" 用{preset_display}。"])
                 return base
         elif action == "persona":
+            if count > 1:
+                if _is_clothing:
+                    return random.choice([
+                        f"好，那我去准备一套{count}张的写真，换好就发你。",
+                        f"行，我先去换衣服，给你拍{count}张不同感觉的。",
+                        f"等我一下，我去整理下造型，拍{count}张给你看。",
+                        f"那我先去准备一下，给你拍{count}张不同场景和角度的。",
+                    ])
+                if has_user_images:
+                    return random.choice([
+                        f"收到，我先参考一下你给的图，拍{count}张给你。",
+                        f"好，我照着你发的感觉来，给你准备{count}张。",
+                        f"嗯，我先看看参考图，拍一组{count}张给你。",
+                    ])
+                return random.choice([
+                    f"好呀，那我去准备一组{count}张给你。",
+                    f"等我一下，我去拍一套{count}张给你看。",
+                    f"嗯嗯，我去整理一下，给你拍{count}张不同感觉的。",
+                    f"好，给你拍一组{count}张，场景和角度我会尽量错开。",
+                ])
             if _is_clothing:
                 return random.choice([
                     "那我去翻下柜子，等我一下哦。",
@@ -1481,6 +1501,8 @@ class FigurineProPlugin(Star):
                                 res = await self._prepare_send_image_bytes(res)
                                 elapsed = (datetime.now() - start_time).total_seconds()
                                 await self.data_mgr.record_usage(uid, gid)
+                                await self._register_generation_success(event.unified_msg_origin, 1)
+                                await self._register_generated_image(event.unified_msg_origin, res)
 
                                 chain_nodes = [Image.fromBytes(res)]
                                 if not hide_text:
@@ -1611,6 +1633,8 @@ class FigurineProPlugin(Star):
                                 res = await self._prepare_send_image_bytes(res)
                                 elapsed = (datetime.now() - start_time).total_seconds()
                                 await self.data_mgr.record_usage(uid, gid)
+                                await self._register_generation_success(event.unified_msg_origin, 1)
+                                await self._register_generated_image(event.unified_msg_origin, res)
 
                                 chain_nodes = [Image.fromBytes(res)]
                                 if not hide_text:
@@ -3127,6 +3151,8 @@ class FigurineProPlugin(Star):
             cached_images = await self._get_recent_generated_images(session_id, max_images=max_images)
             images_bytes.extend([b for b in cached_images if isinstance(b, bytes) and len(b) > 0])
 
+            cached_hashes = {hash(b) for b in images_bytes if isinstance(b, bytes) and len(b) > 0}
+
             # 1. 再提取当前消息中的图片（包括引用）
             bot_id = self._get_bot_id(event)
             current_images = await self.img_mgr.extract_images_from_event(event, ignore_id=bot_id, context=self.context)
@@ -3155,7 +3181,11 @@ class FigurineProPlugin(Star):
                 try:
                     img_b = await self.img_mgr.load_bytes(url)
                     if img_b and len(img_b) > 0:
+                        img_hash = hash(img_b)
+                        if img_hash in cached_hashes:
+                            continue
                         images_bytes.append(img_b)
+                        cached_hashes.add(img_hash)
                 except Exception as e:
                     logger.error(f"收集 PDF 图片时下载失败 {url[:20]}: {e}")
 
@@ -3354,6 +3384,8 @@ class FigurineProPlugin(Star):
                 res = await self._prepare_send_image_bytes(res)
                 elapsed = (datetime.now() - start_time).total_seconds()
                 await self.data_mgr.record_usage(uid, gid)
+                await self._register_generation_success(event.unified_msg_origin, 1)
+                await self._register_generated_image(event.unified_msg_origin, res)
 
                 chain_nodes = [Image.fromBytes(res)]
                 if not hide_text:
@@ -3626,8 +3658,11 @@ class FigurineProPlugin(Star):
                                 model = self.conf.get("model", "nano-banana")
                                 res = await self.api_mgr.call_api(images, final_prompt, model, False, self.img_mgr.proxy)
                                 if isinstance(res, bytes):
+                                    res = await self._prepare_send_image_bytes(res)
                                     pdf_result_images.append(res)
                                     await self.data_mgr.record_usage(uid, gid)
+                                    await self._register_generation_success(event.unified_msg_origin, 1)
+                                    await self._register_generated_image(event.unified_msg_origin, res)
                                     success = True
                                     error_msg = ""
                                 else:
@@ -3903,9 +3938,12 @@ class FigurineProPlugin(Star):
                                 model = self.conf.get("model", "nano-banana")
                                 res = await self.api_mgr.call_api(images, final_prompt, model, False, self.img_mgr.proxy)
                                 if isinstance(res, bytes):
+                                    res = await self._prepare_send_image_bytes(res)
                                     async with results_lock:
                                         pdf_result_images_dict[index] = res
                                     await self.data_mgr.record_usage(uid, gid)
+                                    await self._register_generation_success(event.unified_msg_origin, 1)
+                                    await self._register_generated_image(event.unified_msg_origin, res)
                                     success = True
                                     error_msg = ""
                                 else:
@@ -4176,7 +4214,7 @@ class FigurineProPlugin(Star):
                 return self._build_llm_tool_failure(error_msg)
             if count_limited:
                 return self._build_count_limit_reply(count, "persona")
-            return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 照片发出去了（场景：{scene_name}）。用你自己的语气随口带过，也可以什么都不说。")
+            return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 照片已经发给用户了（场景：{scene_name}）。用你自己的语气随口带过，也可以什么都不说。")
         else:
             # 对于人设的多张生成，因为传递的是最终合并好的图片（包含人设参考+用户参考），
             # 所以使用 _run_batch_image_to_image。但是要防止该函数再次从数据库读取 "_persona_" 导致图片翻倍。
@@ -4202,7 +4240,7 @@ class FigurineProPlugin(Star):
                 return self._build_count_limit_reply(count, "persona")
             if batch_result.get("fail", 0) > 0:
                 return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 发出去了{batch_result.get('success', 0)}张，有{batch_result.get('fail', 0)}张没弄好。用你自己的语气随口带过。")
-            return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] {count}张照片都发出去了。用你自己的语气随口带过，也可以什么都不说。")
+            return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] {count}张照片已经都发给用户了。用你自己的语气随口带过，也可以什么都不说。")
 
     @filter.command("人设拍照", prefix_optional=True)
     async def on_persona_photo_cmd(self, event: AstrMessageEvent, ctx=None):
