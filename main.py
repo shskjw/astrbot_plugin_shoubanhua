@@ -2434,17 +2434,18 @@ class FigurineProPlugin(Star):
 
     @filter.command("切换模型", prefix_optional=True)
     async def on_switch_model(self, event: AstrMessageEvent, ctx=None):
+        if not self.is_admin(event):
+            return
+
         all_m = [m if isinstance(m, str) else m["id"] for m in self.conf.get("model_list", [])]
         parts = event.message_str.split()
         if len(parts) == 1:
             curr = self.conf.get("model", "nano-banana")
             msg = "📋 可用模型:\n" + "\n".join([f"{i + 1}. {m} {'✅' if m == curr else ''}" for i, m in enumerate(all_m)])
-            msg += "\n\n💡 提示: 管理员可使用 #切换模型 <序号> 切换预设模型，\n或直接使用 #切换模型 <模型名称> 写入任意模型。"
+            msg += "\n\n💡 用法: #切换模型 <序号>\n或直接使用 #切换模型 <模型名称> 写入任意模型。"
             yield event.chain_result([Plain(msg)]);
             return
 
-        if not self.is_admin(event): return
-        
         target = parts[1].strip()
         # 尝试按序号切换
         if target.isdigit():
