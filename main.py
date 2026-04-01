@@ -756,6 +756,21 @@ class FigurineProPlugin(Star):
             return f"这么多可不行，我最多先给你处理{actual_count}张。剩下的下次再说。"
         return f"一下要这么多也太贪心了，我最多先给你弄{actual_count}张。"
 
+    def _get_persona_trigger_keywords(self) -> List[str]:
+        """获取人设自拍触发词配置，并做基础清洗。"""
+        raw_keywords = self.conf.get("persona_trigger_keywords", [])
+        if isinstance(raw_keywords, str):
+            raw_keywords = [x.strip() for x in raw_keywords.split(",") if x.strip()]
+        elif not isinstance(raw_keywords, list):
+            raw_keywords = [str(raw_keywords).strip()] if raw_keywords else []
+
+        keywords = []
+        for kw in raw_keywords:
+            kw = str(kw or "").strip().lower()
+            if kw and kw not in keywords:
+                keywords.append(kw)
+        return keywords
+
     def _looks_like_persona_photo_request(self, message: str) -> bool:
         """识别“看你本人照片/自拍/写真”这类请求，避免被通用工具误接。"""
         text = str(message or "").strip().lower()
@@ -768,7 +783,9 @@ class FigurineProPlugin(Star):
             "你的照片", "看你照片", "看看你", "看看你长啥样", "看看你长什么样",
             "你长啥样", "你长什么样", "你的写真", "写真集", "私房照", "营业照",
             "自拍照", "露脸照", "发几张你", "来几张你", "发张你", "来张你",
-            "你本人", "你自己的照片", "看看你本人",
+            "你本人", "你自己的照片", "看看你本人", "发我看看你", "让我看看你",
+            "发我看看你现在在做什么", "看看你现在在做什么", "看看你在做什么",
+            "想看你", "给我看看你",
             # 用户省略"你的"直接说"看看自拍/来张自拍"等，也视为请求Bot本人照片
             "看看自拍", "来张自拍", "发张自拍", "来一张自拍", "来几张自拍",
             "看你的自拍", "拍张照", "来张照片", "发张照片",
@@ -776,11 +793,104 @@ class FigurineProPlugin(Star):
         if any(phrase in compact for phrase in explicit_phrases):
             return True
 
+        configured_keywords = self._get_persona_trigger_keywords()
+        if configured_keywords and any(kw in compact for kw in configured_keywords):
+            if any(term in compact for term in ["你", "你的", "本人", "自拍", "照片", "写真", "看看"]):
+                return True
+
         self_terms = ["你", "你的", "你自己", "你本人", "本人"]
         photo_terms = ["自拍", "照片", "写真", "写真集", "私房照", "相片", "样子", "长啥样", "长什么样", "露脸"]
         has_self = any(term in compact for term in self_terms)
         has_photo = any(term in compact for term in photo_terms)
         return has_self and has_photo
+
+    def _looks_like_persona_followup_request(self, message: str, context_messages: List[Any]) -> bool:
+        """识别依赖上下文的“看看/发我看看”类追问。"""
+        text = str(message or "").strip().lower()
+        if not text:
+            return False
+
+        compact = re.sub(r"\s+", "", text)
+        followup_keywords = [
+            "看看", "看下", "看一眼", "来一张", "来张", "发来", "发我看看",
+            "给我看看", "让我看看", "照片呢", "图呢", "自拍呢", "快发", "快看看"
+        ]
+        if compact not in followup_keywords and not any(kw == compact or kw in compact for kw in followup_keywords):
+            return False
+
+        recent_messages = list(context_messages or [])[-8:]
+        if not recent_messages:
+            return False
+
+        persona_request_markers = [
+            "看看你", "看看你现在在做什么", "你现在在做什么", "发我看看你现在在做什么",
+            "你的自拍", "看你自拍", "发你的照片", "你长啥样", "你长什么样",
+            "写真", "自拍", "照片", "看看自拍"
+        ]
+        action_markers = [
+            "我在", "正在", "刚在", "收尾", "整理", "写完", "熄灯", "换衣服",
+            "拍照", "休息", "喝咖啡", "在房间", "在家", "在外面", "在公园", "在学校"
+        ]
+
+        for msg in reversed(recent_messages):
+            content = str(getattr(msg, "content", "") or "").strip().lower()
+            if not content:
+                continue
+
+            if not getattr(msg, "is_bot", False):
+                if any(marker in content for marker in persona_request_markers):
+                    return True
+            else:
+                if any(marker in content for marker in action_markers):
+                    return True
+
+        return False
+
+    def _build_current_time_persona_hint(self) -> str:
+        """构建当前时间场景提示，注入到人设拍照提示词中。"""
+        now = datetime.now()
+        hour = now.hour
+        minute = now.minute
+
+        if 0 <= hour < 5:
+            time_period_cn = "凌晨"
+            time_scene_en = "deep night before dawn"
+            light_en = "dim indoor warm light, sleepy late-night atmosphere"
+        elif 5 <= hour < 8:
+            time_period_cn = "清晨"
+            time_scene_en = "early morning"
+            light_en = "soft morning light, fresh and quiet atmosphere"
+        elif 8 <= hour < 12:
+            time_period_cn = "上午"
+            time_scene_en = "morning"
+            light_en = "clean daylight, relaxed morning atmosphere"
+        elif 12 <= hour < 14:
+            time_period_cn = "中午"
+            time_scene_en = "noon"
+            light_en = "bright natural daylight, calm midday atmosphere"
+        elif 14 <= hour < 18:
+            time_period_cn = "下午"
+            time_scene_en = "afternoon"
+            light_en = "warm afternoon sunlight, casual daily atmosphere"
+        elif 18 <= hour < 20:
+            time_period_cn = "傍晚"
+            time_scene_en = "sunset evening"
+            light_en = "golden hour lighting, soft sunset glow"
+        elif 20 <= hour < 23:
+            time_period_cn = "晚上"
+            time_scene_en = "night"
+            light_en = "cozy indoor lighting, quiet evening mood"
+        else:
+            time_period_cn = "深夜"
+            time_scene_en = "late night"
+            light_en = "low light, intimate quiet late-night atmosphere"
+
+        return (
+            f"Current time context: now it is {time_period_cn} {hour:02d}:{minute:02d} "
+            f"(approximately {time_scene_en}). "
+            f"The scene, mood, clothing details, behavior, and lighting should naturally match this time of day. "
+            f"Preferred lighting and atmosphere: {light_en}."
+        )
 
     def _infer_requested_count_from_text(self, message: str, default: int = 1, multi_default: int = 3) -> int:
         """从自然语言里尽量推断用户想要的张数。"""
@@ -2718,7 +2828,10 @@ class FigurineProPlugin(Star):
         has_current_image = msg_info["has_image"]
 
         # 2.5 对“看你本人照片/自拍/写真”做强制分流，避免 LLM 误走通用智能工具
-        if self._persona_mode and self._looks_like_persona_photo_request(current_message):
+        if self._persona_mode and (
+            self._looks_like_persona_photo_request(current_message)
+            or self._looks_like_persona_followup_request(current_message, context_messages)
+        ):
             inferred_count = self._infer_requested_count_from_text(current_message, default=1, multi_default=3)
             return await self.persona_photo_tool(
                 event=event,
@@ -4227,6 +4340,7 @@ class FigurineProPlugin(Star):
 
         # 4. 构建完整提示词
         full_prompt = self._build_persona_prompt(scene_prompt, extra_request)
+        full_prompt += " " + self._build_current_time_persona_hint()
         if user_images:
             full_prompt += (
                 " Use the additional user reference image only for outfit, accessories, pose, composition, or atmosphere reference."
@@ -4350,6 +4464,7 @@ class FigurineProPlugin(Star):
 
         # 构建提示词
         full_prompt = self._build_persona_prompt(scene_prompt, extra_request)
+        full_prompt += " " + self._build_current_time_persona_hint()
 
         # 检查配额
         uid = norm_id(event.get_sender_id())
