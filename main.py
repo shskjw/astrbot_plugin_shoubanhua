@@ -3148,6 +3148,32 @@ class FigurineProPlugin(Star):
 
         return all_image_urls
 
+    def _build_pdf_filename_hint(self, prompt: str = "", preset_name: str = "", count: int = 0) -> str:
+        """根据用户批量请求生成更自然的 PDF 文件名提示。"""
+        raw_text = str(prompt or "").strip()
+        preset_text = "" if str(preset_name or "").strip() in {"", "自定义", "编辑", "edit", "custom"} else str(preset_name).strip()
+
+        text = raw_text or preset_text or "图片合集"
+
+        for prefix in ["Additional requirements:", "Edit the image according to the following instructions:"]:
+            if text.startswith(prefix):
+                text = text[len(prefix):].strip()
+
+        text = re.sub(r"\s+", " ", text)
+        text = re.sub(r"[\\/:*?\"<>|\r\n\t]+", "_", text)
+        text = text.strip(" ._")
+
+        if len(text) > 40:
+            text = text[:40].rstrip(" ._")
+
+        if not text:
+            text = "图片合集"
+
+        if count > 0 and not re.search(r"\d+\s*张", text):
+            text = f"{text}{count}张"
+
+        return f"{text}.pdf"
+
     async def _gather_images_for_pdf(self, event: AstrMessageEvent, max_images: int = 10,
                                      wait_for_generation: bool = True) -> List[bytes]:
         """
@@ -3216,6 +3242,10 @@ class FigurineProPlugin(Star):
                 if img_hash not in seen_hashes:
                     unique_images.append(img)
                     seen_hashes.add(img_hash)
+
+            # 最终再次严格按 max_images 截断，避免把上下文历史图片一并打进去
+            if max_images > 0:
+                unique_images = unique_images[-max_images:]
 
             return unique_images
 
@@ -3286,7 +3316,8 @@ class FigurineProPlugin(Star):
         return translated or default_msg
 
     async def _pack_and_send_pdf(self, event: AstrMessageEvent, images_bytes: List[bytes],
-                                 success_prefix: str = "✅ 成功将图片打包为 PDF") -> Tuple[bool, str]:
+                                 success_prefix: str = "✅ 成功将图片打包为 PDF",
+                                 filename_hint: str = "") -> Tuple[bool, str]:
         """独立执行图片打包为 PDF 并发送，不依赖大模型处理逻辑"""
         try:
             valid_images = [img for img in images_bytes if isinstance(img, bytes) and len(img) > 0]
@@ -3301,7 +3332,12 @@ class FigurineProPlugin(Star):
             import os
             from astrbot.core.message.components import File
 
-            filename = f"images_packed_{uuid.uuid4().hex[:6]}.pdf"
+            filename = (filename_hint or "").strip()
+            if not filename:
+                filename = f"images_packed_{uuid.uuid4().hex[:6]}.pdf"
+            elif not filename.lower().endswith(".pdf"):
+                filename = f"{filename}.pdf"
+
             tmp_path = os.path.join(self.data_mgr.data_dir, filename)
             with open(tmp_path, "wb") as f:
                 f.write(pdf_bytes)
@@ -3458,7 +3494,8 @@ class FigurineProPlugin(Star):
         success, msg = await self._pack_and_send_pdf(
             event,
             valid_images_bytes,
-            success_prefix="✅ 成功将图片打包为 PDF"
+            success_prefix="✅ 成功将图片打包为 PDF",
+            filename_hint=self._build_pdf_filename_hint("图片打包", count=len(valid_images_bytes))
         )
         if not success:
             yield event.chain_result([Plain(msg)])
@@ -3502,7 +3539,8 @@ class FigurineProPlugin(Star):
         success, msg = await self._pack_and_send_pdf(
             event,
             valid_images_bytes,
-            success_prefix="✅ 成功将图片打包为 PDF"
+            success_prefix="✅ 成功将图片打包为 PDF",
+            filename_hint=self._build_pdf_filename_hint("图片打包", count=len(valid_images_bytes))
         )
         if success:
             return self._finalize_llm_tool_result("[TOOL_SUCCESS] 图片已经打包成 PDF 并发送给用户。你可以按原本人设自然接话，也可以不补充收尾。")
@@ -4054,16 +4092,19 @@ class FigurineProPlugin(Star):
                             import uuid
                             import os
                             from astrbot.core.message.components import File
-                            filename = f"batch_output_concurrent_{uuid.uuid4().hex[:6]}.pdf"
+                            filename = self._build_pdf_filename_hint(
+                                prompt=extra_rules or prompt,
+                                preset_name=preset_name,
+                                count=results["success"]
+                            )
                             tmp_path = os.path.join(self.data_mgr.data_dir, filename)
                             with open(tmp_path, "wb") as f:
                                 f.write(pdf_bytes_result)
                             await event.send(event.chain_result([File(name=filename, file=tmp_path)]))
-                            
-                            summary = f"\n📊 并发批量处理完成，已打包为 PDF\n"
-                            summary += f"✅ 成功: {results['success']} 张\n"
-                            summary += f"失败: {results['fail']} 张"
-                            await event.send(event.chain_result([Plain("这批图我已经先整理成册发你了。")]))
+
+                            await event.send(event.chain_result([
+                                Plain(f"这批图我已经整理成册发你了，共 {results['success']} 张。")
+                            ]))
                     except Exception as e:
                         logger.error(f"打包 PDF 失败: {e}")
                         if self._should_show_debug_errors():
@@ -4085,7 +4126,17 @@ class FigurineProPlugin(Star):
 
         asyncio.create_task(wrapped_process_all())
 
-        return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 并发批量处理任务已启动，共 {total_images} 张图片，预设：{preset_name}。图片将陆续发出，请用自然语言告知用户稍等即可，不要用'生成'等机械词汇。")
+        if output_as_pdf:
+            return self._finalize_llm_tool_result(
+                f"[TOOL_SUCCESS] 并发批量处理任务已启动，共 {total_images} 张图片，预设：{preset_name}。"
+                "这次不会一张张发出，我会等整批都完成后直接整理成一个 PDF 发给用户。"
+                "请用自然语言告诉用户稍等即可，不要用'生成'等机械词汇。"
+            )
+
+        return self._finalize_llm_tool_result(
+            f"[TOOL_SUCCESS] 并发批量处理任务已启动，共 {total_images} 张图片，预设：{preset_name}。"
+            "图片将陆续发出，请用自然语言告知用户稍等即可，不要用'生成'等机械词汇。"
+        )
 
     # ================= 日常人设功能 =================
 
