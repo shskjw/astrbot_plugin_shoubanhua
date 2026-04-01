@@ -1294,10 +1294,8 @@ class FigurineProPlugin(Star):
         return result
 
     async def _prepare_send_image_bytes(self, image_bytes: bytes) -> bytes:
-        """发送前对超大结果图做轻量压缩，减少平台上传等待。"""
-        if not image_bytes:
-            return image_bytes
-        return await self.img_mgr.optimize_output_image(image_bytes)
+        """发送前保持原图，避免任何有损压缩或缩放。"""
+        return image_bytes
 
     async def _get_active_session_task(self, session_id: str) -> Optional[Dict[str, Any]]:
         """获取当前会话中的进行中任务"""
