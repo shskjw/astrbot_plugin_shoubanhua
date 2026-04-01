@@ -39,35 +39,100 @@ class ImageManager:
         return None
 
     def _optimize_output_image_sync(self, raw: bytes) -> bytes:
-        """对超大结果图做轻量压缩，降低后续平台上传耗时。"""
-        if not raw or len(raw) < 1_500_000:
+        """对结果图做更积极的发送前压缩，降低平台上传耗时。"""
+        if not raw or len(raw) < 700_000:
             return raw
 
         try:
             with PILImage.open(io.BytesIO(raw)) as img:
-                original_mode = img.mode
-                width, height = img.size
-                max_side = 1920
-
                 working = img.copy()
+                width, height = working.size
+
+                # 更积极地下采样，优先缩短上传时间
+                max_side = 1600 if len(raw) < 3_000_000 else 1280
                 if width > max_side or height > max_side:
                     working.thumbnail((max_side, max_side), PILImage.Resampling.LANCZOS)
 
-                out = io.BytesIO()
-                has_alpha = "A" in working.getbands()
-                if not has_alpha and original_mode not in {"P", "1"}:
-                    working = working.convert("RGB")
-                    working.save(out, format="JPEG", quality=88, optimize=False)
-                else:
-                    working = working.convert("RGBA")
-                    working.save(out, format="PNG", optimize=False)
+                # 判断是否真的需要透明通道
+                has_alpha_band = "A" in working.getbands()
+                needs_alpha = False
+                if has_alpha_band:
+                    try:
+                        alpha = working.getchannel("A")
+                        alpha_min, alpha_max = alpha.getextrema()
+                        needs_alpha = alpha_min < 255 or alpha_max < 255
+                    except Exception:
+                        needs_alpha = True
 
-                optimized = out.getvalue()
-                if optimized and len(optimized) < len(raw):
+                candidates = []
+
+                # 候选1：如果不需要透明，优先转 JPEG
+                if not needs_alpha:
+                    rgb = working.convert("RGB")
+                    for quality in (85, 78, 72):
+                        out = io.BytesIO()
+                        rgb.save(
+                            out,
+                            format="JPEG",
+                            quality=quality,
+                            optimize=True,
+                            progressive=True,
+                            subsampling=1 if quality >= 80 else 2,
+                        )
+                        candidates.append(("JPEG", quality, out.getvalue()))
+                else:
+                    # 候选2：保留透明时，尽量压缩 PNG
+                    rgba = working.convert("RGBA")
+                    for compress_level in (9,):
+                        out = io.BytesIO()
+                        rgba.save(
+                            out,
+                            format="PNG",
+                            optimize=True,
+                            compress_level=compress_level,
+                        )
+                        candidates.append(("PNG", compress_level, out.getvalue()))
+
+                if not candidates:
+                    return raw
+
+                # 先取最小候选
+                best_format, best_level, best_data = min(candidates, key=lambda x: len(x[2]))
+
+                # 如果仍然偏大，再做一次更强缩放兜底
+                target_limit = 900_000
+                if len(best_data) > target_limit:
+                    fallback = working.copy()
+                    fallback.thumbnail((1280, 1280), PILImage.Resampling.LANCZOS)
+
+                    if not needs_alpha:
+                        fallback = fallback.convert("RGB")
+                        out = io.BytesIO()
+                        fallback.save(
+                            out,
+                            format="JPEG",
+                            quality=68,
+                            optimize=True,
+                            progressive=True,
+                            subsampling=2,
+                        )
+                        best_format, best_level, best_data = "JPEG", 68, out.getvalue()
+                    else:
+                        out = io.BytesIO()
+                        fallback.convert("RGBA").save(
+                            out,
+                            format="PNG",
+                            optimize=True,
+                            compress_level=9,
+                        )
+                        best_format, best_level, best_data = "PNG", 9, out.getvalue()
+
+                if best_data and len(best_data) < len(raw):
                     logger.info(
-                        f"结果图发送前已压缩: {len(raw) / 1024:.1f}KB -> {len(optimized) / 1024:.1f}KB"
+                        f"结果图发送前已压缩: {len(raw) / 1024:.1f}KB -> {len(best_data) / 1024:.1f}KB "
+                        f"| format={best_format} level={best_level}"
                     )
-                    return optimized
+                    return best_data
         except Exception as e:
             logger.warning(f"Output image optimize failed: {e}")
 

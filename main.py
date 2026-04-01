@@ -103,7 +103,7 @@ _CLOTHING_KEYWORDS = [
     "astrbot_plugin_shoubanhua",
     "shskjw",
     "支持第三方所有OpenAI绘图格式和原生Google Gemini 终极缝合怪，文生图/图生图插件，支持LLM智能判断",
-    "2.6.1",
+    "2.7.0",
     "https://github.com/shkjw/astrbot_plugin_shoubanhua",
 )
 class FigurineProPlugin(Star):
@@ -426,7 +426,7 @@ class FigurineProPlugin(Star):
         Returns:
             (场景名, 场景提示词)
         """
-        context_lower = context_text.lower()
+        context_lower = (context_text or "").lower()
 
         # 按关键词长度排序，优先匹配更具体的场景
         sorted_scenes = sorted(self._persona_scene_map.keys(), key=len, reverse=True)
@@ -435,11 +435,14 @@ class FigurineProPlugin(Star):
             if scene_key.lower() in context_lower:
                 return scene_key, self._persona_scene_map[scene_key]
 
-        # 未匹配到，返回默认场景
-        default_prompt = self.conf.get("persona_default_prompt", "一张日常自拍照")
-        return "日常", default_prompt
+        # 未匹配到时，仅使用 JSON 中配置的默认场景提示词；没有就不使用场景提示词
+        default_prompt = (self.conf.get("persona_default_prompt", "") or "").strip()
+        if default_prompt:
+            return "默认", default_prompt
 
-    def _build_persona_prompt(self, scene_prompt: str, extra_request: str = "") -> str:
+        return "", ""
+
+    def _build_persona_prompt(self, scene_prompt: str = "", extra_request: str = "") -> str:
         """
         构建人设图片的完整提示词
 
@@ -482,7 +485,6 @@ class FigurineProPlugin(Star):
         prompt_parts = [
             f"Generate a natural daily life photo of {persona_name}.",
             f"Character description: {persona_desc}",
-            f"Scene: {scene_prompt}",
             f"Style: {photo_style}",
             "The character identity must strictly remain the same as the persona reference image.",
             "Preserve the original face, hairstyle, hair color, body shape, age appearance, and core character features from the persona reference.",
@@ -490,6 +492,9 @@ class FigurineProPlugin(Star):
             "Natural pose and expression, candid moment, high quality, detailed.",
             "Do NOT include any phones, cameras, or selfie elements in the image."
         ]
+
+        if scene_prompt:
+            prompt_parts.insert(2, f"Scene: {scene_prompt}")
 
         if extra_request:
             prompt_parts.append(f"Additional requirements: {extra_request}")
@@ -916,6 +921,17 @@ class FigurineProPlugin(Star):
     def _should_show_debug_errors(self) -> bool:
         """是否向用户显示中途调试错误信息"""
         return self._get_conf_bool("debug_mode", False)
+
+    def _resolve_debug_error_message(self, error: Any, default_msg: str = "这次没弄好，请稍后再试。") -> str:
+        """调试模式下保留原始上游错误，普通模式下做脱敏。"""
+        if self._should_show_debug_errors():
+            try:
+                raw = str(error).strip() if error is not None else ""
+            except Exception:
+                raw = ""
+            return raw or default_msg
+
+        return self._mask_llm_error(error, default_msg)
 
     def _format_success_timing(self, elapsed: float | None = None) -> str:
         """统一格式化成功耗时，对外仅显示总耗时。"""
@@ -1417,7 +1433,7 @@ class FigurineProPlugin(Star):
                 await event.send(chain)
                 return True, ""
             else:
-                error_msg = self._mask_llm_error(res, "这次没弄好，请稍后再试。") if suppress_user_error else str(res)
+                error_msg = self._resolve_debug_error_message(res, "这次没弄好，请稍后再试。") if suppress_user_error else str(res)
                 if (not suppress_user_error) or self._should_show_debug_errors():
                     display_msg = error_msg
                     if not str(display_msg).startswith("❌"):
@@ -1429,7 +1445,7 @@ class FigurineProPlugin(Star):
 
         except Exception as e:
             logger.error(f"Background task error: {e}")
-            error_msg = self._mask_llm_error(e, "这次没弄好，请稍后再试。") if suppress_user_error else f"系统错误: {e}"
+            error_msg = self._resolve_debug_error_message(e, "这次没弄好，请稍后再试。") if suppress_user_error else f"系统错误: {e}"
             if (not suppress_user_error) or self._should_show_debug_errors():
                 _display = str(error_msg).removeprefix("❌").strip()
                 await event.send(event.chain_result([Plain(f"出了点状况: {_display}")]))
@@ -1538,7 +1554,7 @@ class FigurineProPlugin(Star):
                                     ]))
 
                     except Exception as e:
-                        error_msg = self._mask_llm_error(e, "这次没弄好，请稍后再试。") if suppress_user_error else self._translate_error_to_chinese(str(e))
+                        error_msg = self._resolve_debug_error_message(e, "这次没弄好，请稍后再试。") if suppress_user_error else self._translate_error_to_chinese(str(e))
                         logger.error(f"Batch text-to-image {index} exception: {e}", exc_info=True)
                         async with results_lock:
                             results["fail"] += 1
@@ -1563,9 +1579,10 @@ class FigurineProPlugin(Star):
 
         except Exception as e:
             logger.error(f"Batch text-to-image task error: {e}")
+            final_error = self._resolve_debug_error_message(e, "这次没弄好，请稍后再试。")
             if (not suppress_user_error) or self._should_show_debug_errors():
-                await event.send(event.chain_result([Plain(f"这批出了点状况: {e}")]))
-            return {"success": 0, "fail": count, "errors": [self._mask_llm_error(e, "这次没弄好，请稍后再试。")]}
+                await event.send(event.chain_result([Plain(f"这批出了点状况: {final_error}")]))
+            return {"success": 0, "fail": count, "errors": [final_error]}
 
     # ================= 批量图生图功能（同一张图片生成多个版本） =================
 
@@ -1670,7 +1687,7 @@ class FigurineProPlugin(Star):
                                     ]))
 
                     except Exception as e:
-                        error_msg = self._mask_llm_error(e, "这次没弄好，请稍后再试。") if suppress_user_error else self._translate_error_to_chinese(str(e))
+                        error_msg = self._resolve_debug_error_message(e, "这次没弄好，请稍后再试。") if suppress_user_error else self._translate_error_to_chinese(str(e))
                         logger.error(f"Batch image-to-image {index} exception: {e}", exc_info=True)
                         async with results_lock:
                             results["fail"] += 1
@@ -1694,9 +1711,10 @@ class FigurineProPlugin(Star):
 
         except Exception as e:
             logger.error(f"Batch image-to-image task error: {e}")
+            final_error = self._resolve_debug_error_message(e, "这次没弄好，请稍后再试。")
             if (not suppress_user_error) or self._should_show_debug_errors():
-                await event.send(event.chain_result([Plain(f"多版本处理出了点状况: {e}")]))
-            return {"success": 0, "fail": count, "errors": [self._mask_llm_error(e, "这次没弄好，请稍后再试。")]}
+                await event.send(event.chain_result([Plain(f"多版本处理出了点状况: {final_error}")]))
+            return {"success": 0, "fail": count, "errors": [final_error]}
 
     # ================= LLM 工具调用 (Tool Calling) =================
 
@@ -4292,8 +4310,9 @@ class FigurineProPlugin(Star):
 
         # 发送反馈
         persona_name = self.conf.get("persona_name", "小助手")
-        feedback = f"📸 正在生成 {persona_name} 的照片\n"
-        feedback += f"🎬 场景: {scene_name}"
+        feedback = f"📸 正在生成 {persona_name} 的照片"
+        if scene_name:
+            feedback += f"\n🎬 场景: {scene_name}"
         if extra_request:
             feedback += f"\n📝 要求: {extra_request[:30]}..."
         feedback += "\n⏳ 请稍候..."
@@ -4317,7 +4336,10 @@ class FigurineProPlugin(Star):
 
             quota_str = self._get_quota_str(deduction, uid, gid)
             timing_text = self._format_success_timing(elapsed)
-            info = f"\n✅ 生成成功 ({timing_text}) | 场景: {scene_name} | 剩余: {quota_str}"
+            info = f"\n✅ 生成成功 ({timing_text})"
+            if scene_name:
+                info += f" | 场景: {scene_name}"
+            info += f" | 剩余: {quota_str}"
             yield event.chain_result([Image.fromBytes(res), Plain(info)])
         else:
             yield event.chain_result([Plain(f"没弄好: {res}")])
@@ -4395,8 +4417,9 @@ class FigurineProPlugin(Star):
             prompt_preview = prompt[:40] + "..." if len(prompt) > 40 else prompt
             msg += f"\n• {scene_name}: {prompt_preview}"
 
-        default_prompt = self.conf.get("persona_default_prompt", "一张日常自拍照")
-        msg += f"\n\n📌 默认场景: {default_prompt[:40]}..."
+        default_prompt = (self.conf.get("persona_default_prompt", "") or "").strip()
+        if default_prompt:
+            msg += f"\n\n📌 默认场景: {default_prompt[:40]}..."
 
         yield event.chain_result([Plain(msg)])
 
