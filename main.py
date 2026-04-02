@@ -3259,28 +3259,122 @@ class FigurineProPlugin(Star):
 
         return all_image_urls
 
-    def _build_pdf_filename_hint(self, prompt: str = "", preset_name: str = "", count: int = 0) -> str:
-        """根据用户批量请求生成更自然的 PDF 文件名提示。"""
-        raw_text = str(prompt or "").strip()
-        preset_text = "" if str(preset_name or "").strip() in {"", "自定义", "编辑", "edit", "custom"} else str(preset_name).strip()
-
-        text = raw_text or preset_text or "图片合集"
-
-        for prefix in ["Additional requirements:", "Edit the image according to the following instructions:"]:
-            if text.startswith(prefix):
-                text = text[len(prefix):].strip()
+    def _normalize_pdf_filename(self, filename: str, fallback: str = "图片合集") -> str:
+        """清理并规范化 PDF 文件名。"""
+        text = str(filename or "").strip()
 
         text = re.sub(r"\s+", " ", text)
         text = re.sub(r"[\\/:*?\"<>|\r\n\t]+", "_", text)
-        text = text.strip(" ._")
+        text = re.sub(r"\.pdf\s*$", "", text, flags=re.IGNORECASE)
+        text = text.strip(" ._，。；;、\"'“”‘’()（）[]【】<>《》")
 
         if len(text) > 40:
             text = text[:40].rstrip(" ._")
 
-        if not text:
-            text = "图片合集"
+        return text or fallback
 
-        if count > 0 and not re.search(r"\d+\s*张", text):
+    def _extract_explicit_pdf_filename(self, text: str = "") -> str:
+        """从用户文本中提取明确指定的 PDF 文件名。"""
+        raw = str(text or "").strip()
+        if not raw:
+            return ""
+
+        normalized = raw.replace("\n", " ").replace("\r", " ")
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+
+        patterns = [
+            r"(?:pdf|PDF)\s*(?:名字|名称|文件名)?\s*(?:叫|是|为|命名为|命名成)\s*[：: ]*\s*[\"“”']?([^\"“”'\s]+(?:\.pdf)?)",
+            r"(?:文件名|名称|名字)\s*(?:叫|是|为|命名为|命名成)\s*[：: ]*\s*[\"“”']?([^\"“”'\s]+(?:\.pdf)?)",
+            r"(?:输出为|保存为|导出为|打包为)\s*[\"“”']?([^\"“”'\s]+(?:\.pdf)?)",
+            r"[\"“”']([^\"“”']+?\.pdf)[\"“”']",
+            r"\b([A-Za-z0-9_\-\u4e00-\u9fff]+\.pdf)\b",
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, normalized, flags=re.IGNORECASE)
+            if not match:
+                continue
+
+            candidate = self._normalize_pdf_filename(match.group(1))
+            if candidate:
+                return candidate
+
+        return ""
+
+    def _guess_pdf_topic_name(self, prompt: str = "", preset_name: str = "") -> str:
+        """在未指定文件名时，尽量生成简短且符合任务语义的名字，而不是直接使用整段提示词。"""
+        raw_text = str(prompt or "").strip()
+        normalized = raw_text.replace("\n", " ").replace("\r", " ")
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+
+        preset_text = "" if str(preset_name or "").strip() in {"", "自定义", "编辑", "edit", "custom"} else str(preset_name).strip()
+
+        # 1. 先按明显任务类型命名
+        keyword_map = [
+            (["漫画", "翻译", "日语", "汉化"], "漫画翻译"),
+            (["手办", "手办化"], "手办化"),
+            (["批量", "全部处理"], "批量处理"),
+            (["打包", "pdf", "PDF"], "图片合集"),
+            (["换装", "换衣", "穿搭"], "换装图集"),
+            (["写真", "自拍"], "写真合集"),
+        ]
+        lowered = normalized.lower()
+        for keywords, title in keyword_map:
+            if any(keyword.lower() in lowered for keyword in keywords):
+                if title == "批量处理" and preset_text:
+                    return f"{preset_text}结果"
+                return title
+
+        # 2. 预设名优先作为简短标题
+        if preset_text:
+            return f"{preset_text}结果"
+
+        # 3. 从文本里提取少量核心词，避免直接整句当文件名
+        cleanup_patterns = [
+            r"Additional requirements:\s*",
+            r"Edit the image according to the following instructions:\s*",
+            r"(?:帮我|给我|把|将|麻烦|请)\s*",
+            r"(?:打包成?|合成|整理成?)\s*pdf",
+            r"(?:名字|名称|文件名).*$",
+        ]
+        candidate = normalized
+        for pattern in cleanup_patterns:
+            candidate = re.sub(pattern, "", candidate, flags=re.IGNORECASE).strip()
+
+        chunks = re.split(r"[，。,.、；;：:\-—_\s]+", candidate)
+        stop_words = {
+            "的", "了", "呢", "啊", "呀", "吧", "一下", "一个", "一些", "这个", "那个",
+            "图片", "图", "照片", "处理", "生成", "结果", "合集", "pdf", "PDF"
+        }
+
+        picked = []
+        for chunk in chunks:
+            chunk = self._normalize_pdf_filename(chunk, fallback="")
+            if not chunk:
+                continue
+            if chunk in stop_words:
+                continue
+            if len(chunk) <= 1:
+                continue
+            picked.append(chunk)
+            if len(picked) >= 2:
+                break
+
+        if picked:
+            return "".join(picked)[:16]
+
+        return "图片合集"
+
+    def _build_pdf_filename_hint(self, prompt: str = "", preset_name: str = "", count: int = 0) -> str:
+        """根据用户批量请求生成更自然的 PDF 文件名提示，优先使用明确指定的名字。"""
+        explicit_name = self._extract_explicit_pdf_filename(prompt)
+        if explicit_name:
+            return f"{explicit_name}.pdf"
+
+        text = self._guess_pdf_topic_name(prompt=prompt, preset_name=preset_name)
+        text = self._normalize_pdf_filename(text)
+
+        if count > 0 and not re.search(r"\d+\s*张", text) and text not in {"漫画翻译", "图片合集"}:
             text = f"{text}{count}张"
 
         return f"{text}.pdf"
@@ -3606,7 +3700,7 @@ class FigurineProPlugin(Star):
             event,
             valid_images_bytes,
             success_prefix="✅ 成功将图片打包为 PDF",
-            filename_hint=self._build_pdf_filename_hint("图片打包", count=len(valid_images_bytes))
+            filename_hint=self._build_pdf_filename_hint(event.message_str, count=len(valid_images_bytes))
         )
         if not success:
             yield event.chain_result([Plain(msg)])
@@ -3651,7 +3745,7 @@ class FigurineProPlugin(Star):
             event,
             valid_images_bytes,
             success_prefix="✅ 成功将图片打包为 PDF",
-            filename_hint=self._build_pdf_filename_hint("图片打包", count=len(valid_images_bytes))
+            filename_hint=self._build_pdf_filename_hint(event.message_str, count=len(valid_images_bytes))
         )
         if success:
             return self._finalize_llm_tool_result("[TOOL_SUCCESS] 图片已经打包成 PDF 并发送给用户。你可以按原本人设自然接话，也可以不补充收尾。")
