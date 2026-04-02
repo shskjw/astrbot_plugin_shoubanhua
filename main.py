@@ -892,11 +892,11 @@ class FigurineProPlugin(Star):
             f"Preferred lighting and atmosphere: {light_en}."
         )
 
-    def _infer_requested_count_from_text(self, message: str, default: int = 1, multi_default: int = 3) -> int:
-        """从自然语言里尽量推断用户想要的张数。"""
+    def _extract_explicit_requested_count_from_text(self, message: str) -> Optional[int]:
+        """仅提取用户文本里明确说出的数量；未明确说明时返回 None。"""
         text = str(message or "").strip().lower()
         if not text:
-            return default
+            return None
 
         digit_match = re.search(r"(\d{1,2})\s*张", text)
         if digit_match:
@@ -919,6 +919,18 @@ class FigurineProPlugin(Star):
                 return cn_map.get(cn_num[0], 1) * 10 + cn_map.get(cn_num[2], 0)
             if cn_num in cn_map:
                 return cn_map[cn_num]
+
+        return None
+
+    def _infer_requested_count_from_text(self, message: str, default: int = 1, multi_default: int = 3) -> int:
+        """从自然语言里尽量推断用户想要的张数。"""
+        text = str(message or "").strip().lower()
+        if not text:
+            return default
+
+        explicit_count = self._extract_explicit_requested_count_from_text(text)
+        if explicit_count is not None:
+            return explicit_count
 
         multi_keywords = ["多来几张", "多拍几张", "多发几张", "来几张", "发几张", "写真集", "多来点", "多来一些"]
         if any(keyword in text for keyword in multi_keywords):
@@ -4449,7 +4461,28 @@ class FigurineProPlugin(Star):
             )
             self._log_prompt_preview(f"persona:{scene_name}", full_prompt)
 
-        # 5. 根据配置决定是否发送进度提示
+        # 5. 只信任用户文本中“明确说出的张数”，避免上一次批量参数污染后续自拍/写真请求
+        requested_text = " ".join([str(scene_hint or ""), str(extra_request or "")]).strip()
+        explicit_count = self._extract_explicit_requested_count_from_text(requested_text)
+        incoming_count = max(1, int(count or 1))
+        if explicit_count is None:
+            if incoming_count > 1:
+                logger.info(
+                    f"人设拍照：检测到工具传入 count={incoming_count}，但用户文本未明确要求数量，已回退为单张"
+                )
+            requested_count = 1
+        else:
+            requested_count = explicit_count
+            if incoming_count != explicit_count:
+                logger.info(
+                    f"人设拍照：工具传入 count={incoming_count} 与用户显式数量 {explicit_count} 不一致，已按用户文本修正"
+                )
+
+        # 6. 限制数量（必须先做，避免错误批量参数影响配额检查和分支选择）
+        raw_count = requested_count
+        count, count_limited = self._normalize_generation_count(requested_count, "persona")
+
+        # 7. 根据配置决定是否发送进度提示
         if self._get_conf_bool("llm_show_progress", True):
             feedback = self._build_llm_progress_text(
                 "persona", count=count, scene_name=scene_name,
@@ -4457,7 +4490,7 @@ class FigurineProPlugin(Star):
             )
             await event.send(event.chain_result([Plain(feedback)]))
 
-        # 6. 检查配额
+        # 8. 检查配额
         gid = norm_id(event.get_group_id())
         deduction = await self._check_quota(event, uid, gid, count)
         if not deduction["allowed"]:
@@ -4465,10 +4498,6 @@ class FigurineProPlugin(Star):
                 "[TOOL_FAILED] 用户次数不足，无法完成。"
                 "请用你自己平时的语气告诉用户现在搞不了，随口带过就好。"
             )
-
-        # 7. 限制数量
-        raw_count = count
-        count, count_limited = self._normalize_generation_count(count, "persona")
 
         # 8. 更新冷却时间
         self._update_image_cooldown(uid)
