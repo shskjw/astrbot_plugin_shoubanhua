@@ -1548,6 +1548,8 @@ class FigurineProPlugin(Star):
                     if self.conf.get("show_model_info", False):
                         info_text += f" | {model}"
                     chain_nodes.append(Plain(info_text))
+                else:
+                    chain_nodes.append(Plain(" ")) # 防止某些适配器丢弃纯图片消息
 
                 chain = event.chain_result(chain_nodes)
                 await event.send(chain)
@@ -1980,51 +1982,39 @@ class FigurineProPlugin(Star):
         # 4. 更新图片生成冷却时间
         self._update_image_cooldown(uid)
 
-        # 5. 直接等待生成完成（避免 LLM 在图片发送前提前输出结束语）
+        # 5. 启动后台生成任务（不阻塞，让 LLM 能立即输出等待/陪伴语句）
         await self._register_pending_generation(event.unified_msg_origin, count)
         if count == 1:
-            success, error_msg = await self._run_background_task(
+            asyncio.create_task(self._run_background_task(
                 event, [], final_prompt, preset_name, deduction, uid, gid, total_cost,
                 extra_rules,
                 model_override=self._get_text_to_image_model(), hide_text=hide_llm_result_text,
                 use_text_to_image_api=True, suppress_user_error=True
-            )
-            if not success:
-                return self._build_llm_tool_failure(error_msg)
+            ))
         else:
-            batch_result = await self._run_batch_text_to_image(
+            asyncio.create_task(self._run_batch_text_to_image(
                 event, final_prompt, preset_name, deduction, uid, gid, count, extra_rules,
                 hide_llm_result_text, suppress_user_error=True
-            )
-            if batch_result.get("success", 0) <= 0:
-                first_error = (batch_result.get("errors") or ["这次没弄好，请稍后再试。"])[0]
-                return self._build_llm_tool_failure(first_error)
+            ))
 
-        # 6. 在图片发送完成后再返回给 LLM
-        # 根据身份补充更自然的主人/VIP提示；普通用户仍走原有叛逆逻辑
+        # 6. 立即返回给 LLM
         vip_hint = self._build_master_identity_hint(uid, event, explicit_master=True) if self._is_vip_user(uid, event) else ""
         rebellious_hint = vip_hint or self._get_rebellious_hint(prompt, uid, event)
 
         count_limit_reply = self._build_count_limit_reply(count, "draw") if count_limited else ""
 
         if rebellious_hint:
-            # 有叛逆提示时，让 LLM 可以用叛逆语气回复
-            # 有叛逆提示：给 LLM 只提供最精简的事实 + 人格引导
-            _draw_hint = "[TOOL_SUCCESS] 图已发出去了。"
-            if count > 1 and 'batch_result' in locals() and batch_result.get("fail", 0) > 0:
-                _draw_hint = f"[TOOL_SUCCESS] 发出去了{batch_result.get('success', 0)}张，有{batch_result.get('fail', 0)}张没弄好。"
+            _draw_hint = f"[TOOL_SUCCESS] 正在画{count}张图，稍后会发出。"
             if count_limit_reply:
                 _draw_hint += " " + count_limit_reply
             _draw_hint += rebellious_hint
             return _draw_hint
         else:
             if count_limit_reply:
-                return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 图已发出。{count_limit_reply}")
+                return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 正在画图中。{count_limit_reply} 请用自然语气回复一句等待的话。")
             if count > 1:
-                if 'batch_result' in locals() and batch_result.get("fail", 0) > 0:
-                    return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 图已发出，成功{batch_result.get('success', 0)}张，有{batch_result.get('fail', 0)}张没弄好。用你自己的语气随口说一下就行。")
-                return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] {count}张图都发出去了。用你自己的语气随口带过，别说'生成'等词汇。")
-            return self._finalize_llm_tool_result("[TOOL_SUCCESS] 图发出去了。用你自己的语气随口带过，也可以什么都不说。")
+                return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 正在画{count}张图。请自然地回复一句让用户稍等的话，不要用'生成'等机械词汇。")
+            return self._finalize_llm_tool_result("[TOOL_SUCCESS] 画图任务已启动，请随口说一句让用户稍等的话，比如'等我一下哦'。")
 
     @filter.llm_tool(name="shoubanhua_edit_image")
     async def image_edit_tool(self, event: AstrMessageEvent, prompt: str, use_message_images: bool = True,
@@ -2242,25 +2232,20 @@ class FigurineProPlugin(Star):
         # 6. 更新图片生成冷却时间
         self._update_image_cooldown(uid)
 
-        # 7. 直接等待任务完成，避免图片发送前提前返回
+        # 7. 启动后台生成任务（不阻塞，让 LLM 能立即输出等待/陪伴语句）
         await self._register_pending_generation(event.unified_msg_origin, count)
         if count == 1:
-            success, error_msg = await self._run_background_task(
+            asyncio.create_task(self._run_background_task(
                 event, images, final_prompt, preset_name, deduction, uid, gid, total_cost,
                 extra_rules, hide_text=hide_llm_result_text, suppress_user_error=True
-            )
-            if not success:
-                return self._build_llm_tool_failure(error_msg)
+            ))
         else:
-            batch_result = await self._run_batch_image_to_image(
+            asyncio.create_task(self._run_batch_image_to_image(
                 event, images, final_prompt, preset_name, deduction, uid, gid, count,
                 extra_rules, hide_llm_result_text, suppress_user_error=True
-            )
-            if batch_result.get("success", 0) <= 0:
-                first_error = (batch_result.get("errors") or ["这次没弄好，请稍后再试。"])[0]
-                return self._build_llm_tool_failure(first_error)
+            ))
 
-        # 返回结果 - 在图片发送完成后再告诉 LLM 不需要回复
+        # 返回结果 - 在图片生成任务启动后立刻告诉 LLM 任务开始了
         # 对主人/VIP优先注入更柔和的亲近提示，普通用户保留原有叛逆逻辑
         vip_hint = self._build_master_identity_hint(uid, event, explicit_master=True) if self._is_vip_user(uid, event) else ""
         rebellious_hint = vip_hint or self._get_rebellious_hint(prompt, uid, event)
@@ -2268,23 +2253,17 @@ class FigurineProPlugin(Star):
         count_limit_reply = self._build_count_limit_reply(count, "edit") if count_limited else ""
 
         if rebellious_hint:
-            # 有叛逆提示时，让 LLM 可以用叛逆语气回复
-            # 有叛逆提示：给 LLM 只提供最精简的事实 + 人格引导
-            _edit_hint = "[TOOL_SUCCESS] 图处理完发出去了。"
-            if count > 1 and 'batch_result' in locals() and batch_result.get("fail", 0) > 0:
-                _edit_hint = f"[TOOL_SUCCESS] 发出去了{batch_result.get('success', 0)}个版本，有{batch_result.get('fail', 0)}个没弄好。"
+            _edit_hint = f"[TOOL_SUCCESS] 正在处理{count}张图，稍后会发出。"
             if count_limit_reply:
                 _edit_hint += " " + count_limit_reply
             _edit_hint += rebellious_hint
             return _edit_hint
         else:
             if count_limit_reply:
-                return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 图处理完了。{count_limit_reply}")
+                return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 图正在处理。{count_limit_reply} 请自然地回复一句等待的话。")
             if count > 1:
-                if 'batch_result' in locals() and batch_result.get("fail", 0) > 0:
-                    return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 处理完了，成功{batch_result.get('success', 0)}个版本，有{batch_result.get('fail', 0)}个没弄好。用你自己的语气随口说一下。")
-                return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] {count}个版本都弄好发出去了。用你自己的语气随口带过，别说'生成'等词汇。")
-            return self._finalize_llm_tool_result("[TOOL_SUCCESS] 图弄好发出去了。用你自己的语气随口带过，也可以什么都不说。")
+                return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 正在制作{count}个版本。用你自己的语气自然地告诉用户稍等一下。")
+            return self._finalize_llm_tool_result("[TOOL_SUCCESS] 图片处理任务已启动。用你自己的语气随口说一句让用户等一下的话。")
 
     # ================= 传统指令触发 =================
 
@@ -3407,22 +3386,10 @@ class FigurineProPlugin(Star):
 
         async def collect_once() -> List[bytes]:
             images_bytes = []
-
-            # 0. 优先使用当前会话中最近成功生成的图片缓存
             session_id = event.unified_msg_origin
-            cached_images = await self._get_recent_generated_images(session_id, max_images=max_images)
-            images_bytes.extend([b for b in cached_images if isinstance(b, bytes) and len(b) > 0])
 
-            cached_hashes = {hash(b) for b in images_bytes if isinstance(b, bytes) and len(b) > 0}
-
-            # 1. 再提取当前消息中的图片（包括引用）
-            bot_id = self._get_bot_id(event)
-            current_images = await self.img_mgr.extract_images_from_event(event, ignore_id=bot_id, context=self.context)
-            images_bytes.extend([b for b in current_images if b and len(b) > 0])
-
-            # 2. 再从上下文获取（包含 Bot 发出的图片）
+            # 1. 先从上下文获取（包含 Bot 发出的图片）
             image_sources = await self._collect_images_from_context(session_id, count=30, include_bot=True)
-
             all_urls = []
             seen_urls = set()
 
@@ -3443,24 +3410,31 @@ class FigurineProPlugin(Star):
                 try:
                     img_b = await self.img_mgr.load_bytes(url)
                     if img_b and len(img_b) > 0:
-                        img_hash = hash(img_b)
-                        if img_hash in cached_hashes:
-                            continue
                         images_bytes.append(img_b)
-                        cached_hashes.add(img_hash)
                 except Exception as e:
                     logger.error(f"收集 PDF 图片时下载失败 {url[:20]}: {e}")
 
-            # 按内容去重，避免当前消息和上下文重复收集到同一张图
+            # 2. 再提取当前消息中的图片（包括引用）
+            bot_id = self._get_bot_id(event)
+            current_images = await self.img_mgr.extract_images_from_event(event, ignore_id=bot_id, context=self.context)
+            images_bytes.extend([b for b in current_images if b and len(b) > 0])
+
+            # 3. 最后追加当前会话中最近成功生成的图片缓存（放在最后以免被截断）
+            cached_images = await self._get_recent_generated_images(session_id, max_images=max_images)
+            images_bytes.extend([b for b in cached_images if isinstance(b, bytes) and len(b) > 0])
+
+            # 按内容去重（从后往前保留最新）
             unique_images = []
             seen_hashes = set()
-            for img in images_bytes:
+            for img in reversed(images_bytes):
                 img_hash = hash(img)
                 if img_hash not in seen_hashes:
                     unique_images.append(img)
                     seen_hashes.add(img_hash)
 
-            # 最终再次严格按 max_images 截断，避免把上下文历史图片一并打进去
+            unique_images.reverse()
+
+            # 最终再次严格按 max_images 截断
             if max_images > 0:
                 unique_images = unique_images[-max_images:]
 
@@ -4505,10 +4479,10 @@ class FigurineProPlugin(Star):
         # 9. 计算是否隐藏输出文本（白名单用户和普通用户使用同一开关）
         hide_llm_result_text = True
 
-        # 10. 直接等待任务完成，避免人设结束语先于图片出现
+        # 10. 启动后台生成任务（非阻塞，让 LLM 能够先输出“我换个姿势拍一张”的互动文案）
         await self._register_pending_generation(event.unified_msg_origin, count)
         if count == 1:
-            success, error_msg = await self._run_background_task(
+            asyncio.create_task(self._run_background_task(
                 event=event,
                 images=final_images,
                 prompt=full_prompt,
@@ -4520,18 +4494,16 @@ class FigurineProPlugin(Star):
                 extra_rules=extra_request,
                 hide_text=hide_llm_result_text,
                 suppress_user_error=True
-            )
-            if not success:
-                return self._build_llm_tool_failure(error_msg)
+            ))
             if count_limited:
-                return self._build_count_limit_reply(count, "persona")
-            return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 照片已经发给用户了（场景：{scene_name}）。用你自己的语气随口带过，也可以什么都不说。")
+                return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 拍照任务已开始。{self._build_count_limit_reply(count, 'persona')} 请自然回复。")
+            return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 正在准备发照片给用户。请用你自己的语气自然地说一句陪伴等待的话（比如“那我换个姿势给你拍一张哦...”），不要提'生成'等机械词汇。")
         else:
             # 对于人设的多张生成，因为传递的是最终合并好的图片（包含人设参考+用户参考），
             # 所以使用 _run_batch_image_to_image。但是要防止该函数再次从数据库读取 "_persona_" 导致图片翻倍。
             # _run_batch_image_to_image 中有逻辑：如果不是“自定义”，就去取预设图片叠加。
             # "人设-xxx" 是不会在预设里查到的，所以不会产生重复！这是完美的。
-            batch_result = await self._run_batch_image_to_image(
+            asyncio.create_task(self._run_batch_image_to_image(
                 event=event,
                 images=final_images,
                 prompt=full_prompt,
@@ -4543,15 +4515,10 @@ class FigurineProPlugin(Star):
                 extra_rules=extra_request,
                 hide_text=hide_llm_result_text,
                 suppress_user_error=True
-            )
-            if batch_result.get("success", 0) <= 0:
-                first_error = (batch_result.get("errors") or ["这次没拍好，请稍后再试。"])[0]
-                return self._build_llm_tool_failure(first_error, "这次没拍好，请稍后再试。")
+            ))
             if count_limited:
-                return self._build_count_limit_reply(count, "persona")
-            if batch_result.get("fail", 0) > 0:
-                return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 发出去了{batch_result.get('success', 0)}张，有{batch_result.get('fail', 0)}张没弄好。用你自己的语气随口带过。")
-            return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] {count}张照片已经都发给用户了。用你自己的语气随口带过，也可以什么都不说。")
+                return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 多张拍照任务已开始。{self._build_count_limit_reply(count, 'persona')} 请自然回复。")
+            return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 正在准备拍{count}张照片给用户。请用你自己的语气自然地说一句等待的话（比如“那我多换几个角度拍给你看哦...”），不要提'生成'等机械词汇。")
 
     @filter.command("人设拍照", prefix_optional=True)
     async def on_persona_photo_cmd(self, event: AstrMessageEvent, ctx=None):
