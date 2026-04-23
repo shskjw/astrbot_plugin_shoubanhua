@@ -827,70 +827,20 @@ class FigurineProPlugin(Star):
             "你的自拍", "看你自拍", "发你的照片", "你长啥样", "你长什么样",
             "写真", "自拍", "照片", "看看自拍"
         ]
-        action_markers = [
-            "我在", "正在", "刚在", "收尾", "整理", "写完", "熄灯", "换衣服",
-            "拍照", "休息", "喝咖啡", "在房间", "在家", "在外面", "在公园", "在学校"
-        ]
 
         for msg in reversed(recent_messages):
             content = str(getattr(msg, "content", "") or "").strip().lower()
             if not content:
                 continue
 
-            if not getattr(msg, "is_bot", False):
-                if any(marker in content for marker in persona_request_markers):
-                    return True
-            else:
-                if any(marker in content for marker in action_markers):
-                    return True
+            if not getattr(msg, "is_bot", False) and any(marker in content for marker in persona_request_markers):
+                return True
 
         return False
 
     def _build_current_time_persona_hint(self) -> str:
-        """构建当前时间场景提示，注入到人设拍照提示词中。"""
-        now = datetime.now()
-        hour = now.hour
-        minute = now.minute
-
-        if 0 <= hour < 5:
-            time_period_cn = "凌晨"
-            time_scene_en = "deep night before dawn"
-            light_en = "dim indoor warm light, sleepy late-night atmosphere"
-        elif 5 <= hour < 8:
-            time_period_cn = "清晨"
-            time_scene_en = "early morning"
-            light_en = "soft morning light, fresh and quiet atmosphere"
-        elif 8 <= hour < 12:
-            time_period_cn = "上午"
-            time_scene_en = "morning"
-            light_en = "clean daylight, relaxed morning atmosphere"
-        elif 12 <= hour < 14:
-            time_period_cn = "中午"
-            time_scene_en = "noon"
-            light_en = "bright natural daylight, calm midday atmosphere"
-        elif 14 <= hour < 18:
-            time_period_cn = "下午"
-            time_scene_en = "afternoon"
-            light_en = "warm afternoon sunlight, casual daily atmosphere"
-        elif 18 <= hour < 20:
-            time_period_cn = "傍晚"
-            time_scene_en = "sunset evening"
-            light_en = "golden hour lighting, soft sunset glow"
-        elif 20 <= hour < 23:
-            time_period_cn = "晚上"
-            time_scene_en = "night"
-            light_en = "cozy indoor lighting, quiet evening mood"
-        else:
-            time_period_cn = "深夜"
-            time_scene_en = "late night"
-            light_en = "low light, intimate quiet late-night atmosphere"
-
-        return (
-            f"Current time context: now it is {time_period_cn} {hour:02d}:{minute:02d} "
-            f"(approximately {time_scene_en}). "
-            f"The scene, mood, clothing details, behavior, and lighting should naturally match this time of day. "
-            f"Preferred lighting and atmosphere: {light_en}."
-        )
+        """保留空实现：主文件不再注入任何硬编码动作/时间/场景提示。"""
+        return ""
 
     def _extract_explicit_requested_count_from_text(self, message: str) -> Optional[int]:
         """仅提取用户文本里明确说出的数量；未明确说明时返回 None。"""
@@ -1384,6 +1334,7 @@ class FigurineProPlugin(Star):
     async def _can_pack_pdf_now(self, event: AstrMessageEvent, gathered_images: Optional[List[bytes]] = None) -> Tuple[bool, str]:
         """校验当前是否满足打包 PDF 的前置条件：必须有成功生成结果或当前上下文存在明确有效图片"""
         session_id = event.unified_msg_origin
+        sender_id = norm_id(event.get_sender_id())
         success_count = await self._get_generation_success_count(session_id)
 
         if gathered_images and any(isinstance(img, bytes) and len(img) > 0 for img in gathered_images):
@@ -1401,7 +1352,12 @@ class FigurineProPlugin(Star):
         if current_urls:
             return True, ""
 
-        image_sources = await self._collect_images_from_context(session_id, count=self._context_rounds, include_bot=True)
+        image_sources = await self._collect_images_from_context(
+            session_id,
+            count=self._context_rounds,
+            include_bot=True,
+            sender_id=sender_id
+        )
         if any(urls for _, urls in image_sources):
             return True, ""
 
@@ -3178,7 +3134,8 @@ class FigurineProPlugin(Star):
     # ================= 批量处理图片功能 =================
 
     async def _collect_images_from_context(self, session_id: str, count: int = 10,
-                                           include_bot: bool = False) -> List[Tuple[str, List[str]]]:
+                                           include_bot: bool = False,
+                                           sender_id: str = "") -> List[Tuple[str, List[str]]]:
         """
         从上下文中收集图片
 
@@ -3186,6 +3143,7 @@ class FigurineProPlugin(Star):
             session_id: 会话ID
             count: 获取的消息数量
             include_bot: 是否包含Bot发出的图片
+            sender_id: 仅收集该发送者的图片；为空时不过滤发送者
 
         Returns:
             [(消息ID, [图片URL列表]), ...]
@@ -3195,7 +3153,10 @@ class FigurineProPlugin(Star):
         result = []
         for msg in messages:
             if msg.has_image and msg.image_urls:
-                if not include_bot and msg.is_bot:
+                if msg.is_bot:
+                    if not include_bot:
+                        continue
+                elif sender_id and norm_id(getattr(msg, "sender_id", "")) != norm_id(sender_id):
                     continue
 
                 filtered_urls = []
@@ -3387,9 +3348,21 @@ class FigurineProPlugin(Star):
         async def collect_once() -> List[bytes]:
             images_bytes = []
             session_id = event.unified_msg_origin
+            sender_id = norm_id(event.get_sender_id())
+
+            # 0. 如果当前会话里已经有本轮成功生成结果，优先只打包这些结果，
+            # 避免把源图、历史图或群里其他人中途发送的图片混进来。
+            cached_generated = await self._get_recent_generated_images(session_id, max_images=max_images)
+            if cached_generated:
+                return [b for b in cached_generated if isinstance(b, bytes) and len(b) > 0]
 
             # 1. 先从上下文获取（包含 Bot 发出的图片）
-            image_sources = await self._collect_images_from_context(session_id, count=30, include_bot=True)
+            image_sources = await self._collect_images_from_context(
+                session_id,
+                count=30,
+                include_bot=True,
+                sender_id=sender_id
+            )
             all_urls = []
             seen_urls = set()
 
@@ -3419,7 +3392,7 @@ class FigurineProPlugin(Star):
             current_images = await self.img_mgr.extract_images_from_event(event, ignore_id=bot_id, context=self.context)
             images_bytes.extend([b for b in current_images if b and len(b) > 0])
 
-            # 3. 最后追加当前会话中最近成功生成的图片缓存（放在最后以免被截断）
+            # 3. 最后追加当前会话中最近成功生成的图片缓存（仅作为无缓存首选时的兜底）
             cached_images = await self._get_recent_generated_images(session_id, max_images=max_images)
             images_bytes.extend([b for b in cached_images if isinstance(b, bytes) and len(b) > 0])
 
@@ -3702,6 +3675,7 @@ class FigurineProPlugin(Star):
         4. 如果用户要求"把这些图片手办化/处理后再打包"，请使用 `shoubanhua_batch_process` 工具并设置 output_as_pdf=True。
         5. 这个工具只负责【纯打包】；没有图片成功结果时不要调用。
         6. 你不能靠猜测“应该生成好了”就调用，必须基于明确成功结果或当前上下文已有有效图片再调用。
+        7. 如果用户说的是“生成/处理 N 张后再打包 PDF”，其中 N 是生成数量，不是本工具的 max_images；不要把数量错误地传给本工具。
 
         Args:
             max_images(int): 最多打包的图片数量，默认10张，可以根据用户需求调整。
@@ -3800,12 +3774,19 @@ class FigurineProPlugin(Star):
             except Exception as e:
                 logger.error(f"Failed to extract images from PDF: {e}")
                 
+        uid = norm_id(event.get_sender_id())
+        gid = norm_id(event.get_group_id())
+
+        uid = norm_id(event.get_sender_id())
+        gid = norm_id(event.get_group_id())
+
         # 2. 获取上下文中的图片
         session_id = event.unified_msg_origin
         image_sources = await self._collect_images_from_context(
             session_id,
             count=self._context_rounds,
-            include_bot=True
+            include_bot=True,
+            sender_id=uid
         )
         cached_image_sources = await self._get_recent_generated_image_sources(session_id, max_images=max_images)
 
@@ -4089,7 +4070,8 @@ class FigurineProPlugin(Star):
         image_sources = await self._collect_images_from_context(
             session_id,
             count=self._context_rounds,
-            include_bot=True
+            include_bot=True,
+            sender_id=uid
         )
         cached_image_sources = await self._get_recent_generated_image_sources(session_id, max_images=max_images)
 
@@ -4767,7 +4749,8 @@ class FigurineProPlugin(Star):
         image_sources = await self._collect_images_from_context(
             session_id,
             count=self._context_rounds,
-            include_bot=True
+            include_bot=True,
+            sender_id=uid
         )
         cached_image_sources = await self._get_recent_generated_image_sources(session_id, max_images=max_images)
 
@@ -4776,7 +4759,9 @@ class FigurineProPlugin(Star):
             return
 
         # 3. 收集所有图片URL（统一过滤头像、去重并按顺序整理）
-        merged_current_urls = list(current_urls) + list(cached_image_sources)
+        merged_current_urls = list(current_urls)
+        if not merged_current_urls:
+            merged_current_urls = list(cached_image_sources)
         all_image_urls = self._merge_batch_image_urls(merged_current_urls, image_sources, max_images=max_images)
         total_images = len(all_image_urls)
         if total_images == 0:
@@ -4787,8 +4772,6 @@ class FigurineProPlugin(Star):
         final_prompt, preset_name, extra_rules = self._process_prompt_and_preset(prompt)
 
         # 检查配额
-        uid = norm_id(event.get_sender_id())
-        gid = norm_id(event.get_group_id())
         total_cost = total_images
 
         deduction = await self._check_quota(event, uid, gid, total_cost)
