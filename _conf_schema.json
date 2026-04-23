@@ -44,7 +44,7 @@
     "model_list": {
         "description": "【核心】模型列表配置（仅用于展示/序号切换）",
         "type": "list",
-        "hint": "这里只是给 #切换模型 命令和序号切换功能提供候选列表，可留空。它不会限制【通用】默认模型名称、【通用】文生图专用模型、【高级】强力模型 ID 的填写，这些字段都可以直接填写任意模型名称，即使不在本列表中也能正常使用。",
+        "hint": "这里只是给 #切换模型 命令和序号切换功能提供候选列表，可留空。它不会限制【通用】默认模型名称、【通用】文生图专用模型的填写，这些字段都可以直接填写任意模型名称，即使不在本列表中也能正常使用。",
         "items": {
             "type": "string",
             "description": "模型名称 (如 nano-banana, gemini-1.5-pro)"
@@ -104,73 +104,19 @@
             "4K"
         ]
     },
-    "enable_power_model": {
-        "description": "【高级】启用强力模型模式",
+    "enable_luxury_mode": {
+        "description": "【全局】启用奢侈模式",
         "type": "bool",
-        "hint": "开启后，可通过配置的触发词以额外扣费方式使用强力模型。",
+        "hint": "开启后，每次图片请求都会并发发送多次，只取其中第一张成功图片，其余结果直接丢弃。适合用更多消耗换更高成功率。",
         "default": false
     },
-    "power_model_keyword": {
-        "description": "【高级】强力模式触发词",
-        "type": "string",
-        "hint": "填写一个触发词（例如 pro），使用格式：指令 + 空格 + 触发词 + 空格 + 提示词。例如：手办化 pro [图片]，文生图 pro 描述。",
-        "default": ""
-    },
-    "power_model_id": {
-        "description": "【高级】强力模型 ID",
-        "type": "string",
-        "hint": "启用强力模式后实际调用的模型名称（必须填写）。这里同样可以直接填写任意模型名称，不需要出现在【核心】模型列表配置中。",
-        "default": ""
-    },
-    "power_model_tip_enabled": {
-        "description": "【高级】提示强力模式格式",
-        "type": "bool",
-        "hint": "开启后，在回复中提醒用户可通过“指令 + 触发词 + 提示词”格式消耗强力模式所需次数调用更强模型。",
-        "default": false
-    },
-    "power_model_extra_cost": {
-        "description": "【高级】强力模式额外扣次数",
+    "luxury_request_count": {
+        "description": "【全局】奢侈模式并发次数",
         "type": "int",
-        "hint": "开启强力模式时除了基础扣费外额外扣除的次数，至少为0。",
-        "default": 1
-    },
-    "power_mode_fallback_to_group": {
-        "description": "【高级】强力模式群次数回退",
-        "type": "bool",
-        "hint": "开启后：强力模式优先扣个人次数；若个人次数不足且已启用群组次数限制，则顺位扣群次数。",
-        "default": false
-    },
-    "power_generic_api_url": {
-        "description": "【强力模式-Generic】API基础地址",
-        "type": "string",
-        "hint": "强力模式Generic模式专用：只需填写基础URL（如 https://api.bltcy.ai 或 https://api.bltcy.ai/v1）。如果为空则使用普通模式的API地址。插件会自动拼接所需接口路径；即使误填完整接口路径也会自动修正。",
-        "default": ""
-    },
-    "power_generic_api_keys": {
-        "description": "【强力模式-Generic】API Key 池",
-        "type": "list",
-        "hint": "强力模式Generic模式专用的Key轮询池。如果为空则使用普通模式的Key池。",
-        "items": {
-            "type": "string",
-            "description": "sk-..."
-        },
-        "default": []
-    },
-    "power_gemini_api_url": {
-        "description": "【强力模式-Gemini官方】API Base地址",
-        "type": "string",
-        "hint": "强力模式Gemini官方模式专用：填Base URL（如 https://generativelanguage.googleapis.com）。如果为空则使用普通模式的API地址。",
-        "default": ""
-    },
-    "power_gemini_api_keys": {
-        "description": "【强力模式-Gemini官方】API Key 池",
-        "type": "list",
-        "hint": "强力模式Gemini官方模式专用的Key轮询池。如果为空则使用普通模式的Key池。",
-        "items": {
-            "type": "string",
-            "description": "AIza..."
-        },
-        "default": []
+        "hint": "奢侈模式下同一请求并发发送的次数。例如设为3，则一次请求会并发发起3次，只取其中成功的一张图片，其余全部丢弃。",
+        "default": 3,
+        "min": 1,
+        "max": 16
     },
     "show_model_info": {
         "description": "【显示】显示模型信息",

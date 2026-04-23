@@ -221,11 +221,6 @@
 | `model_list` | 可用模型 ID 列表，默认包含 nano-banana 等 |
 | `model` | 默认模型（需在模型列表中存在），示例：gemini-2.5-flash-preview-image |
 | `image_resolution` | 画质/分辨率参数，例：4K |
-| `enable_power_model` | 开启强力模式开关 |
-| `power_model_keyword` | 强力模式触发词，格式：指令 + 空格 + 触发词 + 提示词，例：手办化 pro [图] |
-| `power_model_id` | 强力模型 ID，例：gemini-3-pro-preview-image |
-| `power_model_tip_enabled` | 是否在普通模式回复里提醒强力模式格式和扣费 |
-| `power_model_extra_cost` | 强力模式额外扣次数（基础 1 次+额外值） |
 | `show_model_info` | 是否在成功/失败消息中显示实际调用模型 |
 | `debug_mode` | 调试模式，开启后报错会附加完整错误内容 |
 | `prefix` | 是否需要命令前缀或 @ 才触发 |

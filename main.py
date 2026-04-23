@@ -107,6 +107,19 @@ _CLOTHING_KEYWORDS = [
     "https://github.com/shkjw/astrbot_plugin_shoubanhua",
 )
 class FigurineProPlugin(Star):
+    _DEPRECATED_CONFIG_KEYS = [
+        "enable_power_model",
+        "power_model_keyword",
+        "power_model_id",
+        "power_model_tip_enabled",
+        "power_model_extra_cost",
+        "power_mode_fallback_to_group",
+        "power_generic_api_url",
+        "power_generic_api_keys",
+        "power_gemini_api_url",
+        "power_gemini_api_keys",
+    ]
+
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.conf = config
@@ -161,6 +174,27 @@ class FigurineProPlugin(Star):
         # 会话级任务进度表（用于催促时优先返回当前任务状态，避免重复开新任务） 
         self._session_task_status: Dict[str, Dict[str, Any]] = {} 
         self._session_task_status_lock = asyncio.Lock()
+
+    def _purge_deprecated_config_keys(self, config_obj=None) -> int:
+        """清理已经废弃的旧配置字段，避免面板继续显示历史残留项。"""
+        target = config_obj if config_obj is not None else self.conf
+        removed = 0
+
+        for key in self._DEPRECATED_CONFIG_KEYS:
+            try:
+                if key in target:
+                    del target[key]
+                    removed += 1
+            except Exception:
+                try:
+                    value = target.get(key, None)
+                    if value is not None:
+                        target[key] = None
+                        removed += 1
+                except Exception:
+                    pass
+
+        return removed
 
     def _is_message_processed(self, msg_id: str) -> bool:
         """
@@ -509,6 +543,10 @@ class FigurineProPlugin(Star):
         return await self.data_mgr.load_preset_ref_images_bytes("_persona_")
 
     async def initialize(self):
+        removed_from_runtime = self._purge_deprecated_config_keys()
+        if removed_from_runtime > 0:
+            logger.info(f"FigurinePro: 已从运行时配置中清理 {removed_from_runtime} 个废弃强力模式字段")
+
         # 尝试加载动态配置备份
         # 注意：仅在当前配置缺失/为空时才回退恢复，避免覆盖用户手动写入的 JSON 配置
         import os
@@ -518,6 +556,13 @@ class FigurineProPlugin(Star):
             try:
                 with open(config_path, "r", encoding="utf-8") as f:
                     dynamic_conf = json.load(f)
+
+                if isinstance(dynamic_conf, dict):
+                    removed_from_backup = self._purge_deprecated_config_keys(dynamic_conf)
+                    if removed_from_backup > 0:
+                        with open(config_path, "w", encoding="utf-8") as fw:
+                            json.dump(dynamic_conf, fw, ensure_ascii=False, indent=2)
+                        logger.info(f"FigurinePro: 已从 dynamic_config.json 清理 {removed_from_backup} 个废弃强力模式字段")
 
                 restored_count = 0
                 skipped_count = 0
@@ -589,6 +634,8 @@ class FigurineProPlugin(Star):
 
     def _save_config(self):
         try:
+            self._purge_deprecated_config_keys()
+
             # 尝试 AstrBot 原生配置保存
             saved = False
             if hasattr(self.conf, "save") and callable(self.conf.save):
@@ -616,16 +663,7 @@ class FigurineProPlugin(Star):
                 "generic_api_url",
                 "generic_api_keys",
                 "gemini_api_url",
-                "gemini_api_keys",
-                "enable_power_model",
-                "power_model_keyword",
-                "power_model_id",
-                "power_model_extra_cost",
-                "power_mode_fallback_to_group",
-                "power_generic_api_url",
-                "power_generic_api_keys",
-                "power_gemini_api_url",
-                "power_gemini_api_keys"
+                "gemini_api_keys"
             ]
 
             save_data = {}
@@ -2244,8 +2282,6 @@ class FigurineProPlugin(Star):
         model_idx_override = int(match.group(1)) - 1 if match else None
         base_cmd = cmd_raw[:match.start()] if match else cmd_raw
 
-        power_kw = (self.conf.get("power_model_keyword") or "").lower()
-        is_power = False
         user_prompt = ""
         preset_name = "自定义"
 
@@ -2259,33 +2295,23 @@ class FigurineProPlugin(Star):
             # user_prompt, preset_name = self._process_prompt_and_preset(user_prompt)
             preset_name = "自定义"
 
-            # 新增：检测强力模式关键词
-            if power_kw and power_kw in user_prompt.lower():
-                is_power = True
-                user_prompt = user_prompt.replace(power_kw, "", 1).strip()
         else:
             preset_prompt = self.data_mgr.get_prompt(base_cmd)
 
             if not preset_prompt: return
 
-            if power_kw and power_kw in base_cmd.lower(): is_power = True
             user_prompt = preset_prompt
             preset_name = base_cmd
 
             if "%" in base_cmd: user_prompt += base_cmd.split("%", 1)[1]
             if len(parts) > 1:
-                if parts[1].strip().lower() == power_kw:
-                    is_power = True
-                else:
-                    user_prompt += " " + parts[1]
+                user_prompt += " " + parts[1]
 
             user_prompt = self._append_preset_safety_suffix(user_prompt, preset_name)
 
-        if is_power and not self.conf.get("enable_power_model", False): is_power = False
-
         uid = norm_id(event.get_sender_id())
         gid = norm_id(event.get_group_id())
-        cost = self.conf.get("power_model_extra_cost", 1) + 1 if is_power else 1
+        cost = 1
 
         deduction = await self._check_quota(event, uid, gid, cost)
         if deduction["allowed"] is False:
@@ -2297,13 +2323,10 @@ class FigurineProPlugin(Star):
         event.stop_event()
 
         # 指令模式：立刻反馈
-        mode_str = "增强" if is_power else ""
         _internal = {"自定义", "编辑", "edit", "custom"}
         preset_display = "" if (not preset_name or preset_name.strip().lower() in _internal) else preset_name
         template = self.conf.get("generating_msg_template", "🎨 收到请求，正在生成 [{preset}]...")
         feedback = template.replace("{preset}", preset_display) if preset_display else template.replace(" [{preset}]", "").replace("[{preset}]", "")
-        if mode_str and "收到请求" in feedback:
-            feedback = feedback.replace("收到请求", f"收到{mode_str}请求")
         yield event.chain_result([Plain(feedback)])
 
         bot_id = self._get_bot_id(event)
@@ -2322,15 +2345,13 @@ class FigurineProPlugin(Star):
         # 判断是否为纯文生图模式（bnn 指令且没有图片）
         is_text_to_image = is_bnn and not images and user_prompt
 
-        if is_power:
-            model = self.conf.get("power_model_id")
-        elif is_text_to_image:
+        if is_text_to_image:
             # 纯文生图使用专用模型
             model = self._get_text_to_image_model()
         else:
             model = self.conf.get("model", "nano-banana")
 
-        if model_idx_override is not None and not is_power:
+        if model_idx_override is not None:
             all_models = [m if isinstance(m, str) else m["id"] for m in self.conf.get("model_list", [])]
             if 0 <= model_idx_override < len(all_models):
                 model = all_models[model_idx_override]
@@ -2347,7 +2368,7 @@ class FigurineProPlugin(Star):
 
         start = datetime.now()
         res = await self.api_mgr.call_api(
-            images, user_prompt, model, is_power, self.img_mgr.proxy,
+            images, user_prompt, model, self.img_mgr.proxy,
             use_text_to_image_api=is_text_to_image
         )
 
@@ -2583,15 +2604,13 @@ class FigurineProPlugin(Star):
         parts = event.message_str.split()
         if len(parts) < 2: return
 
-        is_power = parts[1].lower() in ["p", "power", "强力"]
-        keys = parts[2:] if is_power else parts[1:]
+        keys = parts[1:]
 
         mode = self.conf.get("api_mode", "generic")
-        field = f"{'power_' if is_power else ''}{mode if mode == 'generic' else 'gemini'}_api_keys"
         if mode == "gemini_official":
-            field = f"{'power_' if is_power else ''}gemini_api_keys"
+            field = "gemini_api_keys"
         else:
-            field = f"{'power_' if is_power else ''}generic_api_keys"
+            field = "generic_api_keys"
 
         curr_keys = self.conf.get(field, [])
         curr_keys.extend(keys)
@@ -2606,24 +2625,20 @@ class FigurineProPlugin(Star):
         base = "gemini" if mode == "gemini_official" else "generic"
 
         nk = self.conf.get(f"{base}_api_keys", [])
-        pk = self.conf.get(f"power_{base}_api_keys", [])
-
         msg = f"🔑 模式: {mode}\n📌 普通池 ({len(nk)}):\n" + "\n".join([f"{k[:8]}..." for k in nk])
-        msg += f"\n\n⚡ 强力池 ({len(pk)}):\n" + "\n".join([f"{k[:8]}..." for k in pk])
         yield event.chain_result([Plain(msg)])
 
     @filter.command("手办化删除key", prefix_optional=True)
     async def on_delete_key(self, event: AstrMessageEvent, ctx=None):
         if not self.is_admin(event): return
         parts = event.message_str.split()
-        if len(parts) < 2: yield event.chain_result([Plain("用法: #删除key [p] <all/序号>")]); return
+        if len(parts) < 2: yield event.chain_result([Plain("用法: #删除key <all/序号>")]); return
 
-        is_power = parts[1].lower() in ["p", "power"]
-        idx_str = parts[2] if is_power else parts[1]
+        idx_str = parts[1]
 
         mode = self.conf.get("api_mode", "generic")
         base = "gemini" if mode == "gemini_official" else "generic"
-        field = f"{'power_' if is_power else ''}{base}_api_keys"
+        field = f"{base}_api_keys"
 
         if idx_str == "all":
             self.conf[field] = [];

@@ -42,6 +42,78 @@ class ApiManager:
     def get_last_metrics(self) -> Dict:
         return dict(self._last_metrics or {})
 
+    def _normalize_call_api_args(self, legacy_use_power_or_proxy=None, proxy=None, use_text_to_image_api: bool = False):
+        """兼容旧版 call_api 调用签名：
+        - 新版: call_api(images, prompt, model, proxy, use_text_to_image_api=...)
+        - 旧版: call_api(images, prompt, model, False, proxy)
+        """
+        resolved_proxy = proxy
+        resolved_use_text_to_image_api = bool(use_text_to_image_api)
+
+        if isinstance(legacy_use_power_or_proxy, bool):
+            # 旧版 use_power 参数，现已废弃，直接忽略
+            pass
+        else:
+            if resolved_proxy is None:
+                resolved_proxy = legacy_use_power_or_proxy
+
+        if isinstance(resolved_proxy, bool):
+            resolved_proxy = None
+
+        if resolved_proxy is not None:
+            resolved_proxy = str(resolved_proxy).strip() or None
+
+        return resolved_proxy, resolved_use_text_to_image_api
+
+    def _get_luxury_request_count(self) -> int:
+        """获取奢侈模式并发请求数。"""
+        try:
+            count = int(self.config.get("luxury_request_count", 3) or 3)
+        except Exception:
+            count = 3
+        return max(1, count)
+
+    async def _call_api_with_luxury_mode(self, images: List[bytes], prompt: str,
+                                         model: str, proxy: str = None,
+                                         use_text_to_image_api: bool = False) -> bytes | str:
+        """奢侈模式：同一请求并发多次，只取首个成功结果，其余丢弃。"""
+        luxury_count = self._get_luxury_request_count()
+        if luxury_count <= 1:
+            return await self._call_api_once(images, prompt, model, proxy, use_text_to_image_api)
+
+        logger.info(f"奢侈模式已启用：同一请求并发 {luxury_count} 次，仅取其中一张成功图片")
+
+        tasks = [
+            asyncio.create_task(self._call_api_once(images, prompt, model, proxy, use_text_to_image_api))
+            for _ in range(luxury_count)
+        ]
+
+        first_error = "奢侈模式下所有并发请求均失败"
+        success_result = None
+
+        try:
+            for completed in asyncio.as_completed(tasks):
+                try:
+                    result = await completed
+                except Exception as e:
+                    result = f"系统错误: {e}"
+
+                if isinstance(result, bytes) and result:
+                    success_result = result
+                    break
+
+                if isinstance(result, str) and result and first_error == "奢侈模式下所有并发请求均失败":
+                    first_error = result
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        if success_result is not None:
+            return success_result
+        return first_error
+
     def _should_bypass_proxy(self, url: str) -> bool:
         """本地/内网地址不走代理，避免请求本地中转时反而绕远路。"""
         if not url:
@@ -80,17 +152,13 @@ class ApiManager:
             return None
         return proxy
 
-    async def get_key(self, mode: str, is_power: bool, use_text_to_image_api: bool = False) -> str | None:
+    async def get_key(self, mode: str, use_text_to_image_api: bool = False) -> str | None:
         """获取轮询 Key"""
         async with self.key_lock:
-            prefix = "power_" if is_power else ""
-
             if use_text_to_image_api:
                 if mode == "gemini_official":
                     keys = self.config.get("text_to_image_api_keys", [])
                     if not keys:
-                        keys = self.config.get(f"{prefix}gemini_api_keys", [])
-                    if not keys and is_power:
                         keys = self.config.get("gemini_api_keys", [])
                     if not keys:
                         return None
@@ -100,8 +168,6 @@ class ApiManager:
                 else:
                     keys = self.config.get("text_to_image_api_keys", [])
                     if not keys:
-                        keys = self.config.get(f"{prefix}generic_api_keys", [])
-                    if not keys and is_power:
                         keys = self.config.get("generic_api_keys", [])
                     if not keys:
                         return None
@@ -110,9 +176,7 @@ class ApiManager:
                     return k
 
             if mode == "gemini_official":
-                keys = self.config.get(f"{prefix}gemini_api_keys", [])
-                if not keys and is_power:
-                    keys = self.config.get("gemini_api_keys", [])  # Fallback
+                keys = self.config.get("gemini_api_keys", [])
 
                 if not keys:
                     return None
@@ -120,9 +184,7 @@ class ApiManager:
                 self.gemini_idx += 1
                 return k
             else:
-                keys = self.config.get(f"{prefix}generic_api_keys", [])
-                if not keys and is_power:
-                    keys = self.config.get("generic_api_keys", [])  # Fallback
+                keys = self.config.get("generic_api_keys", [])
 
                 if not keys:
                     return None
@@ -816,8 +878,25 @@ class ApiManager:
         return f"结果图片下载失败: {last_error}"
 
     async def call_api(self, images: List[bytes], prompt: str,
-                       model: str, use_power: bool, proxy: str = None,
+                       model: str, legacy_use_power_or_proxy=None,
+                       proxy: str = None,
                        use_text_to_image_api: bool = False) -> bytes | str:
+        proxy, use_text_to_image_api = self._normalize_call_api_args(
+            legacy_use_power_or_proxy, proxy, use_text_to_image_api
+        )
+
+        if self.config.get("enable_luxury_mode", False):
+            return await self._call_api_with_luxury_mode(
+                images, prompt, model, proxy, use_text_to_image_api
+            )
+
+        return await self._call_api_once(
+            images, prompt, model, proxy, use_text_to_image_api
+        )
+
+    async def _call_api_once(self, images: List[bytes], prompt: str,
+                             model: str, proxy: str = None,
+                             use_text_to_image_api: bool = False) -> bytes | str:
         """核心生成逻辑"""
 
         self._reset_metrics()
@@ -826,31 +905,28 @@ class ApiManager:
         mode = self.config.get("api_mode", "generic")
 
         # 1. 确定 URL
-        prefix = "power_" if use_power else ""
         if use_text_to_image_api:
             if mode == "gemini_official":
                 base = (
                     self.config.get("text_to_image_api_url")
-                    or self.config.get(f"{prefix}gemini_api_url")
                     or self.config.get("gemini_api_url")
                 )
             else:
                 base = (
                     self.config.get("text_to_image_api_url")
-                    or self.config.get(f"{prefix}generic_api_url")
                     or self.config.get("generic_api_url")
                 )
         else:
             if mode == "gemini_official":
-                base = self.config.get(f"{prefix}gemini_api_url") or self.config.get("gemini_api_url")
+                base = self.config.get("gemini_api_url")
             else:
-                base = self.config.get(f"{prefix}generic_api_url") or self.config.get("generic_api_url")
+                base = self.config.get("generic_api_url")
 
         if not base:
             return "API URL 未配置"
 
         # 2. 获取 Key
-        key = await self.get_key(mode, use_power, use_text_to_image_api=use_text_to_image_api)
+        key = await self.get_key(mode, use_text_to_image_api=use_text_to_image_api)
         if not key:
             return "无可用 API Key"
 
