@@ -1,4 +1,4 @@
-6name: astrbot_plugin_shoubanhua
+name: astrbot_plugin_shoubanhua
 desc: 支持第三方所有OpenAI绘图格式和原生Google Gemini 终极缝合怪，文生图/图生图插件，支持LLM智能判断
 help: |
   🎨 手办化插件
