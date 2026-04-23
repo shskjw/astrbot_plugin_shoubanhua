@@ -171,6 +171,12 @@ class FigurineProPlugin(Star):
         self._session_generated_images_lock = asyncio.Lock()
         self._session_generated_images_max = max(1, int(config.get("pdf_session_image_cache", 20)))
 
+        # PDF 暂存模式：当 pack_images_to_pdf 被调用时，通知后台生成任务不要发送单张图片，
+        # 而是将图片写入暂存文件夹，等全部生成完后统一打包 PDF 发送。
+        self._pdf_staging_sessions: Dict[str, bool] = {}        # session_id -> True 表示处于暂存模式
+        self._pdf_staging_images: Dict[str, List[bytes]] = {}   # session_id -> 暂存图片列表
+        self._pdf_staging_lock = asyncio.Lock()
+
         # 会话级任务进度表（用于催促时优先返回当前任务状态，避免重复开新任务） 
         self._session_task_status: Dict[str, Dict[str, Any]] = {} 
         self._session_task_status_lock = asyncio.Lock()
@@ -1011,6 +1017,92 @@ class FigurineProPlugin(Star):
 
         return sources
 
+    # ================= PDF 暂存模式管理 =================
+
+    async def _enter_pdf_staging_mode(self, session_id: str):
+        """进入 PDF 暂存模式：后台生成任务将不再发送单张图片，改为写入暂存列表"""
+        async with self._pdf_staging_lock:
+            self._pdf_staging_sessions[session_id] = True
+            self._pdf_staging_images[session_id] = []
+            logger.info(f"[PDF暂存] 进入暂存模式: {session_id}")
+
+    async def _exit_pdf_staging_mode(self, session_id: str):
+        """退出 PDF 暂存模式并清理暂存数据"""
+        async with self._pdf_staging_lock:
+            self._pdf_staging_sessions.pop(session_id, None)
+            self._pdf_staging_images.pop(session_id, None)
+            logger.info(f"[PDF暂存] 退出暂存模式: {session_id}")
+
+    def _is_pdf_staging_mode(self, session_id: str) -> bool:
+        """检查当前会话是否处于 PDF 暂存模式"""
+        return self._pdf_staging_sessions.get(session_id, False)
+
+    async def _stage_image_for_pdf(self, session_id: str, image_bytes: bytes):
+        """将生成的图片添加到 PDF 暂存列表"""
+        if not session_id or not isinstance(image_bytes, bytes) or len(image_bytes) == 0:
+            return
+        async with self._pdf_staging_lock:
+            imgs = self._pdf_staging_images.get(session_id, [])
+            imgs.append(image_bytes)
+            self._pdf_staging_images[session_id] = imgs
+            logger.info(f"[PDF暂存] 图片已暂存，当前共 {len(imgs)} 张: {session_id}")
+
+    async def _get_staged_images(self, session_id: str) -> List[bytes]:
+        """获取暂存列表中的所有图片"""
+        async with self._pdf_staging_lock:
+            return list(self._pdf_staging_images.get(session_id, []))
+
+    async def _wait_for_all_generations_and_collect(self, session_id: str,
+                                                     timeout: int = 120) -> List[bytes]:
+        """等待当前会话所有后台生成任务完成，然后收集暂存的图片。
+
+        同时也会将内存缓存中的图片合并进来（兜底），确保不丢图。
+
+        Args:
+            session_id: 会话 ID
+            timeout: 最长等待秒数
+
+        Returns:
+            图片字节列表
+        """
+        poll_interval = max(1, self.conf.get("pdf_wait_poll_interval", 2))
+        waited = 0
+
+        while waited < timeout:
+            pending = await self._get_pending_generation_count(session_id)
+            staged = await self._get_staged_images(session_id)
+
+            if pending == 0 and waited > 3:
+                # 后台任务全部结束，退出等待
+                logger.info(f"[PDF暂存] 等待完成，pending=0，已暂存 {len(staged)} 张: {session_id}")
+                break
+
+            if waited > 0 and waited % 10 == 0:
+                logger.info(f"[PDF暂存] 等待中... pending={pending}, staged={len(staged)}, waited={waited}s")
+
+            await asyncio.sleep(poll_interval)
+            waited += poll_interval
+
+        # 收集暂存图片
+        staged_images = await self._get_staged_images(session_id)
+
+        # 兜底：合并内存缓存中的图片（防止有图片在暂存模式开启前就已经生成并缓存了）
+        cached_images = await self._get_recent_generated_images(session_id)
+
+        # 去重合并
+        all_images = list(staged_images)
+        seen_hashes = {hash(img) for img in all_images}
+        for img in cached_images:
+            if isinstance(img, bytes) and len(img) > 0:
+                h = hash(img)
+                if h not in seen_hashes:
+                    all_images.append(img)
+                    seen_hashes.add(h)
+
+        logger.info(f"[PDF暂存] 最终收集到 {len(all_images)} 张图片 "
+                     f"(staged={len(staged_images)}, cached={len(cached_images)}): {session_id}")
+        return all_images
+
     def _get_conf_bool(self, key: str, default: bool = False) -> bool:
         """兼容字符串/数字形式的布尔配置，避免 bool('false') 误判为 True。"""
         value = self.conf.get(key, default)
@@ -1374,8 +1466,14 @@ class FigurineProPlugin(Star):
         session_id = event.unified_msg_origin
         sender_id = norm_id(event.get_sender_id())
         success_count = await self._get_generation_success_count(session_id)
+        pending_count = await self._get_pending_generation_count(session_id)
 
         if gathered_images and any(isinstance(img, bytes) and len(img) > 0 for img in gathered_images):
+            return True, ""
+
+        # 如果当前会话里还有后台图片任务在跑，允许 PDF 工具继续进入收集/等待流程，
+        # 避免“刚开始拍照就立刻打包”时被过早拦截，导致无法等待新图落库。
+        if pending_count > 0:
             return True, ""
 
         if success_count > 0:
@@ -1529,7 +1627,13 @@ class FigurineProPlugin(Star):
                 await self._register_generation_success(event.unified_msg_origin, 1)
                 await self._register_generated_image(event.unified_msg_origin, res)
 
-                # 5. 主动发送结果
+                # 5. 检查是否处于 PDF 暂存模式
+                if self._is_pdf_staging_mode(event.unified_msg_origin):
+                    # PDF 暂存模式：不发送单张图片，写入暂存列表
+                    await self._stage_image_for_pdf(event.unified_msg_origin, res)
+                    return True, ""
+
+                # 6. 主动发送结果
                 chain_nodes = [Image.fromBytes(res)]
                 if not hide_text:
                     quota_str = self._get_quota_str(deduction, uid, gid)
@@ -1635,6 +1739,12 @@ class FigurineProPlugin(Star):
                                 await self.data_mgr.record_usage(uid, gid)
                                 await self._register_generation_success(event.unified_msg_origin, 1)
                                 await self._register_generated_image(event.unified_msg_origin, res)
+
+                                # PDF 暂存模式：不发送单张图片
+                                if self._is_pdf_staging_mode(event.unified_msg_origin):
+                                    await self._stage_image_for_pdf(event.unified_msg_origin, res)
+                                    success = True
+                                    break
 
                                 chain_nodes = [Image.fromBytes(res)]
                                 if not hide_text:
@@ -1768,6 +1878,12 @@ class FigurineProPlugin(Star):
                                 await self.data_mgr.record_usage(uid, gid)
                                 await self._register_generation_success(event.unified_msg_origin, 1)
                                 await self._register_generated_image(event.unified_msg_origin, res)
+
+                                # PDF 暂存模式：不发送单张图片
+                                if self._is_pdf_staging_mode(event.unified_msg_origin):
+                                    await self._stage_image_for_pdf(event.unified_msg_origin, res)
+                                    success = True
+                                    break
 
                                 chain_nodes = [Image.fromBytes(res)]
                                 if not hide_text:
@@ -3621,6 +3737,11 @@ class FigurineProPlugin(Star):
                 await self._register_generation_success(event.unified_msg_origin, 1)
                 await self._register_generated_image(event.unified_msg_origin, res)
 
+                # PDF 暂存模式：不发送单张图片
+                if self._is_pdf_staging_mode(event.unified_msg_origin):
+                    await self._stage_image_for_pdf(event.unified_msg_origin, res)
+                    return True, ""
+
                 chain_nodes = [Image.fromBytes(res)]
                 if not hide_text:
                     # 构建成功文案
@@ -3681,50 +3802,89 @@ class FigurineProPlugin(Star):
 
     @filter.llm_tool(name="shoubanhua_pack_images_to_pdf")
     async def pack_images_to_pdf_tool(self, event: AstrMessageEvent, max_images: int = 10):
-        '''将上下文中的图片（包括Bot之前生成的图片）直接打包成一个PDF文件发送给用户。注意：此工具【不会】修改图片，【不会】生成新图，仅仅是把已有的图片原样打包。
+        '''将上下文中的图片（包括Bot正在生成或已经生成的图片）直接打包成一个PDF文件发送给用户。注意：此工具【不会】修改图片，【不会】生成新图，仅仅是把已有的图片原样打包。
 
         【调用规则（必须严格遵守）】
-        1. 只有在你已经确认图片【确实生成成功】之后，才能调用此工具。
-        2. 如果前面的图片任务还在生成中、还没发出来、或你不确定是否成功，严禁调用。
-        3. 用户必须明确要求"把刚才的图打包成PDF"、"合成PDF"、"把这些图片做成PDF"时，才可以调用。
-        4. 如果用户要求"把这些图片手办化/处理后再打包"，请使用 `shoubanhua_batch_process` 工具并设置 output_as_pdf=True。
-        5. 这个工具只负责【纯打包】；没有图片成功结果时不要调用。
-        6. 你不能靠猜测“应该生成好了”就调用，必须基于明确成功结果或当前上下文已有有效图片再调用。
-        7. 如果用户说的是“生成/处理 N 张后再打包 PDF”，其中 N 是生成数量，不是本工具的 max_images；不要把数量错误地传给本工具。
+        1. 用户必须明确要求"把刚才的图打包成PDF"、"合成PDF"、"把这些图片做成PDF"时，才可以调用。
+        2. 如果用户要求"把这些图片手办化/处理后再打包"，请使用 `shoubanhua_batch_process` 工具并设置 output_as_pdf=True。
+        3. 这个工具只负责【纯打包】，会自动等待正在生成的图片全部完成后再打包。
+        4. 如果前面有图片生成任务正在进行，此工具会自动等待它们完成，无需担心时序问题。
+        5. 如果用户说的是"生成/处理 N 张后再打包 PDF"，其中 N 是生成数量，不是本工具的 max_images；不要把数量错误地传给本工具。
 
         Args:
             max_images(int): 最多打包的图片数量，默认10张，可以根据用户需求调整。
         '''
+        session_id = event.unified_msg_origin
+
+        # 0. 基本前置检查
         can_pack, block_msg = await self._can_pack_pdf_now(event)
         if not can_pack:
             return block_msg
 
-        await event.send(event.chain_result([Plain("📦 正在收集图片，请稍候...")]))
+        # 1. 立即进入 PDF 暂存模式
+        #    后续的后台生成任务将不再发送单张图片，而是写入暂存列表
+        await self._enter_pdf_staging_mode(session_id)
+
+        await event.send(event.chain_result([Plain("📦 正在等待所有图片就绪，请稍候...")]))
 
         try:
-            valid_images_bytes = await self._gather_images_for_pdf(event, max_images=max_images, wait_for_generation=True)
+            # 2. 等待所有后台生成任务完成，并收集暂存的图片
+            pdf_wait_timeout = max(30, self.conf.get("pdf_wait_timeout", 120))
+            valid_images_bytes = await self._wait_for_all_generations_and_collect(
+                session_id, timeout=pdf_wait_timeout
+            )
+
+            # 3. 如果暂存+缓存都没有图片，回退到旧的收集逻辑（兼容直接打包上下文图片的场景）
+            if not valid_images_bytes:
+                try:
+                    valid_images_bytes = await self._gather_images_for_pdf(
+                        event, max_images=max_images, wait_for_generation=False
+                    )
+                except Exception as e:
+                    logger.error(f"收集 PDF 图片异常: {e}", exc_info=True)
+
+            if not valid_images_bytes:
+                return self._finalize_llm_tool_result(
+                    "[TOOL_FAILED] 等了一会儿还是没找到可用的图片。\n"
+                    "请用你自己的语气告诉用户现在没有图可以打包，稍后再来。"
+                )
+
+            # 4. 按 max_images 截断
+            if max_images > 0 and len(valid_images_bytes) > max_images:
+                valid_images_bytes = valid_images_bytes[-max_images:]
+
+            await event.send(event.chain_result([
+                Plain(f"📦 已收集到 {len(valid_images_bytes)} 张图片，正在打包为 PDF，请稍候...")
+            ]))
+
+            # 5. 打包并发送 PDF
+            success, msg = await self._pack_and_send_pdf(
+                event,
+                valid_images_bytes,
+                success_prefix="✅ 成功将图片打包为 PDF",
+                filename_hint=self._build_pdf_filename_hint(
+                    event.message_str, count=len(valid_images_bytes)
+                )
+            )
+
+            if success:
+                return self._finalize_llm_tool_result(
+                    "[TOOL_SUCCESS] 图片已经打包成 PDF 并发送给用户。"
+                    "你可以按原本人设自然接话，也可以不补充收尾。"
+                )
+            return msg
+
         except Exception as e:
-            logger.error(f"收集 PDF 图片异常: {e}", exc_info=True)
-            return self._finalize_llm_tool_result(f"[TOOL_FAILED] {self._mask_llm_error(e, '收集图片失败')}\n请用你自己的语气告诉用户现在搞不了，稍后再试试。")
+            logger.error(f"PDF 打包异常: {e}", exc_info=True)
+            return self._finalize_llm_tool_result(
+                f"[TOOL_FAILED] {self._mask_llm_error(e, '打包 PDF 失败了')}\n"
+                "请用你自己的语气告诉用户现在搞不了，稍后再试试。"
+            )
+        finally:
+            # 6. 无论成功失败，都退出暂存模式
+            await self._exit_pdf_staging_mode(session_id)
 
-        can_pack, block_msg = await self._can_pack_pdf_now(event, valid_images_bytes)
-        if not can_pack:
-            return block_msg
 
-        if not valid_images_bytes:
-            return self._finalize_llm_tool_result("[TOOL_FAILED] 等了一会儿还是没找到可用的图片。\n请用你自己的语气告诉用户现在没有图可以打包，稍后再来。")
-
-        await event.send(event.chain_result([Plain(f"📦 已收集到 {len(valid_images_bytes)} 张图片，正在打包为 PDF，请稍候...")]))
-
-        success, msg = await self._pack_and_send_pdf(
-            event,
-            valid_images_bytes,
-            success_prefix="✅ 成功将图片打包为 PDF",
-            filename_hint=self._build_pdf_filename_hint(event.message_str, count=len(valid_images_bytes))
-        )
-        if success:
-            return self._finalize_llm_tool_result("[TOOL_SUCCESS] 图片已经打包成 PDF 并发送给用户。你可以按原本人设自然接话，也可以不补充收尾。")
-        return msg
 
     @filter.llm_tool(name="shoubanhua_batch_process")
     async def batch_process_tool(self, event: AstrMessageEvent, prompt: str, max_images: int = 10, output_as_pdf: bool = False):
@@ -4432,21 +4592,31 @@ class FigurineProPlugin(Star):
             )
             self._log_prompt_preview(f"persona:{scene_name}", full_prompt)
 
-        # 5. 只信任用户文本中“明确说出的张数”，避免上一次批量参数污染后续自拍/写真请求
+        # 5. 数量决策：
+        # - 如果用户文本里明确写了数量，优先按用户文本；
+        # - 否则优先信任当前这次工具调用传入的 count；
+        # - 如果工具没传出多张，再根据“写真集/多来几张”等自然语言补推断。
+        # 这样既能避免历史上下文污染，又不会把本次工具已经决定好的批量参数错误打回单张。
         requested_text = " ".join([str(scene_hint or ""), str(extra_request or "")]).strip()
         explicit_count = self._extract_explicit_requested_count_from_text(requested_text)
         incoming_count = max(1, int(count or 1))
-        if explicit_count is None:
-            if incoming_count > 1:
-                logger.info(
-                    f"人设拍照：检测到工具传入 count={incoming_count}，但用户文本未明确要求数量，已回退为单张"
-                )
-            requested_count = 1
-        else:
+        inferred_count = self._infer_requested_count_from_text(requested_text, default=1, multi_default=3)
+        if explicit_count is not None:
             requested_count = explicit_count
             if incoming_count != explicit_count:
                 logger.info(
                     f"人设拍照：工具传入 count={incoming_count} 与用户显式数量 {explicit_count} 不一致，已按用户文本修正"
+                )
+        elif incoming_count > 1:
+            requested_count = incoming_count
+            logger.info(
+                f"人设拍照：用户文本未显式写数量，采用工具传入 count={incoming_count}"
+            )
+        else:
+            requested_count = max(1, inferred_count)
+            if requested_count > 1:
+                logger.info(
+                    f"人设拍照：根据用户文本语义推断为多张输出，count={requested_count}"
                 )
 
         # 6. 限制数量（必须先做，避免错误批量参数影响配额检查和分支选择）
