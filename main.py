@@ -1,4 +1,4 @@
-﻿import re
+import re
 import asyncio
 import json
 from datetime import datetime
@@ -173,8 +173,9 @@ class FigurineProPlugin(Star):
 
         # PDF 暂存模式：当 pack_images_to_pdf 被调用时，通知后台生成任务不要发送单张图片，
         # 而是将图片写入暂存文件夹，等全部生成完后统一打包 PDF 发送。
-        self._pdf_staging_sessions: Dict[str, bool] = {}        # session_id -> True 表示处于暂存模式
-        self._pdf_staging_images: Dict[str, List[bytes]] = {}   # session_id -> 暂存图片列表
+        self._pdf_staging_sessions: Dict[str, bool] = {}           # session_id -> True 表示处于暂存模式
+        self._pdf_staging_images: Dict[str, Dict[int, bytes]] = {} # session_id -> {序号: 图片字节}，按序号排序保证顺序
+        self._pdf_staging_counter: Dict[str, int] = {}             # session_id -> 下一个可用序号（自增）
         self._pdf_staging_lock = asyncio.Lock()
 
         # 会话级任务进度表（用于催促时优先返回当前任务状态，避免重复开新任务） 
@@ -1020,10 +1021,11 @@ class FigurineProPlugin(Star):
     # ================= PDF 暂存模式管理 =================
 
     async def _enter_pdf_staging_mode(self, session_id: str):
-        """进入 PDF 暂存模式：后台生成任务将不再发送单张图片，改为写入暂存列表"""
+        """进入 PDF 暂存模式：后台生成任务将不再发送单张图片，改为写入暂存字典"""
         async with self._pdf_staging_lock:
             self._pdf_staging_sessions[session_id] = True
-            self._pdf_staging_images[session_id] = []
+            self._pdf_staging_images[session_id] = {}
+            self._pdf_staging_counter[session_id] = 0
             logger.info(f"[PDF暂存] 进入暂存模式: {session_id}")
 
     async def _exit_pdf_staging_mode(self, session_id: str):
@@ -1031,39 +1033,57 @@ class FigurineProPlugin(Star):
         async with self._pdf_staging_lock:
             self._pdf_staging_sessions.pop(session_id, None)
             self._pdf_staging_images.pop(session_id, None)
+            self._pdf_staging_counter.pop(session_id, None)
             logger.info(f"[PDF暂存] 退出暂存模式: {session_id}")
 
     def _is_pdf_staging_mode(self, session_id: str) -> bool:
         """检查当前会话是否处于 PDF 暂存模式"""
         return self._pdf_staging_sessions.get(session_id, False)
 
-    async def _stage_image_for_pdf(self, session_id: str, image_bytes: bytes):
-        """将生成的图片添加到 PDF 暂存列表"""
+    async def _stage_image_for_pdf(self, session_id: str, image_bytes: bytes,
+                                    staging_index: Optional[int] = None):
+        """将生成的图片添加到 PDF 暂存字典，按 staging_index 排序保证顺序。
+
+        Args:
+            session_id: 会话 ID
+            image_bytes: 图片字节
+            staging_index: 图片在批次中的序号（保证输出顺序与输入一致）。
+                           如果为 None，则自动分配下一个序号（适用于单张生成场景）。
+        """
         if not session_id or not isinstance(image_bytes, bytes) or len(image_bytes) == 0:
             return
         async with self._pdf_staging_lock:
-            imgs = self._pdf_staging_images.get(session_id, [])
-            imgs.append(image_bytes)
+            imgs = self._pdf_staging_images.get(session_id, {})
+
+            if staging_index is None:
+                # 自动分配序号
+                staging_index = self._pdf_staging_counter.get(session_id, 0)
+                self._pdf_staging_counter[session_id] = staging_index + 1
+
+            imgs[staging_index] = image_bytes
             self._pdf_staging_images[session_id] = imgs
-            logger.info(f"[PDF暂存] 图片已暂存，当前共 {len(imgs)} 张: {session_id}")
+            logger.info(f"[PDF暂存] 图片已暂存 index={staging_index}，当前共 {len(imgs)} 张: {session_id}")
 
     async def _get_staged_images(self, session_id: str) -> List[bytes]:
-        """获取暂存列表中的所有图片"""
+        """获取暂存字典中的所有图片，按序号排序返回"""
         async with self._pdf_staging_lock:
-            return list(self._pdf_staging_images.get(session_id, []))
+            imgs_dict = self._pdf_staging_images.get(session_id, {})
+            # 按序号排序，保证输出顺序与输入一致
+            return [imgs_dict[k] for k in sorted(imgs_dict.keys())]
 
     async def _wait_for_all_generations_and_collect(self, session_id: str,
                                                      timeout: int = 120) -> List[bytes]:
         """等待当前会话所有后台生成任务完成，然后收集暂存的图片。
 
         同时也会将内存缓存中的图片合并进来（兜底），确保不丢图。
+        暂存图片按序号排序在前，缓存图片按原有顺序追加在后。
 
         Args:
             session_id: 会话 ID
             timeout: 最长等待秒数
 
         Returns:
-            图片字节列表
+            图片字节列表（顺序与输入/生成顺序一致）
         """
         poll_interval = max(1, self.conf.get("pdf_wait_poll_interval", 2))
         waited = 0
@@ -1083,13 +1103,13 @@ class FigurineProPlugin(Star):
             await asyncio.sleep(poll_interval)
             waited += poll_interval
 
-        # 收集暂存图片
+        # 收集暂存图片（已按序号排序）
         staged_images = await self._get_staged_images(session_id)
 
         # 兜底：合并内存缓存中的图片（防止有图片在暂存模式开启前就已经生成并缓存了）
         cached_images = await self._get_recent_generated_images(session_id)
 
-        # 去重合并
+        # 去重合并：暂存图片（有序）在前，缓存图片追加在后
         all_images = list(staged_images)
         seen_hashes = {hash(img) for img in all_images}
         for img in cached_images:
@@ -1740,9 +1760,9 @@ class FigurineProPlugin(Star):
                                 await self._register_generation_success(event.unified_msg_origin, 1)
                                 await self._register_generated_image(event.unified_msg_origin, res)
 
-                                # PDF 暂存模式：不发送单张图片
+                                # PDF 暂存模式：不发送单张图片，用 index 保证顺序
                                 if self._is_pdf_staging_mode(event.unified_msg_origin):
-                                    await self._stage_image_for_pdf(event.unified_msg_origin, res)
+                                    await self._stage_image_for_pdf(event.unified_msg_origin, res, staging_index=index)
                                     success = True
                                     break
 
@@ -1879,9 +1899,9 @@ class FigurineProPlugin(Star):
                                 await self._register_generation_success(event.unified_msg_origin, 1)
                                 await self._register_generated_image(event.unified_msg_origin, res)
 
-                                # PDF 暂存模式：不发送单张图片
+                                # PDF 暂存模式：不发送单张图片，用 index 保证顺序
                                 if self._is_pdf_staging_mode(event.unified_msg_origin):
-                                    await self._stage_image_for_pdf(event.unified_msg_origin, res)
+                                    await self._stage_image_for_pdf(event.unified_msg_origin, res, staging_index=index)
                                     success = True
                                     break
 
@@ -3737,9 +3757,9 @@ class FigurineProPlugin(Star):
                 await self._register_generation_success(event.unified_msg_origin, 1)
                 await self._register_generated_image(event.unified_msg_origin, res)
 
-                # PDF 暂存模式：不发送单张图片
+                # PDF 暂存模式：不发送单张图片，用 task_index 保证顺序
                 if self._is_pdf_staging_mode(event.unified_msg_origin):
-                    await self._stage_image_for_pdf(event.unified_msg_origin, res)
+                    await self._stage_image_for_pdf(event.unified_msg_origin, res, staging_index=task_index)
                     return True, ""
 
                 chain_nodes = [Image.fromBytes(res)]
