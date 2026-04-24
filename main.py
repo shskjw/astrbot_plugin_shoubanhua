@@ -1141,6 +1141,25 @@ class FigurineProPlugin(Star):
             self._pdf_staging_images[session_id] = imgs
             logger.info(f"[PDF暂存] 图片已暂存 index={staging_index}，当前共 {len(imgs)} 张: {session_id}")
 
+    async def _maybe_stage_after_grace(self, session_id: str, image_bytes: bytes,
+                                       staging_index: Optional[int] = None) -> bool:
+        """给 pack_images_to_pdf 一个短暂接管窗口，避免“先发图后打包”。"""
+        if not session_id or not isinstance(image_bytes, bytes) or not image_bytes:
+            return False
+
+        if self._is_pdf_staging_mode(session_id):
+            await self._stage_image_for_pdf(session_id, image_bytes, staging_index=staging_index)
+            return True
+
+        grace_seconds = max(0.0, float(self.conf.get("pdf_staging_grace_seconds", 1.2) or 0.0))
+        if grace_seconds > 0:
+            await asyncio.sleep(grace_seconds)
+            if self._is_pdf_staging_mode(session_id):
+                await self._stage_image_for_pdf(session_id, image_bytes, staging_index=staging_index)
+                return True
+
+        return False
+
     async def _get_staged_images(self, session_id: str) -> List[bytes]:
         """获取暂存字典中的所有图片，按序号排序返回"""
         async with self._pdf_staging_lock:
@@ -1726,9 +1745,7 @@ class FigurineProPlugin(Star):
                 await self._register_generated_image(event.unified_msg_origin, res)
 
                 # 5. 检查是否处于 PDF 暂存模式
-                if self._is_pdf_staging_mode(event.unified_msg_origin):
-                    # PDF 暂存模式：不发送单张图片，写入暂存列表
-                    await self._stage_image_for_pdf(event.unified_msg_origin, res)
+                if await self._maybe_stage_after_grace(event.unified_msg_origin, res):
                     return True, ""
 
                 # 6. 主动发送结果
@@ -1842,8 +1859,7 @@ class FigurineProPlugin(Star):
                                 await self._register_generated_image(event.unified_msg_origin, res)
 
                                 # PDF 暂存模式：不发送单张图片，用 index 保证顺序
-                                if self._is_pdf_staging_mode(event.unified_msg_origin):
-                                    await self._stage_image_for_pdf(event.unified_msg_origin, res, staging_index=index)
+                                if await self._maybe_stage_after_grace(event.unified_msg_origin, res, staging_index=index):
                                     success = True
                                     break
 
@@ -1983,8 +1999,7 @@ class FigurineProPlugin(Star):
                                 await self._register_generated_image(event.unified_msg_origin, res)
 
                                 # PDF 暂存模式：不发送单张图片，用 index 保证顺序
-                                if self._is_pdf_staging_mode(event.unified_msg_origin):
-                                    await self._stage_image_for_pdf(event.unified_msg_origin, res, staging_index=index)
+                                if await self._maybe_stage_after_grace(event.unified_msg_origin, res, staging_index=index):
                                     success = True
                                     break
 
@@ -3928,8 +3943,7 @@ class FigurineProPlugin(Star):
                 await self._register_generated_image(event.unified_msg_origin, res)
 
                 # PDF 暂存模式：不发送单张图片，用 task_index 保证顺序
-                if self._is_pdf_staging_mode(event.unified_msg_origin):
-                    await self._stage_image_for_pdf(event.unified_msg_origin, res, staging_index=task_index)
+                if await self._maybe_stage_after_grace(event.unified_msg_origin, res, staging_index=task_index):
                     return True, ""
 
                 chain_nodes = [Image.fromBytes(res)]
