@@ -1,4 +1,4 @@
-import re
+﻿import re
 import asyncio
 import json
 from datetime import datetime
@@ -149,8 +149,8 @@ class FigurineProPlugin(Star):
         self._rebellious_mode = config.get("enable_rebellious_mode", True)
         self._rebellious_probability = config.get("rebellious_probability", 0.3)
 
-        # 图片生成冷却时间（只针对图片生成，不影响正常聊天） 
-        self._image_cooldown_seconds = config.get("llm_cooldown_seconds", 60) 
+        # 图片生成冷却时间（只针对图片生成，不影响正常聊天）
+        self._image_cooldown_seconds = config.get("llm_cooldown_seconds", 60)
         self._user_last_image_gen: Dict[str, datetime] = {}  # 用户ID -> 上次图片生成时间
 
         # 消息去重缓存（防止多平台重复处理同一消息）
@@ -158,8 +158,8 @@ class FigurineProPlugin(Star):
         self._msg_dedup_ttl = 60  # 去重缓存保留时间（秒）
         self._msg_dedup_max_size = 1000  # 最大缓存数量
 
-        # 后台生成任务状态跟踪（用于 PDF 等待“全部生成完成”） 
-        self._pending_generation_tasks: Dict[str, int] = {}  # session_id -> pending count 
+        # 后台生成任务状态跟踪（用于 PDF 等待“全部生成完成”）
+        self._pending_generation_tasks: Dict[str, int] = {}  # session_id -> pending count
         self._pending_generation_lock = asyncio.Lock()
 
         # 会话级成功生成记录（用于限制 PDF 工具只能在图片成功生成后调用）
@@ -173,13 +173,13 @@ class FigurineProPlugin(Star):
 
         # PDF 暂存模式：当 pack_images_to_pdf 被调用时，通知后台生成任务不要发送单张图片，
         # 而是将图片写入暂存文件夹，等全部生成完后统一打包 PDF 发送。
-        self._pdf_staging_sessions: Dict[str, bool] = {}           # session_id -> True 表示处于暂存模式
-        self._pdf_staging_images: Dict[str, Dict[int, bytes]] = {} # session_id -> {序号: 图片字节}，按序号排序保证顺序
-        self._pdf_staging_counter: Dict[str, int] = {}             # session_id -> 下一个可用序号（自增）
+        self._pdf_staging_sessions: Dict[str, bool] = {}  # session_id -> True 表示处于暂存模式
+        self._pdf_staging_images: Dict[str, Dict[int, bytes]] = {}  # session_id -> {序号: 图片字节}，按序号排序保证顺序
+        self._pdf_staging_counter: Dict[str, int] = {}  # session_id -> 下一个可用序号（自增）
         self._pdf_staging_lock = asyncio.Lock()
 
-        # 会话级任务进度表（用于催促时优先返回当前任务状态，避免重复开新任务） 
-        self._session_task_status: Dict[str, Dict[str, Any]] = {} 
+        # 会话级任务进度表（用于催促时优先返回当前任务状态，避免重复开新任务）
+        self._session_task_status: Dict[str, Dict[str, Any]] = {}
         self._session_task_status_lock = asyncio.Lock()
 
     def _purge_deprecated_config_keys(self, config_obj=None) -> int:
@@ -500,13 +500,15 @@ class FigurineProPlugin(Star):
 
         # [修复] 清理人设描述，防止包含框架系统指令
         # 仅保留纯描述部分，截断遇到的 '# 标题' 或 JSON 结构
-        if persona_desc and ("# Persona" in persona_desc or "# 任务" in persona_desc or "{" in persona_desc or "# 角色" in persona_desc):
+        if persona_desc and (
+                "# Persona" in persona_desc or "# 任务" in persona_desc or "{" in persona_desc or "# 角色" in persona_desc):
             clean_lines = []
             for line in persona_desc.split('\n'):
                 line = line.strip()
                 if not line: continue
                 # 遇到框架指令标记就截断
-                if line.startswith(('# Persona', '# 任务', '# 角色', '# 外观', '# 经历', '# 性格', 'Persona Instructions')):
+                if line.startswith(
+                        ('# Persona', '# 任务', '# 角色', '# 外观', '# 经历', '# 性格', 'Persona Instructions')):
                     break
                 # 遇到 JSON 结构就跳过
                 if line.startswith('{') or line.startswith('"') or line.startswith('}'):
@@ -569,7 +571,8 @@ class FigurineProPlugin(Star):
                     if removed_from_backup > 0:
                         with open(config_path, "w", encoding="utf-8") as fw:
                             json.dump(dynamic_conf, fw, ensure_ascii=False, indent=2)
-                        logger.info(f"FigurinePro: 已从 dynamic_config.json 清理 {removed_from_backup} 个废弃强力模式字段")
+                        logger.info(
+                            f"FigurinePro: 已从 dynamic_config.json 清理 {removed_from_backup} 个废弃强力模式字段")
 
                 restored_count = 0
                 skipped_count = 0
@@ -933,6 +936,38 @@ class FigurineProPlugin(Star):
 
         return default
 
+    def _has_multi_generation_intent(self, message: str) -> bool:
+        """判断文本是否明确表达了“要多张/批量”的意图。"""
+        text = str(message or "").strip().lower()
+        if not text:
+            return False
+
+        multi_keywords = [
+            "多来几张", "多拍几张", "多发几张", "来几张", "发几张", "写真集", "多来点", "多来一些",
+            "批量", "批量处理", "全部处理", "都处理", "一起处理", "一批", "多版本", "多个版本",
+            "几张", "几版", "几组",
+        ]
+        return any(keyword in text for keyword in multi_keywords)
+
+    def _resolve_tool_requested_count(self, request_text: str, incoming_count: int = 1,
+                                      default: int = 1, multi_default: int = 3) -> int:
+        """统一裁决 LLM 工具传入的数量，避免因预设/提示词中的普通数字误触发批量。"""
+        text = str(request_text or "").strip()
+        safe_incoming = max(1, int(incoming_count or 1))
+
+        explicit_count = self._extract_explicit_requested_count_from_text(text)
+        if explicit_count is not None:
+            return explicit_count
+
+        inferred_count = self._infer_requested_count_from_text(text, default=default, multi_default=multi_default)
+        if inferred_count > default:
+            return inferred_count
+
+        if safe_incoming > default and self._has_multi_generation_intent(text):
+            return safe_incoming
+
+        return default
+
     async def _register_pending_generation(self, session_id: str, count: int = 1):
         """登记后台待完成生成任务"""
         if not session_id or count <= 0:
@@ -1028,19 +1063,29 @@ class FigurineProPlugin(Star):
             self._session_generated_success.pop(session_id, None)
         logger.info(f"[PDF] 已清除会话图片缓存: {session_id}")
 
+    async def _cleanup_temp_file(self, file_path: str):
+        """尽力清理临时文件，避免打包任务残留。"""
+        if not file_path:
+            return
+
+        try:
+            from pathlib import Path
+            path_obj = Path(file_path)
+            if path_obj.exists() and path_obj.is_file():
+                await asyncio.to_thread(path_obj.unlink)
+                logger.info(f"已清理临时文件: {file_path}")
+        except Exception as e:
+            logger.warning(f"清理临时文件失败 {file_path}: {e}")
+
     # ================= PDF 暂存模式管理 =================
 
     async def _enter_pdf_staging_mode(self, session_id: str):
-        """进入 PDF 暂存模式：后台生成任务将不再发送单张图片，改为写入暂存字典。
-        同时清空旧的图片缓存，确保本次打包只包含当前批次的图片。
-        """
+        """进入 PDF 暂存模式：后台生成任务将不再发送单张图片，改为写入暂存字典"""
         async with self._pdf_staging_lock:
             self._pdf_staging_sessions[session_id] = True
             self._pdf_staging_images[session_id] = {}
             self._pdf_staging_counter[session_id] = 0
-        # 清空旧的图片缓存，防止旧图污染本次打包
-        await self._clear_session_image_cache(session_id)
-        logger.info(f"[PDF暂存] 进入暂存模式（已清除旧缓存）: {session_id}")
+            logger.info(f"[PDF暂存] 进入暂存模式: {session_id}")
 
     async def _exit_pdf_staging_mode(self, session_id: str):
         """退出 PDF 暂存模式并清理暂存数据"""
@@ -1055,7 +1100,7 @@ class FigurineProPlugin(Star):
         return self._pdf_staging_sessions.get(session_id, False)
 
     async def _stage_image_for_pdf(self, session_id: str, image_bytes: bytes,
-                                    staging_index: Optional[int] = None):
+                                   staging_index: Optional[int] = None):
         """将生成的图片添加到 PDF 暂存字典，按 staging_index 排序保证顺序。
 
         Args:
@@ -1086,17 +1131,18 @@ class FigurineProPlugin(Star):
             return [imgs_dict[k] for k in sorted(imgs_dict.keys())]
 
     async def _wait_for_all_generations_and_collect(self, session_id: str,
-                                                     timeout: int = 120) -> List[bytes]:
-        """等待当前会话所有后台生成任务完成，然后只收集暂存字典中的图片。
+                                                    timeout: int = 120) -> List[bytes]:
+        """等待当前会话所有后台生成任务完成，然后收集暂存的图片。
 
-        不会合并旧的图片缓存，确保打包结果只包含本次明确暂存的图片。
+        同时也会将内存缓存中的图片合并进来（兜底），确保不丢图。
+        暂存图片按序号排序在前，缓存图片按原有顺序追加在后。
 
         Args:
             session_id: 会话 ID
             timeout: 最长等待秒数
 
         Returns:
-            图片字节列表（按暂存序号排序，顺序与输入/生成顺序一致）
+            图片字节列表（顺序与输入/生成顺序一致）
         """
         poll_interval = max(1, self.conf.get("pdf_wait_poll_interval", 2))
         waited = 0
@@ -1116,10 +1162,25 @@ class FigurineProPlugin(Star):
             await asyncio.sleep(poll_interval)
             waited += poll_interval
 
-        # 只收集暂存图片（已按序号排序），不合并旧缓存
+        # 收集暂存图片（已按序号排序）
         staged_images = await self._get_staged_images(session_id)
-        logger.info(f"[PDF暂存] 最终收集到 {len(staged_images)} 张暂存图片: {session_id}")
-        return staged_images
+
+        # 兜底：合并内存缓存中的图片（防止有图片在暂存模式开启前就已经生成并缓存了）
+        cached_images = await self._get_recent_generated_images(session_id)
+
+        # 去重合并：暂存图片（有序）在前，缓存图片追加在后
+        all_images = list(staged_images)
+        seen_hashes = {hash(img) for img in all_images}
+        for img in cached_images:
+            if isinstance(img, bytes) and len(img) > 0:
+                h = hash(img)
+                if h not in seen_hashes:
+                    all_images.append(img)
+                    seen_hashes.add(h)
+
+        logger.info(f"[PDF暂存] 最终收集到 {len(all_images)} 张图片 "
+                    f"(staged={len(staged_images)}, cached={len(cached_images)}): {session_id}")
+        return all_images
 
     def _get_conf_bool(self, key: str, default: bool = False) -> bool:
         """兼容字符串/数字形式的布尔配置，避免 bool('false') 误判为 True。"""
@@ -1479,7 +1540,8 @@ class FigurineProPlugin(Star):
 
         return f"当前已有进行中的{task_type}，先别重复开新任务，继续等待即可。"
 
-    async def _can_pack_pdf_now(self, event: AstrMessageEvent, gathered_images: Optional[List[bytes]] = None) -> Tuple[bool, str]:
+    async def _can_pack_pdf_now(self, event: AstrMessageEvent, gathered_images: Optional[List[bytes]] = None) -> Tuple[
+        bool, str]:
         """校验当前是否满足打包 PDF 的前置条件：必须有成功生成结果或当前上下文存在明确有效图片"""
         session_id = event.unified_msg_origin
         sender_id = norm_id(event.get_sender_id())
@@ -1665,13 +1727,15 @@ class FigurineProPlugin(Star):
                         info_text += f" | {model}"
                     chain_nodes.append(Plain(info_text))
                 else:
-                    chain_nodes.append(Plain(" ")) # 防止某些适配器丢弃纯图片消息
+                    chain_nodes.append(Plain(" "))  # 防止某些适配器丢弃纯图片消息
 
                 chain = event.chain_result(chain_nodes)
                 await event.send(chain)
                 return True, ""
             else:
-                error_msg = self._resolve_debug_error_message(res, "这次没弄好，请稍后再试。") if suppress_user_error else str(res)
+                error_msg = self._resolve_debug_error_message(res,
+                                                              "这次没弄好，请稍后再试。") if suppress_user_error else str(
+                    res)
                 if (not suppress_user_error) or self._should_show_debug_errors():
                     display_msg = error_msg
                     if not str(display_msg).startswith("❌"):
@@ -1683,7 +1747,8 @@ class FigurineProPlugin(Star):
 
         except Exception as e:
             logger.error(f"Background task error: {e}")
-            error_msg = self._resolve_debug_error_message(e, "这次没弄好，请稍后再试。") if suppress_user_error else f"系统错误: {e}"
+            error_msg = self._resolve_debug_error_message(e,
+                                                          "这次没弄好，请稍后再试。") if suppress_user_error else f"系统错误: {e}"
             if (not suppress_user_error) or self._should_show_debug_errors():
                 _display = str(error_msg).removeprefix("❌").strip()
                 await event.send(event.chain_result([Plain(f"出了点状况: {_display}")]))
@@ -1798,7 +1863,9 @@ class FigurineProPlugin(Star):
                                     ]))
 
                     except Exception as e:
-                        error_msg = self._resolve_debug_error_message(e, "这次没弄好，请稍后再试。") if suppress_user_error else self._translate_error_to_chinese(str(e))
+                        error_msg = self._resolve_debug_error_message(e,
+                                                                      "这次没弄好，请稍后再试。") if suppress_user_error else self._translate_error_to_chinese(
+                            str(e))
                         logger.error(f"Batch text-to-image {index} exception: {e}", exc_info=True)
                         async with results_lock:
                             results["fail"] += 1
@@ -1937,7 +2004,9 @@ class FigurineProPlugin(Star):
                                     ]))
 
                     except Exception as e:
-                        error_msg = self._resolve_debug_error_message(e, "这次没弄好，请稍后再试。") if suppress_user_error else self._translate_error_to_chinese(str(e))
+                        error_msg = self._resolve_debug_error_message(e,
+                                                                      "这次没弄好，请稍后再试。") if suppress_user_error else self._translate_error_to_chinese(
+                            str(e))
                         logger.error(f"Batch image-to-image {index} exception: {e}", exc_info=True)
                         async with results_lock:
                             results["fail"] += 1
@@ -2069,7 +2138,8 @@ class FigurineProPlugin(Star):
         '''
         # 0. 检查 LLM 工具开关
         if not self._get_conf_bool("enable_llm_tool", True):
-            return self._finalize_llm_tool_result("[TOOL_UNAVAILABLE] 当前功能暂时不可用。请用自己平时的语气告诉用户现在不方便，别提功能禁用、指令模式等词汇，要自然。")
+            return self._finalize_llm_tool_result(
+                "[TOOL_UNAVAILABLE] 当前功能暂时不可用。请用自己平时的语气告诉用户现在不方便，别提功能禁用、指令模式等词汇，要自然。")
 
         # 0.1 检查图片生成冷却时间
         uid = norm_id(event.get_sender_id())
@@ -2080,8 +2150,9 @@ class FigurineProPlugin(Star):
             return f"【冷却中】{excuse}\n\n请用自然的方式告诉用户现在不方便生成图片，可以稍后再试。不要直接说'冷却'这个词。"
 
         # 0.2 限制批量生成数量
-        raw_count = count
-        count, count_limited = self._normalize_generation_count(count, "draw")
+        requested_count = self._resolve_tool_requested_count(prompt, incoming_count=count, default=1, multi_default=3)
+        raw_count = requested_count
+        count, count_limited = self._normalize_generation_count(requested_count, "draw")
 
         # 1. 计算预设和追加规则
         final_prompt, preset_name, extra_rules = self._process_prompt_and_preset(prompt)
@@ -2127,7 +2198,8 @@ class FigurineProPlugin(Star):
             ))
 
         # 6. 立即返回给 LLM
-        vip_hint = self._build_master_identity_hint(uid, event, explicit_master=True) if self._is_vip_user(uid, event) else ""
+        vip_hint = self._build_master_identity_hint(uid, event, explicit_master=True) if self._is_vip_user(uid,
+                                                                                                           event) else ""
         rebellious_hint = vip_hint or self._get_rebellious_hint(prompt, uid, event)
 
         count_limit_reply = self._build_count_limit_reply(count, "draw") if count_limited else ""
@@ -2140,10 +2212,13 @@ class FigurineProPlugin(Star):
             return _draw_hint
         else:
             if count_limit_reply:
-                return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 正在画图中。{count_limit_reply} 请用自然语气回复一句等待的话。")
+                return self._finalize_llm_tool_result(
+                    f"[TOOL_SUCCESS] 正在画图中。{count_limit_reply} 请用自然语气回复一句等待的话。")
             if count > 1:
-                return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 正在画{count}张图。请自然地回复一句让用户稍等的话，不要用'生成'等机械词汇。")
-            return self._finalize_llm_tool_result("[TOOL_SUCCESS] 画图任务已启动，请随口说一句让用户稍等的话，比如'等我一下哦'。")
+                return self._finalize_llm_tool_result(
+                    f"[TOOL_SUCCESS] 正在画{count}张图。请自然地回复一句让用户稍等的话，不要用'生成'等机械词汇。")
+            return self._finalize_llm_tool_result(
+                "[TOOL_SUCCESS] 画图任务已启动，请随口说一句让用户稍等的话，比如'等我一下哦'。")
 
     @filter.llm_tool(name="shoubanhua_edit_image")
     async def image_edit_tool(self, event: AstrMessageEvent, prompt: str, use_message_images: bool = True,
@@ -2183,7 +2258,8 @@ class FigurineProPlugin(Star):
         '''
         # 0. 检查 LLM 工具开关
         if not self._get_conf_bool("enable_llm_tool", True):
-            return self._finalize_llm_tool_result("[TOOL_UNAVAILABLE] 当前功能暂时不可用。请用自己平时的语气告诉用户现在不方便，别提功能禁用、指令模式等词汇，要自然。")
+            return self._finalize_llm_tool_result(
+                "[TOOL_UNAVAILABLE] 当前功能暂时不可用。请用自己平时的语气告诉用户现在不方便，别提功能禁用、指令模式等词汇，要自然。")
 
         # 0.1 检查图片生成冷却时间
         uid = norm_id(event.get_sender_id())
@@ -2264,11 +2340,13 @@ class FigurineProPlugin(Star):
 
         if not images:
             # 不要重复发送错误消息，只返回给 LLM
-            return self._finalize_llm_tool_result("[TOOL_FAILED] 未检测到图片。请让用户发送或引用包含图片的消息后再试。【重要】不要再次调用此工具，直接用自然语言告诉用户需要提供图片。")
+            return self._finalize_llm_tool_result(
+                "[TOOL_FAILED] 未检测到图片。请让用户发送或引用包含图片的消息后再试。【重要】不要再次调用此工具，直接用自然语言告诉用户需要提供图片。")
 
         # 4. 限制批量生成数量
-        raw_count = count
-        count, count_limited = self._normalize_generation_count(count, "edit")
+        count_request_text = f"{prompt} {extra_rules}".strip() if extra_rules else prompt
+        raw_count = self._resolve_tool_requested_count(count_request_text, incoming_count=count, default=1, multi_default=3)
+        count, count_limited = self._normalize_generation_count(raw_count, "edit")
         gid = norm_id(event.get_group_id())
 
         # ==== 分支：分别批量处理多张图片 ====
@@ -2288,7 +2366,8 @@ class FigurineProPlugin(Star):
             # 发送进度提示
             if show_llm_progress:
                 feedback = self._build_llm_progress_text(
-                    "edit", preset_name=preset_name, count=count, total_images=total_images, extra_request=extra_rules or prompt
+                    "edit", preset_name=preset_name, count=count, total_images=total_images,
+                    extra_request=extra_rules or prompt
                 )
                 await event.send(event.chain_result([Plain(feedback)]))
 
@@ -2330,7 +2409,8 @@ class FigurineProPlugin(Star):
             if total_success <= 0:
                 return self._build_llm_tool_failure(branch_errors[0] if branch_errors else "这次没弄好，请稍后再试。")
 
-            vip_hint = self._build_master_identity_hint(uid, event, explicit_master=True) if self._is_vip_user(uid, event) else ""
+            vip_hint = self._build_master_identity_hint(uid, event, explicit_master=True) if self._is_vip_user(uid,
+                                                                                                               event) else ""
             rebellious_hint = vip_hint or self._get_rebellious_hint(prompt, uid, event)
             if rebellious_hint:
                 _multi_hint = "[TOOL_SUCCESS] 这批图处理完发出去了。"
@@ -2339,8 +2419,10 @@ class FigurineProPlugin(Star):
                 return _multi_hint + rebellious_hint
             else:
                 if total_fail > 0:
-                    return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 发出去了{total_success}张，有{total_fail}张没弄好。用你自己的语气随口带过。")
-                return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] {total_images}张图都弄好发出去了。用你自己的语气随口带过，也可以什么都不说。")
+                    return self._finalize_llm_tool_result(
+                        f"[TOOL_SUCCESS] 发出去了{total_success}张，有{total_fail}张没弄好。用你自己的语气随口带过。")
+                return self._finalize_llm_tool_result(
+                    f"[TOOL_SUCCESS] {total_images}张图都弄好发出去了。用你自己的语气随口带过，也可以什么都不说。")
 
         # ==== 分支：普通单次处理（单图或合并多图） ====
         total_cost = count
@@ -2377,7 +2459,8 @@ class FigurineProPlugin(Star):
 
         # 返回结果 - 在图片生成任务启动后立刻告诉 LLM 任务开始了
         # 对主人/VIP优先注入更柔和的亲近提示，普通用户保留原有叛逆逻辑
-        vip_hint = self._build_master_identity_hint(uid, event, explicit_master=True) if self._is_vip_user(uid, event) else ""
+        vip_hint = self._build_master_identity_hint(uid, event, explicit_master=True) if self._is_vip_user(uid,
+                                                                                                           event) else ""
         rebellious_hint = vip_hint or self._get_rebellious_hint(prompt, uid, event)
 
         count_limit_reply = self._build_count_limit_reply(count, "edit") if count_limited else ""
@@ -2390,10 +2473,13 @@ class FigurineProPlugin(Star):
             return _edit_hint
         else:
             if count_limit_reply:
-                return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 图正在处理。{count_limit_reply} 请自然地回复一句等待的话。")
+                return self._finalize_llm_tool_result(
+                    f"[TOOL_SUCCESS] 图正在处理。{count_limit_reply} 请自然地回复一句等待的话。")
             if count > 1:
-                return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 正在制作{count}个版本。用你自己的语气自然地告诉用户稍等一下。")
-            return self._finalize_llm_tool_result("[TOOL_SUCCESS] 图片处理任务已启动。用你自己的语气随口说一句让用户等一下的话。")
+                return self._finalize_llm_tool_result(
+                    f"[TOOL_SUCCESS] 正在制作{count}个版本。用你自己的语气自然地告诉用户稍等一下。")
+            return self._finalize_llm_tool_result(
+                "[TOOL_SUCCESS] 图片处理任务已启动。用你自己的语气随口说一句让用户等一下的话。")
 
     # ================= 传统指令触发 =================
 
@@ -2462,7 +2548,9 @@ class FigurineProPlugin(Star):
         _internal = {"自定义", "编辑", "edit", "custom"}
         preset_display = "" if (not preset_name or preset_name.strip().lower() in _internal) else preset_name
         template = self.conf.get("generating_msg_template", "🎨 收到请求，正在生成 [{preset}]...")
-        feedback = template.replace("{preset}", preset_display) if preset_display else template.replace(" [{preset}]", "").replace("[{preset}]", "")
+        feedback = template.replace("{preset}", preset_display) if preset_display else template.replace(" [{preset}]",
+                                                                                                        "").replace(
+            "[{preset}]", "")
         yield event.chain_result([Plain(feedback)])
 
         bot_id = self._get_bot_id(event)
@@ -2539,7 +2627,9 @@ class FigurineProPlugin(Star):
         _internal2 = {"自定义", "编辑", "edit", "custom"}
         preset_display = "" if (not preset_name or preset_name.strip().lower() in _internal2) else preset_name
         template = self.conf.get("generating_msg_template", "🎨 收到请求，正在生成 [{preset}]...")
-        feedback = template.replace("{preset}", preset_display) if preset_display else template.replace(" [{preset}]", "").replace("[{preset}]", "")
+        feedback = template.replace("{preset}", preset_display) if preset_display else template.replace(" [{preset}]",
+                                                                                                        "").replace(
+            "[{preset}]", "")
         yield event.chain_result([Plain(feedback)])
 
         if deduction["source"] == "user":
@@ -2649,12 +2739,14 @@ class FigurineProPlugin(Star):
                     at_qq = str(seg.qq).strip()
                     if bot_id and at_qq == str(bot_id).strip():
                         continue
-                    uid = at_qq; break
+                    uid = at_qq;
+                    break
             # 也支持纯数字指定用户
             parts = event.message_str.split()
             for p in parts:
                 if p.isdigit() and len(p) >= 5:
-                    uid = p; break
+                    uid = p;
+                    break
         u_cnt = self.data_mgr.get_user_count(uid)
         msg = f"👤 用户 {uid} 剩余: {u_cnt}"
         if gid := event.get_group_id():
@@ -2756,7 +2848,8 @@ class FigurineProPlugin(Star):
             logger.info(f"[管理] 增加用户次数: {target} +{count}")
             yield event.chain_result([Plain(f"✅ 用户 {target} +{count}")])
         else:
-            yield event.chain_result([Plain("用法: 手办化增加用户次数 <QQ号> <次数>\n或: 手办化增加用户次数 @用户 <次数>")])
+            yield event.chain_result(
+                [Plain("用法: 手办化增加用户次数 <QQ号> <次数>\n或: 手办化增加用户次数 @用户 <次数>")])
 
     @filter.command("手办化增加群组次数", prefix_optional=True)
     async def on_add_group_counts(self, event: AstrMessageEvent, ctx=None):
@@ -2773,7 +2866,8 @@ class FigurineProPlugin(Star):
             gid = norm_id(event.get_group_id())
             count = int(digit_parts[0])
         else:
-            yield event.chain_result([Plain("用法: 手办化增加群组次数 <群号> <次数>\n或在群内: 手办化增加群组次数 <次数>")])
+            yield event.chain_result(
+                [Plain("用法: 手办化增加群组次数 <群号> <次数>\n或在群内: 手办化增加群组次数 <次数>")])
             return
 
         if count > 0:
@@ -2782,7 +2876,8 @@ class FigurineProPlugin(Star):
             yield event.chain_result([Plain(f"✅ 群 {gid} +{count}")])
             # 提醒管理员检查配置
             if not self.conf.get("enable_group_limit", False):
-                yield event.chain_result([Plain("⚠️ 注意：当前配置中 enable_group_limit=False，群组次数不会生效。请在配置中开启 enable_group_limit。")])
+                yield event.chain_result([Plain(
+                    "⚠️ 注意：当前配置中 enable_group_limit=False，群组次数不会生效。请在配置中开启 enable_group_limit。")])
 
     @filter.command("手办化添加key", prefix_optional=True)
     async def on_add_key(self, event: AstrMessageEvent, ctx=None):
@@ -2951,7 +3046,8 @@ class FigurineProPlugin(Star):
         '''
         # 0. 检查 LLM 工具开关
         if not self._get_conf_bool("enable_llm_tool", True):
-            return self._finalize_llm_tool_result("[TOOL_UNAVAILABLE] 当前功能暂时不可用。请用自己平时的语气告诉用户现在不方便，别提功能禁用、指令模式等词汇，要自然。")
+            return self._finalize_llm_tool_result(
+                "[TOOL_UNAVAILABLE] 当前功能暂时不可用。请用自己平时的语气告诉用户现在不方便，别提功能禁用、指令模式等词汇，要自然。")
 
         # 0.1 检查图片生成冷却时间
         uid = norm_id(event.get_sender_id())
@@ -2975,8 +3071,8 @@ class FigurineProPlugin(Star):
 
         # 2.5 对“看你本人照片/自拍/写真”做强制分流，避免 LLM 误走通用智能工具
         if self._persona_mode and (
-            self._looks_like_persona_photo_request(current_message)
-            or self._looks_like_persona_followup_request(current_message, context_messages)
+                self._looks_like_persona_photo_request(current_message)
+                or self._looks_like_persona_followup_request(current_message, context_messages)
         ):
             inferred_count = self._infer_requested_count_from_text(current_message, default=1, multi_default=3)
             return await self.persona_photo_tool(
@@ -3035,7 +3131,8 @@ class FigurineProPlugin(Star):
             if not success:
                 return self._build_llm_tool_failure(error_msg)
 
-            return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 文生图任务已结束，预设：{preset_name}，图片已经发送给用户。你可以按原本人设自然接话，也可以不补充收尾。")
+            return self._finalize_llm_tool_result(
+                f"[TOOL_SUCCESS] 文生图任务已结束，预设：{preset_name}，图片已经发送给用户。你可以按原本人设自然接话，也可以不补充收尾。")
 
         elif task_type == "image_to_image":
             # 图生图
@@ -3069,7 +3166,8 @@ class FigurineProPlugin(Star):
                             images.append(img_bytes)
 
             if not images:
-                return self._finalize_llm_tool_result("[TOOL_FAILED] 未检测到图片。请直接自然告诉用户需要先发图或引用图片，不要再次调用工具。")
+                return self._finalize_llm_tool_result(
+                    "[TOOL_FAILED] 未检测到图片。请直接自然告诉用户需要先发图或引用图片，不要再次调用工具。")
 
             gid = norm_id(event.get_group_id())
             deduction = await self._check_quota(event, uid, gid, 1)
@@ -3087,7 +3185,8 @@ class FigurineProPlugin(Star):
             if not success:
                 return self._build_llm_tool_failure(error_msg)
 
-            return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 图生图任务已结束，预设：{preset_name}，图片已经发送给用户。你可以按原本人设自然接话，也可以不补充收尾。")
+            return self._finalize_llm_tool_result(
+                f"[TOOL_SUCCESS] 图生图任务已结束，预设：{preset_name}，图片已经发送给用户。你可以按原本人设自然接话，也可以不补充收尾。")
 
         return "未知任务类型"
 
@@ -3460,7 +3559,8 @@ class FigurineProPlugin(Star):
         normalized = raw_text.replace("\n", " ").replace("\r", " ")
         normalized = re.sub(r"\s+", " ", normalized).strip()
 
-        preset_text = "" if str(preset_name or "").strip() in {"", "自定义", "编辑", "edit", "custom"} else str(preset_name).strip()
+        preset_text = "" if str(preset_name or "").strip() in {"", "自定义", "编辑", "edit", "custom"} else str(
+            preset_name).strip()
 
         # 1. 先按明显任务类型命名
         keyword_map = [
@@ -3553,10 +3653,6 @@ class FigurineProPlugin(Star):
 
             # 0. 如果当前会话里已经有本轮成功生成结果，优先只打包这些结果，
             # 避免把源图、历史图或群里其他人中途发送的图片混进来。
-            cached_generated = await self._get_recent_generated_images(session_id, max_images=max_images)
-            if cached_generated:
-                return [b for b in cached_generated if isinstance(b, bytes) and len(b) > 0]
-
             # 1. 先从上下文获取（包含 Bot 发出的图片）
             image_sources = await self._collect_images_from_context(
                 session_id,
@@ -3592,10 +3688,6 @@ class FigurineProPlugin(Star):
             bot_id = self._get_bot_id(event)
             current_images = await self.img_mgr.extract_images_from_event(event, ignore_id=bot_id, context=self.context)
             images_bytes.extend([b for b in current_images if b and len(b) > 0])
-
-            # 3. 最后追加当前会话中最近成功生成的图片缓存（仅作为无缓存首选时的兜底）
-            cached_images = await self._get_recent_generated_images(session_id, max_images=max_images)
-            images_bytes.extend([b for b in cached_images if isinstance(b, bytes) and len(b) > 0])
 
             # 按内容去重（从后往前保留最新）
             unique_images = []
@@ -3684,6 +3776,7 @@ class FigurineProPlugin(Star):
                                  success_prefix: str = "✅ 成功将图片打包为 PDF",
                                  filename_hint: str = "") -> Tuple[bool, str]:
         """独立执行图片打包为 PDF 并发送，不依赖大模型处理逻辑"""
+        tmp_path = ""
         try:
             valid_images = [img for img in images_bytes if isinstance(img, bytes) and len(img) > 0]
             if not valid_images:
@@ -3707,11 +3800,14 @@ class FigurineProPlugin(Star):
             with open(tmp_path, "wb") as f:
                 f.write(pdf_bytes)
 
-            await event.send(event.chain_result([File(name=filename, file=tmp_path), Plain(f"\n{success_prefix}（共 {len(valid_images)} 张）")]))
+            await event.send(event.chain_result(
+                [File(name=filename, file=tmp_path), Plain(f"\n{success_prefix}（共 {len(valid_images)} 张）")]))
             return True, f"成功将 {len(valid_images)} 张图片打包为 PDF"
         except Exception as e:
             logger.error(f"独立打包 PDF 异常: {e}", exc_info=True)
             return False, f"{self._mask_llm_error(e, '打包 PDF 失败了，请稍后再试。')}"
+        finally:
+            await self._cleanup_temp_file(tmp_path)
 
     def _translate_error_to_chinese(self, error: str) -> str:
         """将错误信息翻译为中文"""
@@ -3904,10 +4000,14 @@ class FigurineProPlugin(Star):
                 session_id, timeout=pdf_wait_timeout
             )
 
-            # 3. 暂存模式只使用暂存的图片，不回退到旧缓存
-            #    如果暂存为空，说明没有后台生成任务完成（或根本没有生成任务）
+            # 3. 如果暂存+缓存都没有图片，回退到旧的收集逻辑（兼容直接打包上下文图片的场景）
             if not valid_images_bytes:
-                logger.warning(f"[PDF暂存] 暂存为空，没有收集到任何图片: {session_id}")
+                try:
+                    valid_images_bytes = await self._gather_images_for_pdf(
+                        event, max_images=max_images, wait_for_generation=False
+                    )
+                except Exception as e:
+                    logger.error(f"收集 PDF 图片异常: {e}", exc_info=True)
 
             if not valid_images_bytes:
                 return self._finalize_llm_tool_result(
@@ -3952,10 +4052,9 @@ class FigurineProPlugin(Star):
             # 6. 无论成功失败，都退出暂存模式
             await self._exit_pdf_staging_mode(session_id)
 
-
-
     @filter.llm_tool(name="shoubanhua_batch_process")
-    async def batch_process_tool(self, event: AstrMessageEvent, prompt: str, max_images: int = 10, output_as_pdf: bool = False):
+    async def batch_process_tool(self, event: AstrMessageEvent, prompt: str, max_images: int = 10,
+                                 output_as_pdf: bool = False):
         '''批量处理上下文中的多张图片，也可以将结果打包为PDF输出。仅在用户明确要求批量处理多张图片时才调用。
 
         调用前请严格判断：
@@ -3985,7 +4084,8 @@ class FigurineProPlugin(Star):
 
         # 0. 检查 LLM 工具开关
         if not self._get_conf_bool("enable_llm_tool", True):
-            return self._finalize_llm_tool_result("[TOOL_UNAVAILABLE] 当前功能暂时不可用。请用自己平时的语气告诉用户现在不方便，别提功能禁用、指令模式等词汇，要自然。")
+            return self._finalize_llm_tool_result(
+                "[TOOL_UNAVAILABLE] 当前功能暂时不可用。请用自己平时的语气告诉用户现在不方便，别提功能禁用、指令模式等词汇，要自然。")
 
         active_task = await self._get_active_session_task(event.unified_msg_origin)
         if active_task:
@@ -4016,7 +4116,7 @@ class FigurineProPlugin(Star):
                     pdf_extracted_urls.append(f"base64://{b64}")
             except Exception as e:
                 logger.error(f"Failed to extract images from PDF: {e}")
-                
+
         uid = norm_id(event.get_sender_id())
         gid = norm_id(event.get_group_id())
 
@@ -4034,7 +4134,8 @@ class FigurineProPlugin(Star):
         cached_image_sources = await self._get_recent_generated_image_sources(session_id, max_images=max_images)
 
         if not image_sources and not current_urls and not pdf_extracted_urls and not cached_image_sources:
-            return self._finalize_llm_tool_result("[TOOL_FAILED] 上下文里没找到图片或PDF。\n请用你自己的语气让用户先发图再试。")
+            return self._finalize_llm_tool_result(
+                "[TOOL_FAILED] 上下文里没找到图片或PDF。\n请用你自己的语气让用户先发图再试。")
 
         # 3. 收集所有图片URL（统一过滤头像、去重并按顺序整理）
         # 修复：当前消息里已经明确带图时，不再混入会话缓存图片，否则会把历史图一起算进去
@@ -4044,7 +4145,8 @@ class FigurineProPlugin(Star):
         all_image_urls = self._merge_batch_image_urls(merged_current_urls, image_sources, max_images=max_images)
         total_images = len(all_image_urls)
         if total_images == 0:
-            return self._finalize_llm_tool_result("[TOOL_FAILED] 没找到有效的图片。\n请用你自己的语气告诉用户没找到图，发几张再来。")
+            return self._finalize_llm_tool_result(
+                "[TOOL_FAILED] 没找到有效的图片。\n请用你自己的语气告诉用户没找到图，发几张再来。")
 
         # 3. 计算预设和追加规则
         final_prompt, preset_name, extra_rules = self._process_prompt_and_preset(prompt)
@@ -4089,7 +4191,7 @@ class FigurineProPlugin(Star):
             fail_count = 0
             failed_details = []  # 记录失败详情
             max_retries = self.conf.get("batch_retries", 2)
-            pdf_result_images = [] # 如果要打PDF，这里存最后生成的 bytes
+            pdf_result_images = []  # 如果要打PDF，这里存最后生成的 bytes
 
             for i, url in enumerate(all_image_urls, 1):
                 try:
@@ -4131,7 +4233,8 @@ class FigurineProPlugin(Star):
                                     if ref_images:
                                         images = ref_images + images
                                 model = self.conf.get("model", "nano-banana")
-                                res = await self.api_mgr.call_api(images, final_prompt, model, False, self.img_mgr.proxy)
+                                res = await self.api_mgr.call_api(images, final_prompt, model, False,
+                                                                  self.img_mgr.proxy)
                                 if isinstance(res, bytes):
                                     res = await self._prepare_send_image_bytes(res)
                                     pdf_result_images.append(res)
@@ -4251,7 +4354,8 @@ class FigurineProPlugin(Star):
 
         asyncio.create_task(wrapped_process_all())
 
-        return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 批量处理任务已启动，共 {total_images} 张图片，预设：{preset_name}。图片将陆续发出，请用自然语言告知用户稍等即可，不要用'生成'等机械词汇。")
+        return self._finalize_llm_tool_result(
+            f"[TOOL_SUCCESS] 批量处理任务已启动，共 {total_images} 张图片，预设：{preset_name}。图片将陆续发出，请用自然语言告知用户稍等即可，不要用'生成'等机械词汇。")
 
     @filter.llm_tool(name="shoubanhua_batch_process_concurrent")
     async def batch_process_concurrent_tool(self, event: AstrMessageEvent, prompt: str, max_images: int = 10,
@@ -4279,7 +4383,8 @@ class FigurineProPlugin(Star):
 
         # 0. 检查 LLM 工具开关
         if not self._get_conf_bool("enable_llm_tool", True):
-            return self._finalize_llm_tool_result("[TOOL_UNAVAILABLE] 当前功能暂时不可用。请用自己平时的语气告诉用户现在不方便，别提功能禁用、指令模式等词汇，要自然。")
+            return self._finalize_llm_tool_result(
+                "[TOOL_UNAVAILABLE] 当前功能暂时不可用。请用自己平时的语气告诉用户现在不方便，别提功能禁用、指令模式等词汇，要自然。")
 
         active_task = await self._get_active_session_task(event.unified_msg_origin)
         if active_task:
@@ -4309,7 +4414,7 @@ class FigurineProPlugin(Star):
                     pdf_extracted_urls.append(f"base64://{b64}")
             except Exception as e:
                 logger.error(f"Failed to extract images from PDF: {e}")
-                
+
         # 2. 获取上下文中的图片
         session_id = event.unified_msg_origin
         image_sources = await self._collect_images_from_context(
@@ -4321,7 +4426,8 @@ class FigurineProPlugin(Star):
         cached_image_sources = await self._get_recent_generated_image_sources(session_id, max_images=max_images)
 
         if not image_sources and not current_urls and not pdf_extracted_urls and not cached_image_sources:
-            return self._finalize_llm_tool_result("[TOOL_FAILED] 上下文里没找到图片或PDF。\n请用你自己的语气让用户先发图再试。")
+            return self._finalize_llm_tool_result(
+                "[TOOL_FAILED] 上下文里没找到图片或PDF。\n请用你自己的语气让用户先发图再试。")
 
         # 3. 收集所有图片URL（统一过滤头像、去重并按顺序整理）
         # 修复：当前消息里已经明确带图时，不再混入会话缓存图片，否则会把历史图一起算进去
@@ -4331,7 +4437,8 @@ class FigurineProPlugin(Star):
         all_image_urls = self._merge_batch_image_urls(merged_current_urls, image_sources, max_images=max_images)
         total_images = len(all_image_urls)
         if total_images == 0:
-            return self._finalize_llm_tool_result("[TOOL_FAILED] 没找到有效的图片。\n请用你自己的语气告诉用户没找到图，发几张再来。")
+            return self._finalize_llm_tool_result(
+                "[TOOL_FAILED] 没找到有效的图片。\n请用你自己的语气告诉用户没找到图，发几张再来。")
 
         # 3. 计算预设和追加规则
         final_prompt, preset_name, extra_rules = self._process_prompt_and_preset(prompt)
@@ -4375,7 +4482,7 @@ class FigurineProPlugin(Star):
         semaphore = asyncio.Semaphore(concurrency)
         results = {"success": 0, "fail": 0}
         failed_details = []
-        pdf_result_images_dict = {} # 用于保证并发生成的图片顺序
+        pdf_result_images_dict = {}  # 用于保证并发生成的图片顺序
         results_lock = asyncio.Lock()
         max_retries = self.conf.get("batch_retries", 2)
 
@@ -4417,7 +4524,8 @@ class FigurineProPlugin(Star):
                                     if ref_images:
                                         images = ref_images + images
                                 model = self.conf.get("model", "nano-banana")
-                                res = await self.api_mgr.call_api(images, final_prompt, model, False, self.img_mgr.proxy)
+                                res = await self.api_mgr.call_api(images, final_prompt, model, False,
+                                                                  self.img_mgr.proxy)
                                 if isinstance(res, bytes):
                                     res = await self._prepare_send_image_bytes(res)
                                     async with results_lock:
@@ -4593,10 +4701,12 @@ class FigurineProPlugin(Star):
         '''
         # 0. 检查功能开关
         if not self._persona_mode:
-            return self._finalize_llm_tool_result("[TOOL_UNAVAILABLE] 人设功能当前未启用。请用自己平时的语气告诉用户现在不方便，别提配置开关等技术词汇。")
+            return self._finalize_llm_tool_result(
+                "[TOOL_UNAVAILABLE] 人设功能当前未启用。请用自己平时的语气告诉用户现在不方便，别提配置开关等技术词汇。")
 
         if not self._get_conf_bool("enable_llm_tool", True):
-            return self._finalize_llm_tool_result("[TOOL_UNAVAILABLE] 当前功能暂时不可用。请用自己平时的语气告诉用户现在不方便，别提功能禁用、指令模式等词汇，要自然。")
+            return self._finalize_llm_tool_result(
+                "[TOOL_UNAVAILABLE] 当前功能暂时不可用。请用自己平时的语气告诉用户现在不方便，别提功能禁用、指令模式等词汇，要自然。")
 
         # 0.1 检查图片生成冷却时间
         uid = norm_id(event.get_sender_id())
@@ -4609,7 +4719,8 @@ class FigurineProPlugin(Star):
         # 1. 加载人设参考图
         ref_images = await self._load_persona_ref_images()
         if not ref_images:
-            return self._finalize_llm_tool_result("[TOOL_UNAVAILABLE] 人设参考图还没配置好。请用自己平时的语气告诉用户现在还没办法，不要提指令或命令。")
+            return self._finalize_llm_tool_result(
+                "[TOOL_UNAVAILABLE] 人设参考图还没配置好。请用自己平时的语气告诉用户现在还没办法，不要提指令或命令。")
         logger.info(f"人设拍照：已加载人设参考图 {len(ref_images)} 张")
 
         # 1.5 提取用户可能提供的参考图片（如衣服款式、姿势参考等）
@@ -4670,32 +4781,16 @@ class FigurineProPlugin(Star):
             )
             self._log_prompt_preview(f"persona:{scene_name}", full_prompt)
 
-        # 5. 数量决策：
-        # - 如果用户文本里明确写了数量，优先按用户文本；
-        # - 否则优先信任当前这次工具调用传入的 count；
-        # - 如果工具没传出多张，再根据“写真集/多来几张”等自然语言补推断。
-        # 这样既能避免历史上下文污染，又不会把本次工具已经决定好的批量参数错误打回单张。
+        # 5. 数量决策：仅在用户明确写了数量，或明确表达“多张/写真集/批量”时才允许多张。
         requested_text = " ".join([str(scene_hint or ""), str(extra_request or "")]).strip()
-        explicit_count = self._extract_explicit_requested_count_from_text(requested_text)
-        incoming_count = max(1, int(count or 1))
-        inferred_count = self._infer_requested_count_from_text(requested_text, default=1, multi_default=3)
-        if explicit_count is not None:
-            requested_count = explicit_count
-            if incoming_count != explicit_count:
-                logger.info(
-                    f"人设拍照：工具传入 count={incoming_count} 与用户显式数量 {explicit_count} 不一致，已按用户文本修正"
-                )
-        elif incoming_count > 1:
-            requested_count = incoming_count
-            logger.info(
-                f"人设拍照：用户文本未显式写数量，采用工具传入 count={incoming_count}"
-            )
-        else:
-            requested_count = max(1, inferred_count)
-            if requested_count > 1:
-                logger.info(
-                    f"人设拍照：根据用户文本语义推断为多张输出，count={requested_count}"
-                )
+        requested_count = self._resolve_tool_requested_count(
+            requested_text,
+            incoming_count=count,
+            default=1,
+            multi_default=3
+        )
+        if requested_count > 1:
+            logger.info(f"人设拍照：最终采用多张输出 count={requested_count}")
 
         # 6. 限制数量（必须先做，避免错误批量参数影响配额检查和分支选择）
         raw_count = requested_count
@@ -4741,8 +4836,10 @@ class FigurineProPlugin(Star):
                 suppress_user_error=True
             ))
             if count_limited:
-                return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 拍照任务已开始。{self._build_count_limit_reply(count, 'persona')} 请自然回复。")
-            return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 正在准备发照片给用户。请用你自己的语气自然地说一句陪伴等待的话（比如“那我换个姿势给你拍一张哦...”），不要提'生成'等机械词汇。")
+                return self._finalize_llm_tool_result(
+                    f"[TOOL_SUCCESS] 拍照任务已开始。{self._build_count_limit_reply(count, 'persona')} 请自然回复。")
+            return self._finalize_llm_tool_result(
+                f"[TOOL_SUCCESS] 正在准备发照片给用户。请用你自己的语气自然地说一句陪伴等待的话（比如“那我换个姿势给你拍一张哦...”），不要提'生成'等机械词汇。")
         else:
             # 对于人设的多张生成，因为传递的是最终合并好的图片（包含人设参考+用户参考），
             # 所以使用 _run_batch_image_to_image。但是要防止该函数再次从数据库读取 "_persona_" 导致图片翻倍。
@@ -4762,8 +4859,10 @@ class FigurineProPlugin(Star):
                 suppress_user_error=True
             ))
             if count_limited:
-                return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 多张拍照任务已开始。{self._build_count_limit_reply(count, 'persona')} 请自然回复。")
-            return self._finalize_llm_tool_result(f"[TOOL_SUCCESS] 正在准备拍{count}张照片给用户。请用你自己的语气自然地说一句等待的话（比如“那我多换几个角度拍给你看哦...”），不要提'生成'等机械词汇。")
+                return self._finalize_llm_tool_result(
+                    f"[TOOL_SUCCESS] 多张拍照任务已开始。{self._build_count_limit_reply(count, 'persona')} 请自然回复。")
+            return self._finalize_llm_tool_result(
+                f"[TOOL_SUCCESS] 正在准备拍{count}张照片给用户。请用你自己的语气自然地说一句等待的话（比如“那我多换几个角度拍给你看哦...”），不要提'生成'等机械词汇。")
 
     @filter.command("人设拍照", prefix_optional=True)
     async def on_persona_photo_cmd(self, event: AstrMessageEvent, ctx=None):
@@ -5022,9 +5121,7 @@ class FigurineProPlugin(Star):
             return
 
         # 3. 收集所有图片URL（统一过滤头像、去重并按顺序整理）
-        merged_current_urls = list(current_urls)
-        if not merged_current_urls:
-            merged_current_urls = list(cached_image_sources)
+        merged_current_urls = list(pdf_extracted_urls) + list(current_urls)
         all_image_urls = self._merge_batch_image_urls(merged_current_urls, image_sources, max_images=max_images)
         total_images = len(all_image_urls)
         if total_images == 0:
