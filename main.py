@@ -4781,16 +4781,34 @@ class FigurineProPlugin(Star):
             )
             self._log_prompt_preview(f"persona:{scene_name}", full_prompt)
 
-        # 5. 数量决策：仅在用户明确写了数量，或明确表达“多张/写真集/批量”时才允许多张。
+        # 5. 数量决策：
+        # - 如果用户文本里明确写了数量，优先按用户文本；
+        # - 否则若 LLM 工具已经显式传入 count>1，则信任这次工具调用；
+        # - 最后才根据“写真集/多来几张”等自然语言补推断。
+        # 这样可以避免因为 extra_request 只保留了部分内容（如只剩“穿着睡衣”）而把
+        # 已经由 LLM 明确决定好的批量参数错误降回 1 张。
         requested_text = " ".join([str(scene_hint or ""), str(extra_request or "")]).strip()
-        requested_count = self._resolve_tool_requested_count(
-            requested_text,
-            incoming_count=count,
-            default=1,
-            multi_default=3
-        )
-        if requested_count > 1:
-            logger.info(f"人设拍照：最终采用多张输出 count={requested_count}")
+        explicit_count = self._extract_explicit_requested_count_from_text(requested_text)
+        incoming_count = max(1, int(count or 1))
+
+        if explicit_count is not None:
+            requested_count = explicit_count
+            if incoming_count != explicit_count:
+                logger.info(
+                    f"人设拍照：工具传入 count={incoming_count} 与用户显式数量 {explicit_count} 不一致，已按用户文本修正"
+                )
+        elif incoming_count > 1:
+            requested_count = incoming_count
+            logger.info(f"人设拍照：用户文本未显式写数量，采用工具传入 count={incoming_count}")
+        else:
+            requested_count = self._resolve_tool_requested_count(
+                requested_text,
+                incoming_count=1,
+                default=1,
+                multi_default=3
+            )
+            if requested_count > 1:
+                logger.info(f"人设拍照：根据用户文本语义推断为多张输出，count={requested_count}")
 
         # 6. 限制数量（必须先做，避免错误批量参数影响配额检查和分支选择）
         raw_count = requested_count
