@@ -1018,6 +1018,16 @@ class FigurineProPlugin(Star):
 
         return sources
 
+    async def _clear_session_image_cache(self, session_id: str):
+        """清除会话的图片缓存和成功计数，用于 PDF 打包成功后防止旧图残留"""
+        if not session_id:
+            return
+        async with self._session_generated_images_lock:
+            self._session_generated_images.pop(session_id, None)
+        async with self._session_generated_success_lock:
+            self._session_generated_success.pop(session_id, None)
+        logger.info(f"[PDF] 已清除会话图片缓存: {session_id}")
+
     # ================= PDF 暂存模式管理 =================
 
     async def _enter_pdf_staging_mode(self, session_id: str):
@@ -2057,6 +2067,7 @@ class FigurineProPlugin(Star):
 
         【批量生成数量控制】
         - 除非用户明确说出了具体数字（如"画5张"），否则【严禁】随意设置大量 count。
+        - 用户说"打包成PDF"、"发个PDF"并不等于要多张！只说打包不说数量时 count 必须保持 1。
         - 如果用户只说"多来点"、"多来几张"、"写真集"，请默认设置 count=3。
         - 坚决不要为了表现热情而擅自将 count 设为 10 等大数字，这会严重消耗资源！
 
@@ -2164,6 +2175,7 @@ class FigurineProPlugin(Star):
 
         【批量生成不同版本的数量控制（极度重要）】
         - 除非用户明确指定了数量（如"画5张"），否则【严禁】随意设置大量 count。
+        - 用户说"打包成PDF"、"发个PDF"并不等于要多张！只说打包不说数量时 count 必须保持 1。
         - 如果用户只说"多来点"、"多来几张"，请默认设置 count=3。
         - 不要为了表现热情而擅自将 count 设为 10 等大数字！
 
@@ -2643,8 +2655,18 @@ class FigurineProPlugin(Star):
     async def on_query_count(self, event: AstrMessageEvent, ctx=None):
         uid = norm_id(event.get_sender_id())
         if self.is_admin(event):
+            bot_id = self._get_bot_id(event)
             for seg in event.message_obj.message:
-                if isinstance(seg, At): uid = str(seg.qq); break
+                if isinstance(seg, At):
+                    at_qq = str(seg.qq).strip()
+                    if bot_id and at_qq == str(bot_id).strip():
+                        continue
+                    uid = at_qq; break
+            # 也支持纯数字指定用户
+            parts = event.message_str.split()
+            for p in parts:
+                if p.isdigit() and len(p) >= 5:
+                    uid = p; break
         u_cnt = self.data_mgr.get_user_count(uid)
         msg = f"👤 用户 {uid} 剩余: {u_cnt}"
         if gid := event.get_group_id():
@@ -2708,31 +2730,71 @@ class FigurineProPlugin(Star):
     @filter.command("手办化增加用户次数", prefix_optional=True)
     async def on_add_user_counts(self, event: AstrMessageEvent, ctx=None):
         if not self.is_admin(event): return
-        target = None
-        for seg in event.message_obj.message:
-            if isinstance(seg, At): target = str(seg.qq); break
 
+        # 提取文本中的所有纯数字段
         parts = event.message_str.split()
-        count = 0
-        if target:
-            for p in parts:
-                if p.isdigit(): count = int(p)
-        else:
-            if len(parts) >= 3 and parts[1].isdigit() and parts[2].isdigit():
-                target = parts[1];
-                count = int(parts[2])
+        digit_parts = [p for p in parts if p.isdigit()]
 
-        if target and count:
+        # 获取 At 对象（如果有）
+        at_target = None
+        bot_id = self._get_bot_id(event)
+        for seg in event.message_obj.message:
+            if isinstance(seg, At):
+                at_qq = str(seg.qq).strip()
+                # 忽略 @ 自己（bot）的 At 段
+                if bot_id and at_qq == str(bot_id).strip():
+                    continue
+                at_target = at_qq
+                break
+
+        target = None
+        count = 0
+
+        if at_target and digit_parts:
+            # @某人 + 数字 → At 是目标用户, 数字是次数
+            target = at_target
+            count = int(digit_parts[-1])  # 取最后一个数字作为次数
+        elif len(digit_parts) >= 2:
+            # 没有 At，纯数字：第一个是 QQ，最后一个是次数
+            target = digit_parts[0]
+            count = int(digit_parts[-1])
+        elif len(digit_parts) == 1 and at_target:
+            # @某人 + 单个数字 → At 是目标, 数字是次数
+            target = at_target
+            count = int(digit_parts[0])
+
+        if target and count > 0:
             await self.data_mgr.add_user_count(target, count)
+            logger.info(f"[管理] 增加用户次数: {target} +{count}")
             yield event.chain_result([Plain(f"✅ 用户 {target} +{count}")])
+        else:
+            yield event.chain_result([Plain("用法: 手办化增加用户次数 <QQ号> <次数>\n或: 手办化增加用户次数 @用户 <次数>")])
 
     @filter.command("手办化增加群组次数", prefix_optional=True)
     async def on_add_group_counts(self, event: AstrMessageEvent, ctx=None):
         if not self.is_admin(event): return
+
         parts = event.message_str.split()
-        if len(parts) >= 3 and parts[1].isdigit() and parts[2].isdigit():
-            await self.data_mgr.add_group_count(parts[1], int(parts[2]))
-            yield event.chain_result([Plain(f"✅ 群 {parts[1]} +{parts[2]}")])
+        digit_parts = [p for p in parts if p.isdigit()]
+
+        if len(digit_parts) >= 2:
+            gid = digit_parts[0]
+            count = int(digit_parts[-1])
+        elif len(digit_parts) == 1 and event.get_group_id():
+            # 只给了次数，默认当前群
+            gid = norm_id(event.get_group_id())
+            count = int(digit_parts[0])
+        else:
+            yield event.chain_result([Plain("用法: 手办化增加群组次数 <群号> <次数>\n或在群内: 手办化增加群组次数 <次数>")])
+            return
+
+        if count > 0:
+            await self.data_mgr.add_group_count(gid, count)
+            logger.info(f"[管理] 增加群组次数: {gid} +{count}")
+            yield event.chain_result([Plain(f"✅ 群 {gid} +{count}")])
+            # 提醒管理员检查配置
+            if not self.conf.get("enable_group_limit", False):
+                yield event.chain_result([Plain("⚠️ 注意：当前配置中 enable_group_limit=False，群组次数不会生效。请在配置中开启 enable_group_limit。")])
 
     @filter.command("手办化添加key", prefix_optional=True)
     async def on_add_key(self, event: AstrMessageEvent, ctx=None):
@@ -3888,6 +3950,8 @@ class FigurineProPlugin(Star):
             )
 
             if success:
+                # 打包成功后清除本次会话的图片缓存，防止旧图污染下次打包
+                await self._clear_session_image_cache(session_id)
                 return self._finalize_llm_tool_result(
                     "[TOOL_SUCCESS] 图片已经打包成 PDF 并发送给用户。"
                     "你可以按原本人设自然接话，也可以不补充收尾。"
@@ -4181,6 +4245,8 @@ class FigurineProPlugin(Star):
                                 f.write(pdf_bytes_result)
                             await event.send(event.chain_result([File(name=filename, file=tmp_path)]))
                             await event.send(event.chain_result([Plain("这批图我已经先整理成册发你了。")]))
+                            # 打包成功后清除缓存，防止旧图污染下次打包
+                            await self._clear_session_image_cache(event.unified_msg_origin)
                     except Exception as e:
                         logger.error(f"打包 PDF 失败: {e}")
                         if self._should_show_debug_errors():
@@ -4479,6 +4545,8 @@ class FigurineProPlugin(Star):
                             await event.send(event.chain_result([
                                 Plain(f"这批图我已经整理成册发你了，共 {results['success']} 张。")
                             ]))
+                            # 打包成功后清除缓存，防止旧图污染下次打包
+                            await self._clear_session_image_cache(event.unified_msg_origin)
                     except Exception as e:
                         logger.error(f"打包 PDF 失败: {e}")
                         if self._should_show_debug_errors():
@@ -4528,10 +4596,16 @@ class FigurineProPlugin(Star):
         2. 用户只是问"你在干嘛"、"你在做什么"、"闲聊" → 用文字回答即可，不要发照片
         3. 没有明确表达想看照片意愿 → 不要主动发照片
 
+        【数量控制（极度重要！）】
+        - 默认只生成1张，除非用户明确说出了具体数字（如"来5张""拍3张"）。
+        - 用户说"打包成PDF"、"发个PDF"并不等于要多张！只说打包不说数量时 count 必须保持 1。
+        - 只有"写真集"、"多来点"、"多拍几张"等明确要多张的表述才设置 count=3。
+        - 坚决不要为了表现热情而擅自设置大量 count！
+
         Args:
             scene_hint(string): 场景提示（可选），如"咖啡店"、"公园"等，用于匹配预设场景
             extra_request(string): 用户的额外要求（可选），如"穿红色衣服"、"微笑"等
-            count(int): 生成图片的数量，默认1张，最大10张。当用户要求"写真集"或"多来几张"但没说数量时设置为3张。
+            count(int): 生成图片的数量，默认1张，最大10张。只有用户明确要求多张时才增大。
         '''
         # 0. 检查功能开关
         if not self._persona_mode:
