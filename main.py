@@ -1031,12 +1031,16 @@ class FigurineProPlugin(Star):
     # ================= PDF 暂存模式管理 =================
 
     async def _enter_pdf_staging_mode(self, session_id: str):
-        """进入 PDF 暂存模式：后台生成任务将不再发送单张图片，改为写入暂存字典"""
+        """进入 PDF 暂存模式：后台生成任务将不再发送单张图片，改为写入暂存字典。
+        同时清空旧的图片缓存，确保本次打包只包含当前批次的图片。
+        """
         async with self._pdf_staging_lock:
             self._pdf_staging_sessions[session_id] = True
             self._pdf_staging_images[session_id] = {}
             self._pdf_staging_counter[session_id] = 0
-            logger.info(f"[PDF暂存] 进入暂存模式: {session_id}")
+        # 清空旧的图片缓存，防止旧图污染本次打包
+        await self._clear_session_image_cache(session_id)
+        logger.info(f"[PDF暂存] 进入暂存模式（已清除旧缓存）: {session_id}")
 
     async def _exit_pdf_staging_mode(self, session_id: str):
         """退出 PDF 暂存模式并清理暂存数据"""
@@ -1083,17 +1087,16 @@ class FigurineProPlugin(Star):
 
     async def _wait_for_all_generations_and_collect(self, session_id: str,
                                                      timeout: int = 120) -> List[bytes]:
-        """等待当前会话所有后台生成任务完成，然后收集暂存的图片。
+        """等待当前会话所有后台生成任务完成，然后只收集暂存字典中的图片。
 
-        同时也会将内存缓存中的图片合并进来（兜底），确保不丢图。
-        暂存图片按序号排序在前，缓存图片按原有顺序追加在后。
+        不会合并旧的图片缓存，确保打包结果只包含本次明确暂存的图片。
 
         Args:
             session_id: 会话 ID
             timeout: 最长等待秒数
 
         Returns:
-            图片字节列表（顺序与输入/生成顺序一致）
+            图片字节列表（按暂存序号排序，顺序与输入/生成顺序一致）
         """
         poll_interval = max(1, self.conf.get("pdf_wait_poll_interval", 2))
         waited = 0
@@ -1113,25 +1116,10 @@ class FigurineProPlugin(Star):
             await asyncio.sleep(poll_interval)
             waited += poll_interval
 
-        # 收集暂存图片（已按序号排序）
+        # 只收集暂存图片（已按序号排序），不合并旧缓存
         staged_images = await self._get_staged_images(session_id)
-
-        # 兜底：合并内存缓存中的图片（防止有图片在暂存模式开启前就已经生成并缓存了）
-        cached_images = await self._get_recent_generated_images(session_id)
-
-        # 去重合并：暂存图片（有序）在前，缓存图片追加在后
-        all_images = list(staged_images)
-        seen_hashes = {hash(img) for img in all_images}
-        for img in cached_images:
-            if isinstance(img, bytes) and len(img) > 0:
-                h = hash(img)
-                if h not in seen_hashes:
-                    all_images.append(img)
-                    seen_hashes.add(h)
-
-        logger.info(f"[PDF暂存] 最终收集到 {len(all_images)} 张图片 "
-                     f"(staged={len(staged_images)}, cached={len(cached_images)}): {session_id}")
-        return all_images
+        logger.info(f"[PDF暂存] 最终收集到 {len(staged_images)} 张暂存图片: {session_id}")
+        return staged_images
 
     def _get_conf_bool(self, key: str, default: bool = False) -> bool:
         """兼容字符串/数字形式的布尔配置，避免 bool('false') 误判为 True。"""
@@ -3916,14 +3904,10 @@ class FigurineProPlugin(Star):
                 session_id, timeout=pdf_wait_timeout
             )
 
-            # 3. 如果暂存+缓存都没有图片，回退到旧的收集逻辑（兼容直接打包上下文图片的场景）
+            # 3. 暂存模式只使用暂存的图片，不回退到旧缓存
+            #    如果暂存为空，说明没有后台生成任务完成（或根本没有生成任务）
             if not valid_images_bytes:
-                try:
-                    valid_images_bytes = await self._gather_images_for_pdf(
-                        event, max_images=max_images, wait_for_generation=False
-                    )
-                except Exception as e:
-                    logger.error(f"收集 PDF 图片异常: {e}", exc_info=True)
+                logger.warning(f"[PDF暂存] 暂存为空，没有收集到任何图片: {session_id}")
 
             if not valid_images_bytes:
                 return self._finalize_llm_tool_result(
