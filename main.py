@@ -951,7 +951,13 @@ class FigurineProPlugin(Star):
 
     def _resolve_tool_requested_count(self, request_text: str, incoming_count: int = 1,
                                       default: int = 1, multi_default: int = 3) -> int:
-        """统一裁决 LLM 工具传入的数量，避免因预设/提示词中的普通数字误触发批量。"""
+        """统一裁决 LLM 工具传入的数量。
+
+        规则：
+        1. 用户文本里明确写了“X张”时，优先按用户文本；
+        2. 否则如果 LLM 工具已经显式传入 count>1，视为明确批量调用，直接信任；
+        3. 最后才根据“多来几张/写真集/批量”等自然语言语义做弱推断。
+        """
         text = str(request_text or "").strip()
         safe_incoming = max(1, int(incoming_count or 1))
 
@@ -959,12 +965,12 @@ class FigurineProPlugin(Star):
         if explicit_count is not None:
             return explicit_count
 
+        if safe_incoming > default:
+            return safe_incoming
+
         inferred_count = self._infer_requested_count_from_text(text, default=default, multi_default=multi_default)
         if inferred_count > default:
             return inferred_count
-
-        if safe_incoming > default and self._has_multi_generation_intent(text):
-            return safe_incoming
 
         return default
 
@@ -1062,6 +1068,18 @@ class FigurineProPlugin(Star):
         async with self._session_generated_success_lock:
             self._session_generated_success.pop(session_id, None)
         logger.info(f"[PDF] 已清除会话图片缓存: {session_id}")
+
+    async def _clear_session_image_cache_if_idle(self, session_id: str):
+        """仅在当前会话没有进行中的生成任务时，清理旧图片缓存，避免上一轮结果污染新任务。"""
+        if not session_id:
+            return
+
+        pending = await self._get_pending_generation_count(session_id)
+        if pending > 0:
+            logger.info(f"[PDF] 当前会话仍有进行中的任务，跳过清理旧缓存: {session_id} pending={pending}")
+            return
+
+        await self._clear_session_image_cache(session_id)
 
     async def _cleanup_temp_file(self, file_path: str):
         """尽力清理临时文件，避免打包任务残留。"""
@@ -2182,6 +2200,9 @@ class FigurineProPlugin(Star):
         # 4. 更新图片生成冷却时间
         self._update_image_cooldown(uid)
 
+        # 4.1 新任务开始前，若当前会话空闲则清掉上一轮生成缓存，避免后续 PDF 混入旧图
+        await self._clear_session_image_cache_if_idle(event.unified_msg_origin)
+
         # 5. 启动后台生成任务（不阻塞，让 LLM 能立即输出等待/陪伴语句）
         await self._register_pending_generation(event.unified_msg_origin, count)
         if count == 1:
@@ -2443,6 +2464,9 @@ class FigurineProPlugin(Star):
 
         # 6. 更新图片生成冷却时间
         self._update_image_cooldown(uid)
+
+        # 6.1 新任务开始前，若当前会话空闲则清掉上一轮生成缓存，避免后续 PDF 混入旧图
+        await self._clear_session_image_cache_if_idle(event.unified_msg_origin)
 
         # 7. 启动后台生成任务（不阻塞，让 LLM 能立即输出等待/陪伴语句）
         await self._register_pending_generation(event.unified_msg_origin, count)
@@ -4833,6 +4857,9 @@ class FigurineProPlugin(Star):
 
         # 8. 更新冷却时间
         self._update_image_cooldown(uid)
+
+        # 8.1 新任务开始前，若当前会话空闲则清掉上一轮生成缓存，避免后续 PDF 混入旧图
+        await self._clear_session_image_cache_if_idle(event.unified_msg_origin)
 
         # 9. 计算是否隐藏输出文本（白名单用户和普通用户使用同一开关）
         hide_llm_result_text = True
