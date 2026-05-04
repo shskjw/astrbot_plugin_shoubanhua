@@ -103,7 +103,7 @@ _CLOTHING_KEYWORDS = [
     "astrbot_plugin_shoubanhua",
     "shskjw",
     "支持第三方所有OpenAI绘图格式和原生Google Gemini 终极缝合怪，文生图/图生图插件，支持LLM智能判断",
-    "2.7.0",
+    "2.8.3",
     "https://github.com/shkjw/astrbot_plugin_shoubanhua",
 )
 class FigurineProPlugin(Star):
@@ -1240,7 +1240,7 @@ class FigurineProPlugin(Star):
         """是否向用户显示中途调试错误信息"""
         return self._get_conf_bool("debug_mode", False)
 
-    def _resolve_debug_error_message(self, error: Any, default_msg: str = "这次没弄好，请稍后再试。") -> str:
+    def _resolve_debug_error_message(self, error: Any, default_msg: str = "这边刚才有点小问题，我先缓一下，稍后再试试。") -> str:
         """调试模式下保留原始上游错误，普通模式下做脱敏。"""
         if self._should_show_debug_errors():
             try:
@@ -1435,7 +1435,7 @@ class FigurineProPlugin(Star):
             ])
         return "稍等。"
 
-    def _build_llm_tool_failure(self, error: Any, default_msg: str = "这次没弄好，请稍后再试。") -> str:
+    def _build_llm_tool_failure(self, error: Any, default_msg: str = "这边刚才有点小问题，稍后我再试试。") -> str:
         """仅返回给 LLM 的失败信息，不直接向用户暴露底层报错。"""
         import random
         masked = self._mask_llm_error(error, default_msg)
@@ -1450,11 +1450,11 @@ class FigurineProPlugin(Star):
         masked = str(masked).removeprefix("❌").strip()
         # 给 LLM 多种自然表达失败的参考，不要让它照搬机械话术
         fail_styles = random.choice([
-            "这次整出问题了，稍后再试试？",
-            "哎，刚才有点问题，过一会儿再来？",
-            "没搞好，可能是网络抖了，稍等一下再试？",
-            "出了点小状况，要不等一下再弄？",
-            "这次有点卡，稍后再发给你？",
+            "刚才有点小状况，稍后我再试一次。",
+            "哎，刚刚有点问题，过一会儿再来更稳一点。",
+            "应该是网络轻轻抖了一下，我等会儿再试。",
+            "先缓一缓，待会儿我再继续。",
+            "这边有点卡，稍后再接着处理。",
         ])
         return self._finalize_llm_tool_result(
             f"[TOOL_FAILED] 失败原因（不要对用户说）：{masked}。"
@@ -2648,7 +2648,7 @@ class FigurineProPlugin(Star):
 
             yield event.chain_result([Image.fromBytes(res), Plain(info)])
         else:
-            yield event.chain_result([Plain(f"没弄好: {res}")])
+            yield event.chain_result([Plain(f"没弄好: {self._resolve_debug_error_message(res, '这次没弄好，请稍后再试。')}")])
 
     @filter.command("文生图", prefix_optional=True)
     async def on_txt2img(self, event: AstrMessageEvent, ctx=None):
@@ -3848,7 +3848,7 @@ class FigurineProPlugin(Star):
         finally:
             await self._cleanup_temp_file(tmp_path)
 
-    def _translate_error_to_chinese(self, error: str) -> str:
+    def _translate_error_to_chinese(self, error: str, default_msg: str = "这边刚才有点小问题，稍后再试试。") -> str:
         """将错误信息翻译为中文"""
         error_lower = str(error).lower()
 
@@ -3904,11 +3904,7 @@ class FigurineProPlugin(Star):
         if "json" in error_lower:
             return "API返回数据格式异常"
 
-        # 默认返回原始错误（截断）
-        error_str = str(error)
-        if len(error_str) > 50:
-            return f"未知错误: {error_str[:50]}..."
-        return f"未知错误: {error_str}"
+        return default_msg
 
     async def _run_single_batch_task(self, event: AstrMessageEvent, image_bytes: bytes,
                                      prompt: str, preset_name: str, task_index: int, total_tasks: int,
@@ -4286,7 +4282,7 @@ class FigurineProPlugin(Star):
                                     error_msg = self._translate_error_to_chinese(res)
                             except Exception as e:
                                 success = False
-                                error_msg = str(e)
+                                error_msg = self._translate_error_to_chinese(str(e))
                         else:
                             success, error_msg = await self._run_single_batch_task(
                                 event=event,
@@ -4338,7 +4334,7 @@ class FigurineProPlugin(Star):
                         await asyncio.sleep(0.5)
 
                 except Exception as e:
-                    error_msg = self._translate_error_to_chinese(str(e))
+                    error_msg = self._resolve_debug_error_message(e, "这次没弄好，请稍后再试。")
                     logger.error(f"Batch process image {i} exception: {e}", exc_info=True)
                     failed_details.append({
                         "index": i,
@@ -4578,7 +4574,7 @@ class FigurineProPlugin(Star):
                                     error_msg = self._translate_error_to_chinese(res)
                             except Exception as e:
                                 success = False
-                                error_msg = str(e)
+                                error_msg = self._translate_error_to_chinese(str(e))
                         else:
                             success, error_msg = await self._run_single_batch_task(
                                 event=event,
@@ -5005,7 +5001,7 @@ class FigurineProPlugin(Star):
             info += f" | 剩余: {quota_str}"
             yield event.chain_result([Image.fromBytes(res), Plain(info)])
         else:
-            yield event.chain_result([Plain(f"没弄好: {res}")])
+            yield event.chain_result([Plain(f"没弄好: {self._resolve_debug_error_message(res, '这次没弄好，请稍后再试。')}")])
 
     @filter.command("人设参考图添加", aliases={"添加人设图"}, prefix_optional=True)
     async def on_add_persona_ref(self, event: AstrMessageEvent, ctx=None):
@@ -5289,7 +5285,7 @@ class FigurineProPlugin(Star):
                             ]))
 
                 except Exception as e:
-                    error_msg = self._translate_error_to_chinese(str(e))
+                    error_msg = self._resolve_debug_error_message(e, "这次没弄好，请稍后再试。")
                     logger.error(f"Batch process image {index} exception: {e}", exc_info=True)
                     async with results_lock:
                         results["fail"] += 1
