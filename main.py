@@ -104,7 +104,7 @@ _CLOTHING_KEYWORDS = [
     "shskjw",
     "支持第三方所有OpenAI绘图格式和原生Google Gemini 终极缝合怪，文生图/图生图插件，支持LLM智能判断",
     "2.8.3",
-    "https://github.com/shkjw/astrbot_plugin_shoubanhua",
+    "https://github.com/shskjw/astrbot_plugin_shoubanhua",
 )
 class FigurineProPlugin(Star):
     _DEPRECATED_CONFIG_KEYS = [
@@ -3795,7 +3795,7 @@ class FigurineProPlugin(Star):
         if not err_text:
             return default_msg
 
-        translated = self._translate_error_to_chinese(err_text)
+        translated = self._translate_error_to_chinese(err_text, default_msg=default_msg)
 
         unsafe_keywords = [
             "traceback", "exception", "stack", "context", "attributeerror",
@@ -4282,7 +4282,7 @@ class FigurineProPlugin(Star):
                                     error_msg = self._translate_error_to_chinese(res)
                             except Exception as e:
                                 success = False
-                                error_msg = self._translate_error_to_chinese(str(e))
+                                error_msg = self._resolve_debug_error_message(e, "图片生成失败")
                         else:
                             success, error_msg = await self._run_single_batch_task(
                                 event=event,
@@ -4574,7 +4574,7 @@ class FigurineProPlugin(Star):
                                     error_msg = self._translate_error_to_chinese(res)
                             except Exception as e:
                                 success = False
-                                error_msg = self._translate_error_to_chinese(str(e))
+                                error_msg = self._resolve_debug_error_message(e,self._translate_error_to_chinese(str(e)))
                         else:
                             success, error_msg = await self._run_single_batch_task(
                                 event=event,
