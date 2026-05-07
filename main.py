@@ -2705,14 +2705,14 @@ class FigurineProPlugin(Star):
         # 立即阻止事件继续传递，防止重复触发
         event.stop_event()
 
-        # 指令模式：立刻反馈
+        # 指令模式：先启动本处理流程，再发提示，避免被 after_message_sent 类插件截断后半段逻辑。
         _internal = {"自定义", "编辑", "edit", "custom"}
         preset_display = "" if (not preset_name or preset_name.strip().lower() in _internal) else preset_name
         template = self.conf.get("generating_msg_template", "🎨 收到请求，正在生成 [{preset}]...")
         feedback = template.replace("{preset}", preset_display) if preset_display else template.replace(" [{preset}]",
                                                                                                         "").replace(
             "[{preset}]", "")
-        yield event.chain_result([Plain(feedback)])
+        await event.send(event.chain_result([Plain(feedback)]))
 
         bot_id = self._get_bot_id(event)
         # 传递 bot_id 给 image manager 以过滤，并传入 context 支持 message_id
@@ -2791,7 +2791,7 @@ class FigurineProPlugin(Star):
         feedback = template.replace("{preset}", preset_display) if preset_display else template.replace(" [{preset}]",
                                                                                                         "").replace(
             "[{preset}]", "")
-        yield event.chain_result([Plain(feedback)])
+        await event.send(event.chain_result([Plain(feedback)]))
 
         if deduction["source"] == "user":
             await self.data_mgr.decrease_user_count(uid, 1)
