@@ -175,9 +175,37 @@ class ApiManager:
             return [str(item).strip() for item in keys if str(item).strip()]
         return [str(keys).strip()] if str(keys).strip() else []
 
+    def _summarize_api_error(self, error, key: str = "", max_length: int = 500) -> str:
+        """保留排错所需的错误摘要，隐藏凭证与图片数据。"""
+        text = str(error or "")
+        text = re.sub(r"data:image/[^,\s]+,[A-Za-z0-9+/=_\-\s]+", "<image data>", text, flags=re.I)
+        text = re.sub(r"[A-Za-z0-9+/_-]{160,}={0,2}", "<binary data>", text)
+        keys = [key] if key else []
+        for field in ("api_keys", "generic_api_keys", "gemini_api_keys", "text_to_image_api_keys"):
+            keys.extend(self._normalize_keys(self.config.get(field)))
+        for secret in sorted(set(keys), key=len, reverse=True):
+            if secret:
+                text = text.replace(secret, "<redacted>")
+        text = re.sub(r"(?i)(bearer\s+)\S+", r"\1<redacted>", text)
+        text = re.sub(
+            r'''(?i)(["']?(?:api[_-]?key|access[_-]?token|token|key|authorization)["']?\s*[:=]\s*["']?)[^\s&"',}]+''',
+            r"\1<redacted>", text,
+        )
+        return " ".join(text.split())[:max_length]
+
     def _get_interface_mode(self) -> str:
         """读取新版接口模式，并兼容旧版 generic 配置。"""
         mode = str(self.config.get("interface_mode", "") or "").strip().lower()
+        mode_aliases = {
+            "image": "openai_image",
+            "images": "openai_image",
+            "openai_images": "openai_image",
+            "chat": "openai_chat",
+            "generic": "openai_chat",
+            "gemini": "gemini_official",
+            "custom": "custom_endpoint",
+        }
+        mode = mode_aliases.get(mode, mode)
         valid_modes = {"openai_image", "openai_chat", "gemini_official", "custom_endpoint"}
         if mode in valid_modes:
             return mode
@@ -190,6 +218,24 @@ class ApiManager:
         if legacy_mode == "custom_endpoint":
             return "custom_endpoint"
         return "openai_image" if self.config.get("generic_prefer_images_api", False) else "openai_chat"
+
+    def _should_force_images_api(self, interface_mode: str, custom_kind: str = "") -> bool:
+        """Whether the selected configuration makes Images API a hard route.
+
+        ``generic_prefer_images_api`` historically behaved as a best-effort hint: it
+        silently switched multi-image edits (and unsupported edits endpoints) back
+        to chat/completions. That made an explicitly selected image route impossible
+        to rely on. Treat both OpenAI Images mode and this compatibility switch as
+        routing constraints instead.
+        """
+        return (
+            interface_mode == "openai_image"
+            or custom_kind == "image"
+            or (
+                interface_mode == "openai_chat"
+                and bool(self.config.get("generic_prefer_images_api", False))
+            )
+        )
 
     def _get_base_url(self, mode: str, use_text_to_image_api: bool = False) -> str:
         unified_base = str(self.config.get("base_url", "") or "").strip()
@@ -244,16 +290,17 @@ class ApiManager:
             # 格式: {"data": [{"url": "..."}, {"b64_json": "..."}]}
             if "data" in data and isinstance(data["data"], list) and len(data["data"]) > 0:
                 item = data["data"][0]
-                if "b64_json" in item:
-                    return f"data:image/png;base64,{item['b64_json']}"
-                if "url" in item:
-                    url_value = item["url"]
-                    if isinstance(url_value, str):
+                if isinstance(item, dict):
+                    encoded_image = item.get("b64_json")
+                    if isinstance(encoded_image, str) and encoded_image.strip():
+                        return f"data:image/png;base64,{encoded_image}"
+                    url_value = item.get("url")
+                    if isinstance(url_value, str) and url_value.strip():
                         # 兼容某些接口把纯 base64 误放进 url 字段
                         pure_b64_match = re.fullmatch(r'[A-Za-z0-9+/]{1000,}={0,2}', url_value.strip())
                         if pure_b64_match:
                             return f"data:image/jpeg;base64,{url_value.strip()}"
-                    return url_value
+                        return url_value.strip()
 
             # ================== 2. OpenAI Chat Completion ==================
             # 格式: {"choices": [{"message": {"content": "..."}}]}
@@ -480,8 +527,6 @@ class ApiManager:
         """Detect providers that do not implement /images/edits at all."""
         error_lower = (error_msg or "").lower()
         keywords = [
-            "images/edits",
-            "image edits",
             "not support this api",
             "api not supported",
             "unsupported endpoint",
@@ -493,14 +538,15 @@ class ApiManager:
         ]
         return any(keyword in error_lower for keyword in keywords)
 
-    async def _parse_images_api_success_response(self, resp_text: str, proxy: str = None) -> bytes | str:
+    async def _parse_images_api_success_response(self, resp_text: str, proxy: str = None,
+                                                base_url: str = None) -> bytes | str:
         """统一解析 Images API 成功响应"""
         try:
             res_data = json.loads(resp_text)
         except json.JSONDecodeError:
             return f"数据解析失败: 返回内容不是 JSON. 内容: {resp_text[:100]}..."
 
-        if "error" in res_data:
+        if isinstance(res_data, dict) and "error" in res_data:
             return json.dumps(res_data["error"], ensure_ascii=False)
 
         img_url = self.extract_image_url(res_data)
@@ -508,20 +554,25 @@ class ApiManager:
             return f"Images API 返回成功但未找到图片数据。Raw: {str(res_data)[:200]}..."
 
         if img_url.startswith("data:"):
-            return base64.b64decode(img_url.split(",")[-1])
+            try:
+                encoded_image = re.sub(r"\s+", "", img_url.split(",", 1)[-1])
+                image_data = base64.b64decode(encoded_image, altchars=b"-_", validate=True)
+            except ValueError:
+                return "Images API 返回了无效的 base64 图片数据"
+            return image_data if image_data else "Images API 返回了空的图片数据"
 
-        return await self._download_result_image(img_url, proxy)
+        return await self._download_result_image(img_url, proxy, base_url)
 
     async def _call_images_api_multipart(self, images: List[bytes], prompt: str,
                                          model: str, key: str, base_url: str, proxy: str = None,
                                          generation_params: Dict = None,
                                          exact_endpoint: bool = False) -> bytes | str:
-        """以 multipart/form-data 方式调用 Images API，兼容部分仅接受文件上传的编辑接口"""
+        """以 multipart/form-data 上传参考图，直接调用 Images 编辑接口。"""
         has_input_image = bool(images)
         candidate_urls = [base_url.rstrip("/")] if exact_endpoint else self._build_candidate_generic_image_urls(
             base_url, has_input_image=has_input_image
         )
-        logger.info(f"Retry Images API with multipart/form-data, candidate urls: {candidate_urls}")
+        logger.info(f"Using Images API multipart/form-data: {self._summarize_api_error(candidate_urls, key)}")
 
         headers = {
             "Authorization": f"Bearer {key}"
@@ -544,15 +595,20 @@ class ApiManager:
                 form.add_field("prompt", final_prompt)
                 form.add_field("n", "1")
                 form.add_field("size", generation_params["size"])
-                if not str(model).lower().startswith("gpt-image"):
+                if str(model).strip().lower().startswith("dall-e"):
                     form.add_field("response_format", "b64_json")
 
                 if images:
-                    img = images[0]
-                    mime = self.get_mime_type(img)
-                    ext = mime.split("/")[-1] if "/" in mime else "png"
-                    filename = f"input.{ext}"
-                    form.add_field("image", img, filename=filename, content_type=mime)
+                    # OpenAI-compatible edits accepts one ``image`` field for a
+                    # single input and repeated ``image[]`` fields for multiple
+                    # references. Do not discard extra references or reroute them
+                    # through chat/completions.
+                    field_name = "image" if len(images) == 1 else "image[]"
+                    for image_index, img in enumerate(images):
+                        mime = self.get_mime_type(img)
+                        ext = mime.split("/")[-1] if "/" in mime else "png"
+                        filename = f"input_{image_index + 1}.{ext}"
+                        form.add_field(field_name, img, filename=filename, content_type=mime)
 
                 current_proxy = self._get_request_proxy(url, proxy)
                 async with session.post(url, data=form, headers=headers, proxy=current_proxy, timeout=timeout) as resp:
@@ -563,34 +619,30 @@ class ApiManager:
                         continue
 
                     if resp.status != 200:
-                        try:
-                            err_json = json.loads(resp_text)
-                            err_msg = json.dumps(err_json, ensure_ascii=False)
-                            if has_input_image and self._is_images_edits_unsupported_error(err_msg):
-                                if idx < len(candidate_urls) - 1:
-                                    logger.warning(f"Images API multipart edits endpoint unsupported, trying next candidate: {candidate_urls[idx + 1]}")
-                                    continue
-                                return f"Images API edits endpoint unsupported {resp.status}: {err_msg} | URL: {url}"
-                            return f"Images API Multipart Error {resp.status}: {err_msg} | URL: {url}"
-                        except:
-                            if has_input_image and self._is_images_edits_unsupported_error(resp_text):
-                                if idx < len(candidate_urls) - 1:
-                                    logger.warning(f"Images API multipart edits endpoint unsupported, trying next candidate: {candidate_urls[idx + 1]}")
-                                    continue
-                                return f"Images API edits endpoint unsupported {resp.status}: {resp_text[:300]} | URL: {url}"
-                            return f"HTTP {resp.status}: {resp_text[:200]} | URL: {url}"
+                        err_msg = self._summarize_api_error(resp_text, key)
+                        safe_url = self._summarize_api_error(url, key)
+                        logger.error(f"Images API multipart HTTP {resp.status}: {err_msg} | URL: {safe_url}")
+                        if has_input_image and self._is_images_edits_unsupported_error(err_msg):
+                            return f"Images API edits endpoint unsupported {resp.status}: {err_msg} | URL: {safe_url}"
+                        return f"Images API Multipart Error {resp.status}: {err_msg} | URL: {safe_url}"
 
                     if "<html" in resp_text.lower():
-                        return f"HTTP 200: 服务端返回了网页而非图片接口数据 | URL: {url}"
+                        error = f"HTTP 200: 服务端返回了网页而非图片接口数据 | URL: {self._summarize_api_error(url, key)}"
+                        logger.error(error)
+                        return error
 
-                    return await self._parse_images_api_success_response(resp_text, proxy)
+                    result = await self._parse_images_api_success_response(resp_text, proxy, url)
+                    if isinstance(result, str):
+                        logger.error(f"Images API multipart 响应未取得图片: {self._summarize_api_error(result, key)}")
+                    return result
 
             return f"Images API Multipart Error: 未找到可用接口地址 | Candidates: {candidate_urls}"
         except asyncio.TimeoutError:
+            logger.error(f"Images API multipart 请求超时 ({timeout_val}s)")
             return f"请求超时 ({timeout_val}s)，请稍后再试或检查网络。"
         except Exception as e:
             import traceback
-            logger.error(f"Images API Multipart Call Error: {traceback.format_exc()}")
+            logger.error(f"Images API Multipart Call Error: {self._summarize_api_error(traceback.format_exc(), key)}")
             err_msg = str(e) or type(e).__name__
             return f"系统错误: {err_msg}"
 
@@ -598,13 +650,23 @@ class ApiManager:
                                model: str, key: str, base_url: str, proxy: str = None,
                                generation_params: Dict = None,
                                exact_endpoint: bool = False) -> bytes | str:
-        """调用 Images API (DALL-E 风格接口) - 作为 fallback"""
+        """Images 编辑接口直接上传文件，文生图和自定义 JSON 接口发送 JSON。"""
 
         has_input_image = bool(images)
+        endpoint_path = urlparse(base_url).path.rstrip("/").lower()
+        if has_input_image and (not exact_endpoint or endpoint_path.endswith("/images/edits")):
+            return await self._call_images_api_multipart(
+                images, prompt, model, key, base_url, proxy,
+                generation_params=generation_params,
+                exact_endpoint=exact_endpoint,
+            )
+        if exact_endpoint and endpoint_path.endswith("/images/edits") and not has_input_image:
+            return "Images API /images/edits 需要至少一张参考图"
+
         candidate_urls = [base_url.rstrip("/")] if exact_endpoint else self._build_candidate_generic_image_urls(
             base_url, has_input_image=has_input_image
         )
-        logger.info(f"Fallback to Images API, candidate urls: {candidate_urls}")
+        logger.info(f"Using Images API JSON: {self._summarize_api_error(candidate_urls, key)}")
 
         headers = {
             "Content-Type": "application/json",
@@ -625,20 +687,24 @@ class ApiManager:
             "n": 1,
             "size": generation_params["size"],
         }
-        if not str(model).lower().startswith("gpt-image"):
+        if str(model).strip().lower().startswith("dall-e"):
             payload["response_format"] = "b64_json"
 
         # 如果有输入图片，兼容不同 Images API 的字段要求
         # 一些服务要求 image_url；另一些只认 image / input_image / images
         if images:
-            img = images[0]
-            mime = self.get_mime_type(img)
-            b64_img = base64.b64encode(img).decode()
-            data_uri = f"data:{mime};base64,{b64_img}"
-            payload["image"] = data_uri
-            payload["image_url"] = data_uri
-            payload["input_image"] = data_uri
-            payload["images"] = [data_uri]
+            data_uris = []
+            for img in images:
+                mime = self.get_mime_type(img)
+                b64_img = base64.b64encode(img).decode()
+                data_uris.append(f"data:{mime};base64,{b64_img}")
+
+            # Keep singular aliases for compatibility while preserving every
+            # reference in the standard plural field.
+            payload["image"] = data_uris[0]
+            payload["image_url"] = data_uris[0]
+            payload["input_image"] = data_uris[0]
+            payload["images"] = data_uris
 
         try:
             timeout_val = self.config.get("timeout", 120)
@@ -665,11 +731,15 @@ class ApiManager:
                         except:
                             pass
 
+                        err_msg = self._summarize_api_error(err_msg, key)
+                        safe_url = self._summarize_api_error(url, key)
+                        logger.error(f"Images API JSON HTTP {resp.status}: {err_msg} | URL: {safe_url}")
+
                         if has_input_image and self._is_images_edits_unsupported_error(err_msg):
                             if idx < len(candidate_urls) - 1:
                                 logger.warning(f"Images API edits endpoint unsupported, trying next candidate: {candidate_urls[idx + 1]}")
                                 continue
-                            return f"Images API edits endpoint unsupported {resp.status}: {err_msg[:300]} | URL: {url}"
+                            return f"Images API edits endpoint unsupported {resp.status}: {err_msg} | URL: {safe_url}"
 
                         if self._should_retry_images_api_with_multipart(err_msg, has_input_image):
                             logger.info("Images API JSON 请求失败，检测到服务端更偏好 multipart/form-data，自动重试")
@@ -679,21 +749,27 @@ class ApiManager:
                                 exact_endpoint=exact_endpoint,
                             )
 
-                        return f"Images API Error {resp.status}: {err_msg[:300]} | URL: {url}"
+                        return f"Images API Error {resp.status}: {err_msg} | URL: {safe_url}"
 
                     if "<html" in resp_text.lower():
-                        return f"HTTP 200: 服务端返回了网页而非图片接口数据 | URL: {url}"
+                        error = f"HTTP 200: 服务端返回了网页而非图片接口数据 | URL: {self._summarize_api_error(url, key)}"
+                        logger.error(error)
+                        return error
 
-                    return await self._parse_images_api_success_response(resp_text, proxy)
+                    result = await self._parse_images_api_success_response(resp_text, proxy, url)
+                    if isinstance(result, str):
+                        logger.error(f"Images API JSON 响应未取得图片: {self._summarize_api_error(result, key)}")
+                    return result
 
             return f"Images API Error: 未找到可用接口地址 | Candidates: {candidate_urls}"
 
         except asyncio.TimeoutError:
             timeout_val = self.config.get("timeout", 120)
+            logger.error(f"Images API JSON 请求超时 ({timeout_val}s)")
             return f"请求超时 ({timeout_val}s)，请稍后再试或检查网络。"
         except Exception as e:
             import traceback
-            logger.error(f"Images API Call Error: {traceback.format_exc()}")
+            logger.error(f"Images API Call Error: {self._summarize_api_error(traceback.format_exc(), key)}")
             err_msg = str(e) or type(e).__name__
             return f"系统错误: {err_msg}"
 
@@ -751,14 +827,8 @@ class ApiManager:
             return img_url
 
         if base_url:
-            normalized_chat_url = self._normalize_generic_chat_url(base_url)
-            api_root = normalized_chat_url
-            if "/chat/completions" in api_root:
-                api_root = api_root.split("/chat/completions", 1)[0] + "/"
-            elif not api_root.endswith("/"):
-                api_root += "/"
-
-            resolved = urljoin(api_root, img_url.lstrip("/"))
+            api_root = normalize_api_root(base_url).rstrip("/") + "/"
+            resolved = urljoin(api_root, img_url)
             logger.info(f"检测到相对结果图地址，已自动补全为绝对地址: {resolved}")
             return resolved
 
@@ -990,32 +1060,22 @@ class ApiManager:
             else:
                 custom_kind = "image"
 
-        if interface_mode == "openai_image" or custom_kind == "image":
+        force_images_api = self._should_force_images_api(interface_mode, custom_kind)
+        if force_images_api:
+            route_reason = (
+                f"interface_mode={interface_mode}"
+                if interface_mode != "openai_chat"
+                else "generic_prefer_images_api=true"
+            )
+            target_endpoint = "images/edits" if images else "images/generations"
+            logger.info(
+                f"API route locked to Images API ({route_reason}); "
+                f"endpoint={target_endpoint}, input_images={len(images)}"
+            )
             return await self.call_images_api(
                 images, prompt, model, key, base, proxy,
                 generation_params=generation_params,
                 exact_endpoint=(interface_mode == "custom_endpoint"),
-            )
-
-        # 对于明确使用 Generic 图片接口的站点，可配置为优先直连 Images API
-        # 但当输入为多图时，优先走 chat/completions 以保留全部参考图（Images API 常只接受单图编辑）。
-        if interface_mode == "openai_chat" and self.config.get("generic_prefer_images_api", False):
-            if len(images) <= 1:
-                logger.info("已启用 generic_prefer_images_api，优先直接走 Images API")
-                image_api_result = await self.call_images_api(
-                    images, prompt, model, key, base, proxy,
-                    generation_params=generation_params
-                )
-                if not (
-                        images
-                        and isinstance(image_api_result, str)
-                        and self._is_images_edits_unsupported_error(image_api_result)
-                ):
-                    return image_api_result
-                logger.warning("Preferred Images API edits endpoint is unsupported; falling back to chat/completions.")
-            logger.info(
-                "generic_prefer_images_api 已启用，但检测到多图输入，"
-                "为保留全部参考图改走 chat/completions"
             )
 
         # 画质强化 Prompt

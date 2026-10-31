@@ -6,6 +6,11 @@ from typing import Optional, List, Tuple, Any, Dict
 
 from astrbot import logger
 from astrbot.api.event import filter
+try:
+    from astrbot.api import llm_tool
+except ImportError:
+    # 兼容尚未从公开 API 导出 llm_tool 的旧版 AstrBot。
+    llm_tool = filter.llm_tool
 from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.core import AstrBotConfig
 from astrbot.core.message.components import Image, Plain, Node, Nodes, At, Reply
@@ -103,7 +108,7 @@ _CLOTHING_KEYWORDS = [
     "astrbot_plugin_shoubanhua",
     "shskjw",
     "支持第三方所有OpenAI绘图格式和原生Google Gemini 终极缝合怪，文生图/图生图插件，支持LLM智能判断",
-    "2.9.0",
+    "2.9.4",
     "https://github.com/shskjw/astrbot_plugin_shoubanhua",
 )
 class FigurineProPlugin(Star):
@@ -306,6 +311,19 @@ class FigurineProPlugin(Star):
         current_is_default = has_default and current_value == default_value
 
         if has_override_meta:
+            # A panel/config-file save performed after the local command backup is
+            # authoritative even when the selected value equals the schema default
+            # (notably interface_mode=openai_image). Previously an older persisted
+            # openai_chat override could be restored here and make the UI show an
+            # image selection while runtime requests still used chat/completions.
+            if (
+                    current_exists
+                    and key == "interface_mode"
+                    and dynamic_backup_is_newer is not True
+            ):
+                return False, "keep-runtime-interface-mode"
+            if current_exists and dynamic_backup_is_newer is False:
+                return False, "keep-newer-panel-value"
             if current_exists and not current_is_default:
                 if key in self._PANEL_PRIORITY_DYNAMIC_KEYS:
                     return False, "keep-panel-value"
@@ -867,8 +885,10 @@ class FigurineProPlugin(Star):
             logger.warning("FigurinePro: 未配置任何 API Key")
 
         auto_detect_status = "已启用" if self._llm_auto_detect else "未启用"
+        effective_interface_mode = self.api_mgr._get_interface_mode()
         logger.info(
-            f"FigurinePro 插件已加载 v2.5.5 | LLM智能判断: {auto_detect_status} | 上下文轮数: {self._context_rounds}")
+            f"FigurinePro 插件已加载 v2.9.4 | LLM智能判断: {auto_detect_status} | "
+            f"上下文轮数: {self._context_rounds} | 生图接口路由: {effective_interface_mode}")
 
     def is_admin(self, event: AstrMessageEvent) -> bool:
         sender_id = norm_id(event.get_sender_id())
@@ -2079,9 +2099,8 @@ class FigurineProPlugin(Star):
             ])
         return "稍等。"
 
-    def _build_llm_tool_failure(self, error: Any, default_msg: str = "这边刚才有点小问题，稍后我再试试。") -> str:
-        """仅返回给 LLM 的失败信息，不直接向用户暴露底层报错。"""
-        import random
+    def _build_llm_tool_failure(self, error: Any, default_msg: str = "这次没弄好，可以稍后再试。") -> str:
+        """失败结果只给出可公开的信息，不引导 LLM 排障或承诺自动重试。"""
         masked = self._mask_llm_error(error, default_msg)
         low_level_failures = {
             "API服务器内部错误", "API网关错误", "API服务暂时不可用", "网络连接异常",
@@ -2092,22 +2111,12 @@ class FigurineProPlugin(Star):
         if str(masked).strip() in low_level_failures:
             masked = default_msg
         masked = str(masked).removeprefix("❌").strip()
-        # 给 LLM 多种自然表达失败的参考，不要让它照搬机械话术
-        fail_styles = random.choice([
-            "刚才有点小状况，稍后我再试一次。",
-            "哎，刚刚有点问题，过一会儿再来更稳一点。",
-            "应该是网络轻轻抖了一下，我等会儿再试。",
-            "先缓一缓，待会儿我再继续。",
-            "这边有点卡，稍后再接着处理。",
-        ])
         return self._finalize_llm_tool_result(
-            f"[TOOL_FAILED] 失败原因（不要对用户说）：{masked}。"
-            f"请用你自己的语气告诉用户这次没弄好，参考语气：'{fail_styles}'，但不要照抄，自然表达即可。"
-            f"绝对不要提'系统''工具''API''参数''配置'等词汇。"
+            f"[TOOL_FAILED] {masked}"
         )
 
     def _finalize_llm_tool_result(self, text: str) -> str:
-        """统一收敛 LLM 工具返回：屏蔽思考过程提示并附加硬性输出约束。"""
+        """保留结果事实，以简短提示收尾；失败时明确结束本轮操作。"""
         result = str(text or "")
 
         result = re.sub(r"<\s*think\b[^>]*>.*?<\s*/\s*think\s*>", "", result, flags=re.IGNORECASE | re.DOTALL)
@@ -2128,17 +2137,13 @@ class FigurineProPlugin(Star):
 
         result = "\n".join(cleaned_lines).strip()
         if not result:
-            result = "[TOOL_SUCCESS] 任务已完成，结果已发送给用户。"
+            result = "[TOOL_FAILED] 没有取得有效结果。"
 
         guard_rule = (
-            "【对话要求】你现在要根据以上工具结果，用自己的语气给用户回一句自然的话，就像真人在聊天一样。"
-            "严格禁止以下行为：\n"
-            "- 说出'生成''绘制''绘图''渲染''处理完成''任务完成''已发送'等机械词汇\n"
-            "- 暴露工具名称、预设名、内部参数或系统信息\n"
-            "- 输出思考过程、推理步骤、错误代码或格式前缀（如[TOOL_SUCCESS]）\n"
-            "- 重复复述工具返回的文字\n"
-            "如果图片发送成功，就随口说一句自然的收尾话（或者不说也行）。"
-            "如果失败，用生活化的语气随口带过，不要说'系统''工具''API'等字眼。"
+            "请按原本人设自然回复，勿复述状态标记、内部细节或排障信息。"
+            "失败或不可用时，本轮操作已结束：直接告诉用户这次没弄好，等待用户下一次请求；"
+            "不要自动重试，不要承诺稍后自行重试，也不要调用其他工具执行命令、读取文件或查找日志。"
+            "成功时可简短收尾，不要重复发送图片。"
         )
         if guard_rule not in result:
             result = f"{result}\n{guard_rule}"
@@ -2385,7 +2390,10 @@ class FigurineProPlugin(Star):
                 )
                 if isinstance(res, bytes) or not self._is_transient_generation_error(res) or attempt == 1:
                     break
-                logger.warning(f"Background task transient error, retrying once: {res}")
+                logger.warning(
+                    "Background task transient error, retrying once: "
+                    f"{self.api_mgr._summarize_api_error(res)}"
+                )
                 await asyncio.sleep(1.2)
 
             # 4. 处理结果
@@ -2420,6 +2428,10 @@ class FigurineProPlugin(Star):
                 await event.send(chain)
                 return True, ""
             else:
+                logger.warning(
+                    "Background image generation failed: "
+                    f"{self.api_mgr._summarize_api_error(res)}"
+                )
                 error_msg = self._resolve_debug_error_message(res,
                                                               "这次没弄好，请稍后再试。") if suppress_user_error else str(
                     res)
@@ -2433,7 +2445,7 @@ class FigurineProPlugin(Star):
                 return False, str(error_msg).removeprefix("❌").strip()
 
         except Exception as e:
-            logger.error(f"Background task error: {e}")
+            logger.error(f"Background task error: {self.api_mgr._summarize_api_error(e)}")
             error_msg = self._resolve_debug_error_message(e,
                                                           "这次没弄好，请稍后再试。") if suppress_user_error else f"系统错误: {e}"
             if (not suppress_user_error) or self._should_show_debug_errors():
@@ -2767,8 +2779,8 @@ class FigurineProPlugin(Star):
 
         return normalized_uid in normalized_whitelist
 
-    @filter.llm_tool(name="shoubanhua_check_user_status")
-    async def check_user_status_tool(self, event: AstrMessageEvent):
+    @llm_tool(name="shoubanhua_check_user_status")
+    async def check_user_status_tool(self, event: AstrMessageEvent) -> str:
         '''检查用户是否是高权限VIP用户。
 
         【调用优化指南（重要！）】：
@@ -2799,9 +2811,9 @@ class FigurineProPlugin(Star):
             logger.debug(f"FigurinePro: 用户 {uid} 被识别为普通用户")
             return "【用户身份】普通用户。请按照你的正常人设和性格来回复；如果启用了叛逆模式，可以自然地带一点傲娇、调侃或小脾气，但不要像流程化应答。"
 
-    @filter.llm_tool(name="shoubanhua_draw_image")
+    @llm_tool(name="shoubanhua_draw_image")
     async def text_to_image_tool(self, event: AstrMessageEvent, prompt: str, count: int = 1,
-                                 aspect_ratio: str = "auto", resolution: str = "auto"):
+                                 aspect_ratio: str = "auto", resolution: str = "auto") -> str:
         '''根据文本描述生成图片（文生图）。
 
         【排他性条件（极度重要！）】
@@ -2853,7 +2865,8 @@ class FigurineProPlugin(Star):
         if in_cooldown:
             # 返回借口让LLM用自然语言拒绝
             excuse = self._get_cooldown_excuse(remaining)
-            return f"【冷却中】{excuse}\n\n请用自然的方式告诉用户现在不方便生成图片，可以稍后再试。不要直接说'冷却'这个词。"
+            return self._finalize_llm_tool_result(
+                f"[TOOL_UNAVAILABLE] {excuse} 请自然告诉用户稍后再来，不要提冷却。")
 
         # 0.2 限制批量生成数量
         requested_count = self._resolve_tool_requested_count(prompt, incoming_count=count, default=1, multi_default=3)
@@ -2944,9 +2957,9 @@ class FigurineProPlugin(Star):
             return self._finalize_llm_tool_success(
                 "[TOOL_SUCCESS] 图片已经发给用户。请用自己的语气自然收尾一句，比如“给你啦，别说我没帮你。”不要提系统、工具或生成。")
 
-    @filter.llm_tool(name="shoubanhua_edit_image")
+    @llm_tool(name="shoubanhua_edit_image")
     async def image_edit_tool(self, event: AstrMessageEvent, prompt: str, use_message_images: bool = True,
-                              task_types: str = "edit", count: int = 1, merge_multiple_images: bool = False):
+                              task_types: str = "edit", count: int = 1, merge_multiple_images: bool = False) -> str:
         '''编辑用户发送的图片或引用的图片（图生图）。仅在用户明确要求对图片进行处理时才调用。
 
         调用前请判断：
@@ -3004,7 +3017,8 @@ class FigurineProPlugin(Star):
         if in_cooldown:
             # 返回借口让LLM用自然语言拒绝
             excuse = self._get_cooldown_excuse(remaining)
-            return f"【冷却中】{excuse}\n\n请用自然的方式告诉用户现在不方便处理图片，可以稍后再试。不要直接说'冷却'这个词。"
+            return self._finalize_llm_tool_result(
+                f"[TOOL_UNAVAILABLE] {excuse} 请自然告诉用户稍后再来，不要提冷却。")
 
         # 1. 根据 task_types 决定是否使用预设
         # 当 task_types 为 "edit" 时，不匹配预设，直接使用用户的 prompt
@@ -3568,12 +3582,25 @@ class FigurineProPlugin(Star):
         aliases = {
             "generic": "openai_chat",
             "gemini": "gemini_official",
+            "image": "openai_image",
+            "images": "openai_image",
+            "chat": "openai_chat",
+            "custom": "custom_endpoint",
         }
         mode = aliases.get(mode, mode)
         if mode in ["openai_image", "openai_chat", "gemini_official", "custom_endpoint"]:
             self.conf["interface_mode"] = mode
             self._save_config(["interface_mode"])
-            yield event.chain_result([Plain(f"✅ 已切换为 {mode}")])
+            effective_mode = self.api_mgr._get_interface_mode()
+            endpoint_hint = {
+                "openai_image": "文生图 /images/generations；图生图 /images/edits（不会回落 chat）",
+                "openai_chat": "/chat/completions",
+                "gemini_official": "Gemini generateContent",
+                "custom_endpoint": "配置的完整端点",
+            }.get(effective_mode, effective_mode)
+            yield event.chain_result([Plain(
+                f"✅ 已切换为 {effective_mode}\n实际请求路径: {endpoint_hint}"
+            )])
         else:
             yield event.chain_result([Plain(
                 "模式无效 (openai_image / openai_chat / gemini_official / custom_endpoint；旧 generic 仍兼容)"
@@ -3858,8 +3885,8 @@ class FigurineProPlugin(Star):
         # 不阻断事件传递
         return
 
-    @filter.llm_tool(name="shoubanhua_smart_generate")
-    async def smart_generate_tool(self, event: AstrMessageEvent, user_request: str = ""):
+    @llm_tool(name="shoubanhua_smart_generate")
+    async def smart_generate_tool(self, event: AstrMessageEvent, user_request: str = "") -> str:
         '''智能判断并生成图片。仅在用户明确表达需要生成图片时才调用。
 
         调用前请严格判断：
@@ -3885,7 +3912,8 @@ class FigurineProPlugin(Star):
         if in_cooldown:
             # 返回借口让LLM用自然语言拒绝
             excuse = self._get_cooldown_excuse(remaining)
-            return f"【冷却中】{excuse}\n\n请用自然的方式告诉用户现在不方便生成图片，可以稍后再试。不要直接说'冷却'这个词。"
+            return self._finalize_llm_tool_result(
+                f"[TOOL_UNAVAILABLE] {excuse} 请自然告诉用户稍后再来，不要提冷却。")
 
         # 1. 获取上下文
         session_id = event.unified_msg_origin
@@ -4799,8 +4827,8 @@ class FigurineProPlugin(Star):
         if not success:
             yield event.chain_result([Plain(msg)])
 
-    @filter.llm_tool(name="shoubanhua_pack_images_to_pdf")
-    async def pack_images_to_pdf_tool(self, event: AstrMessageEvent, max_images: int = 10):
+    @llm_tool(name="shoubanhua_pack_images_to_pdf")
+    async def pack_images_to_pdf_tool(self, event: AstrMessageEvent, max_images: int = 10) -> str:
         '''将上下文中的图片（包括Bot正在生成或已经生成的图片）直接打包成一个PDF文件发送给用户。注意：此工具【不会】修改图片，【不会】生成新图，仅仅是把已有的图片原样打包。
 
         【调用规则（必须严格遵守）】
@@ -4885,9 +4913,9 @@ class FigurineProPlugin(Star):
             # 6. 无论成功失败，都退出暂存模式
             await self._exit_pdf_staging_mode(session_id)
 
-    @filter.llm_tool(name="shoubanhua_batch_process")
+    @llm_tool(name="shoubanhua_batch_process")
     async def batch_process_tool(self, event: AstrMessageEvent, prompt: str, max_images: int = 10,
-                                 output_as_pdf: bool = False):
+                                 output_as_pdf: bool = False) -> str:
         '''批量处理上下文中的多张图片，也可以将结果打包为PDF输出。仅在用户明确要求批量处理多张图片时才调用。
 
         调用前请严格判断：
@@ -4930,7 +4958,8 @@ class FigurineProPlugin(Star):
         if in_cooldown:
             # 返回借口让LLM用自然语言拒绝
             excuse = self._get_cooldown_excuse(remaining)
-            return f"【冷却中】{excuse}\n\n请用自然的方式告诉用户现在不方便处理图片，可以稍后再试。不要直接说'冷却'这个词。"
+            return self._finalize_llm_tool_result(
+                f"[TOOL_UNAVAILABLE] {excuse} 请自然告诉用户稍后再来，不要提冷却。")
 
         # 1. 提取当前消息的图片 URL（包括引用消息中的图片）
         msg_info = self._extract_message_info(event)
@@ -5190,9 +5219,9 @@ class FigurineProPlugin(Star):
         return self._finalize_llm_tool_success(
             f"[TOOL_SUCCESS] 批量处理任务已启动，共 {total_images} 张图片，预设：{preset_name}。图片将陆续发出，请用自然语言告知用户稍等即可，不要用'生成'等机械词汇。")
 
-    @filter.llm_tool(name="shoubanhua_batch_process_concurrent")
+    @llm_tool(name="shoubanhua_batch_process_concurrent")
     async def batch_process_concurrent_tool(self, event: AstrMessageEvent, prompt: str, max_images: int = 10,
-                                            concurrency: int = 3, output_as_pdf: bool = False):
+                                            concurrency: int = 3, output_as_pdf: bool = False) -> str:
         '''并发批量处理上下文中的多张图片，也可以将结果打包为PDF输出。仅在用户明确要求快速批量处理时才调用。
 
         调用前请严格判断：
@@ -5229,7 +5258,8 @@ class FigurineProPlugin(Star):
         if in_cooldown:
             # 返回借口让LLM用自然语言拒绝
             excuse = self._get_cooldown_excuse(remaining)
-            return f"【冷却中】{excuse}\n\n请用自然的方式告诉用户现在不方便处理图片，可以稍后再试。不要直接说'冷却'这个词。"
+            return self._finalize_llm_tool_result(
+                f"[TOOL_UNAVAILABLE] {excuse} 请自然告诉用户稍后再来，不要提冷却。")
 
         # 1. 提取当前消息的图片 URL（包括引用消息中的图片）
         msg_info = self._extract_message_info(event)
@@ -5507,9 +5537,9 @@ class FigurineProPlugin(Star):
 
     # ================= 日常人设功能 =================
 
-    @filter.llm_tool(name="shoubanhua_persona_photo")
+    @llm_tool(name="shoubanhua_persona_photo")
     async def persona_photo_tool(self, event: AstrMessageEvent, scene_hint: str = "", extra_request: str = "",
-                                 count: int = 1):
+                                 count: int = 1) -> str:
         '''生成Bot人设角色（你自己）的日常照片或写真。
 
         【唯一指定用途】
@@ -5554,13 +5584,19 @@ class FigurineProPlugin(Star):
             return self._finalize_llm_tool_result(
                 "[TOOL_UNAVAILABLE] 当前功能暂时不可用。请用自己平时的语气告诉用户现在不方便，别提功能禁用、指令模式等词汇，要自然。")
 
+        # 模型可能只传 count；此时从当前消息保留场景、换装、参考意图和画面参数。
+        # 已明确传入场景或要求时，保留模型整理后的内容，避免重复混入原文。
+        if not str(scene_hint or "").strip() and not str(extra_request or "").strip():
+            extra_request = str(getattr(event, "message_str", "") or "").strip()
+
         # 0.1 检查图片生成冷却时间
         uid = norm_id(event.get_sender_id())
         in_cooldown, remaining = self._check_image_cooldown(uid)
         if in_cooldown:
             # 返回借口让LLM用自然语言拒绝
             excuse = self._get_cooldown_excuse(remaining)
-            return f"【冷却中】{excuse}\n\n请用自然的方式告诉用户现在不方便拍照，可以稍后再试。不要直接说'冷却'这个词。"
+            return self._finalize_llm_tool_result(
+                f"[TOOL_UNAVAILABLE] {excuse} 请自然告诉用户稍后再来，不要提冷却。")
 
         # 1. 加载人设参考图
         ref_images = await self._load_persona_ref_images()
@@ -5620,7 +5656,7 @@ class FigurineProPlugin(Star):
         context_messages = await self.ctx_mgr.get_recent_messages(session_id, count=10)
 
         # 构建上下文文本
-        context_text = scene_hint
+        context_text = requested_text
         if context_messages:
             for msg in context_messages[-5:]:
                 if msg.is_bot:

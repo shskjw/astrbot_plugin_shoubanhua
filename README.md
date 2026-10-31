@@ -14,6 +14,11 @@
 ### LLM工具调用优化
 - **进度显示开关**：新增 `llm_show_progress` 配置项，可控制LLM工具调用时是否发送"正在生成..."等进度提示，关闭后直接发送结果图片
 - **用户独立冷却时间**：新增 `llm_cooldown_seconds` 配置项（默认60秒），每个用户独立计时，防止单用户无节制刷图，不影响其他用户正常使用
+- 对齐 [OmniDraw](https://github.com/diaomin66/astrbot_plugin_omnidraw) 的公开 `astrbot.api.llm_tool` 注册方式，兼容旧版注册入口
+- 人设拍照只传 `count` 时会读取当前用户请求，保留场景、换装、比例与清晰度要求
+- 失败结果简短返回，要求本轮直接回复用户，等待新请求，不自行调用其他工具查日志或承诺自动重试
+- 上述结束要求通过工具返回提示约束模型；后续工具调用仍由 AstrBot 与模型决定，不能替代 AstrBot 的工具权限控制
+- 图片请求失败会在 AstrBot 日志中记录脱敏的 HTTP 状态和原因，无需让聊天模型执行命令读取日志
 
 ### 文生图专用模型
 - 新增 `text_to_image_model` 配置项，可为文生图功能指定专用模型
@@ -40,7 +45,7 @@
   - 只有当前消息没有图时，才回退到上下文中查找历史图片
 - 修复 **结果图外链下载不稳定** 的问题，增加了结果图下载重试、超时和 User-Agent 兜底策略
 - 修复 **Generic API 地址容易填错完整路径** 的问题：现在即使填成 `/v1/chat/completions`、`/v1/images/generations`、`/v1/images/edits`，也会自动忽略尾部路径并重新拼接
-- 新增 **Images API multipart/form-data 自动回退**：当服务端不接受 JSON data URI、要求文件上传时，会自动尝试 multipart 方式重试
+- **Images API 图生图直接上传文件**：有参考图时直接以 multipart/form-data 请求 `/images/edits`，单图使用 `image`，多图使用 `image[]`，保留全部参考图；文生图使用 JSON 请求 `/images/generations`
 
 ### 📌 当前批处理与 PDF 行为说明
 - 用户明确发送“这两张图 / 这几张图”时，如果当前消息里已经附带图片，则插件默认只处理当前消息里的这些图片，不再额外混入历史上下文图片
