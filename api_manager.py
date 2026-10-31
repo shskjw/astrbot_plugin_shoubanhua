@@ -31,6 +31,24 @@ class ApiManager:
             self._session = aiohttp.ClientSession()
         return self._session
 
+    def _get_request_timeout(self, default: int = 120) -> int:
+        """为 HTTP 请求留出时间，让上层工具执行器先收到可控的失败结果。"""
+        try:
+            configured = int(self.config.get("timeout", default) or default)
+        except (TypeError, ValueError):
+            configured = default
+        # AstrBot 的本地工具执行通常也有 120 秒上限；不要让 aiohttp 和它同时超时。
+        return max(1, min(configured, 110))
+
+    def _get_result_image_download_timeout(self) -> int:
+        """计算结果图下载超时，并限制在本次请求的总超时以内。"""
+        request_timeout = self._get_request_timeout()
+        try:
+            configured = int(self.config.get("result_image_download_timeout", 0) or 0)
+        except (TypeError, ValueError):
+            configured = 0
+        return max(1, min(configured or request_timeout, request_timeout))
+
     def _reset_metrics(self):
         self._last_metrics = {
             "upstream_duration": 0.0,
@@ -584,7 +602,7 @@ class ApiManager:
         res_set = generation_params["resolution"]
         final_prompt = f"(Masterpiece, Best Quality, {res_set} Resolution), {prompt}" if res_set != "1K" else prompt
 
-        timeout_val = self.config.get("timeout", 120)
+        timeout_val = self._get_request_timeout()
         timeout = aiohttp.ClientTimeout(total=timeout_val)
         session = await self._get_session()
 
@@ -707,7 +725,7 @@ class ApiManager:
             payload["images"] = data_uris
 
         try:
-            timeout_val = self.config.get("timeout", 120)
+            timeout_val = self._get_request_timeout()
             timeout = aiohttp.ClientTimeout(total=timeout_val)
             session = await self._get_session()
 
@@ -764,7 +782,7 @@ class ApiManager:
             return f"Images API Error: 未找到可用接口地址 | Candidates: {candidate_urls}"
 
         except asyncio.TimeoutError:
-            timeout_val = self.config.get("timeout", 120)
+            timeout_val = self._get_request_timeout()
             logger.error(f"Images API JSON 请求超时 ({timeout_val}s)")
             return f"请求超时 ({timeout_val}s)，请稍后再试或检查网络。"
         except Exception as e:
@@ -843,9 +861,8 @@ class ApiManager:
         proxy = self._get_request_proxy(img_url, proxy)
 
         session = await self._get_session()
-        request_timeout = max(30, int(self.config.get("timeout", 120)))
-        configured_timeout = int(self.config.get("result_image_download_timeout", 0) or 0)
-        timeout_val = max(30, configured_timeout or request_timeout, request_timeout)
+        # 下载结果图也受工具执行器总时限约束，不能因单独配置再次回到 120 秒以上。
+        timeout_val = self._get_result_image_download_timeout()
         retries = max(2, int(self.config.get("result_image_download_retries", 4)))
         timeout = aiohttp.ClientTimeout(
             total=timeout_val,
@@ -1155,7 +1172,7 @@ class ApiManager:
         
         # 4. 发送请求
         try:
-            timeout_val = self.config.get("timeout", 120)
+            timeout_val = self._get_request_timeout()
             timeout = aiohttp.ClientTimeout(total=timeout_val)
             
             # 使用持久化 Session，避免重复的 TCP/SSL 握手开销

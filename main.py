@@ -108,7 +108,7 @@ _CLOTHING_KEYWORDS = [
     "astrbot_plugin_shoubanhua",
     "shskjw",
     "支持第三方所有OpenAI绘图格式和原生Google Gemini 终极缝合怪，文生图/图生图插件，支持LLM智能判断",
-    "2.9.4",
+    "2.9.5",
     "https://github.com/shskjw/astrbot_plugin_shoubanhua",
 )
 class FigurineProPlugin(Star):
@@ -887,7 +887,7 @@ class FigurineProPlugin(Star):
         auto_detect_status = "已启用" if self._llm_auto_detect else "未启用"
         effective_interface_mode = self.api_mgr._get_interface_mode()
         logger.info(
-            f"FigurinePro 插件已加载 v2.9.4 | LLM智能判断: {auto_detect_status} | "
+            f"FigurinePro 插件已加载 v2.9.5 | LLM智能判断: {auto_detect_status} | "
             f"上下文轮数: {self._context_rounds} | 生图接口路由: {effective_interface_mode}")
 
     def is_admin(self, event: AstrMessageEvent) -> bool:
@@ -1163,7 +1163,9 @@ class FigurineProPlugin(Star):
         ]
         generation_terms = [
             "画", "画一", "画个", "画张", "生成", "创作", "设计", "绘制", "做一张",
-            "出一张", "文生图", "生成图", "画图"
+            "出一张", "来一张", "来张", "文生图", "生成图", "画图",
+            "海报", "宣传图", "宣传海报", "插画", "插图", "横幅", "广告",
+            "封面", "壁纸", "banner", "illustration"
         ]
         third_party_subject_terms = [
             "一个女孩", "一个男孩", "一个人", "某个人", "路人", "陌生人", "角色图",
@@ -1209,7 +1211,12 @@ class FigurineProPlugin(Star):
                 has_bot_pattern
                 or (
                     has_bot
-                    and (has_appearance or has_selfie or has_style_show or (has_photo and not has_generation))
+                    and (
+                        has_selfie
+                        or has_photo
+                        or (has_appearance and not has_generation)
+                        or (has_style_show and not has_generation)
+                    )
                 )
         ):
             return True
@@ -1225,7 +1232,16 @@ class FigurineProPlugin(Star):
 
         configured_keywords = self._get_persona_trigger_keywords()
         if configured_keywords and any(kw in compact for kw in configured_keywords):
-            if has_bot or has_selfie or has_photo or has_appearance or has_request or has_style_show:
+            # 配置关键词只是辅助信号
+            # 请求误进入人设流程；还需要明确的照片/外貌意图。
+            has_configured_photo_intent = (
+                has_selfie
+                or has_photo
+                or has_appearance
+                or (has_request and not has_generation)
+                or (has_style_show and not has_generation)
+            )
+            if has_configured_photo_intent:
                 return True
 
         # “cos/换装/抱着某物/摆姿势给我看”是展示 Bot 人设的新照片，而不是纯文生图。
@@ -2848,8 +2864,10 @@ class FigurineProPlugin(Star):
             return self._finalize_llm_tool_result(
                 "[TOOL_UNAVAILABLE] 当前功能暂时不可用。请用自己平时的语气告诉用户现在不方便，别提功能禁用、指令模式等词汇，要自然。")
 
-        persona_request_text = " ".join([str(getattr(event, "message_str", "") or ""), str(prompt or "")])
-        if self._persona_mode and self._looks_like_persona_photo_request(persona_request_text):
+        # 只用真实用户原话做兜底判断。事件没有原话时，不拿模型扩写内容猜测人设，
+        # 否则普通海报提示词里的“photo/照片”等词可能再次触发人设分流。
+        persona_request_text = str(getattr(event, "message_str", "") or "").strip()
+        if self._persona_mode and persona_request_text and self._looks_like_persona_photo_request(persona_request_text):
             logger.info("shoubanhua_draw_image 命中人设请求兜底分流，改用 shoubanhua_persona_photo")
             inferred_count = self._infer_requested_count_from_text(persona_request_text, default=1, multi_default=3)
             return await self.persona_photo_tool(
@@ -3000,8 +3018,9 @@ class FigurineProPlugin(Star):
             return self._finalize_llm_tool_result(
                 "[TOOL_UNAVAILABLE] 当前功能暂时不可用。请用自己平时的语气告诉用户现在不方便，别提功能禁用、指令模式等词汇，要自然。")
 
-        persona_request_text = " ".join([str(getattr(event, "message_str", "") or ""), str(prompt or "")])
-        if self._persona_mode and self._looks_like_persona_photo_request(persona_request_text):
+        # 只用真实用户原话做兜底判断，避免模型扩写内容污染人设识别。
+        persona_request_text = str(getattr(event, "message_str", "") or "").strip()
+        if self._persona_mode and persona_request_text and self._looks_like_persona_photo_request(persona_request_text):
             logger.info("shoubanhua_edit_image 命中人设请求兜底分流，改用 shoubanhua_persona_photo")
             inferred_count = self._infer_requested_count_from_text(persona_request_text, default=1, multi_default=3)
             return await self.persona_photo_tool(
@@ -3933,16 +3952,19 @@ class FigurineProPlugin(Star):
                 and self._looks_like_context_image_reference(current_message)
         )
 
-        # 2.5 对“看你本人照片/自拍/写真”做强制分流，避免 LLM 误走通用智能工具
-        if self._persona_mode and (
-                self._looks_like_persona_photo_request(current_message)
-                or self._looks_like_persona_followup_request(current_message, context_messages)
+        # 2.5 只用事件中的真实用户原话做强制分流。
+        # ``user_request`` 可能是模型整理后的提示词，不能让其中的 photo/照片等词
+        # 把普通文生图请求误改道到人设工具。
+        persona_request_text = str(getattr(event, "message_str", "") or "").strip()
+        if self._persona_mode and persona_request_text and (
+                self._looks_like_persona_photo_request(persona_request_text)
+                or self._looks_like_persona_followup_request(persona_request_text, context_messages)
         ):
-            inferred_count = self._infer_requested_count_from_text(current_message, default=1, multi_default=3)
+            inferred_count = self._infer_requested_count_from_text(persona_request_text, default=1, multi_default=3)
             return await self.persona_photo_tool(
                 event=event,
                 scene_hint="",
-                extra_request=current_message,
+                extra_request=persona_request_text,
                 count=inferred_count,
             )
 

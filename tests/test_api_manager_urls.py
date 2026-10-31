@@ -75,6 +75,23 @@ class ApiEndpointBuildTest(unittest.TestCase):
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent",
         )
 
+    def test_request_timeout_leaves_margin_for_tool_executor(self):
+        self.manager.config["timeout"] = 120
+        self.assertEqual(self.manager._get_request_timeout(), 110)
+
+        self.manager.config["timeout"] = 45
+        self.assertEqual(self.manager._get_request_timeout(), 45)
+
+    def test_result_download_timeout_cannot_exceed_request_timeout(self):
+        self.manager.config.update({
+            "timeout": 120,
+            "result_image_download_timeout": 180,
+        })
+        self.assertEqual(self.manager._get_result_image_download_timeout(), 110)
+
+        self.manager.config["result_image_download_timeout"] = 45
+        self.assertEqual(self.manager._get_result_image_download_timeout(), 45)
+
 
 class ApiRouteTest(unittest.IsolatedAsyncioTestCase):
     @classmethod

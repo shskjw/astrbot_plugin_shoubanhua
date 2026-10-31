@@ -161,6 +161,153 @@ class ToolResultTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("穿蓝裙", prompt)
         self.assertNotIn(event.message_str, prompt)
 
+    def test_persona_detection_does_not_steal_regular_poster_requests(self):
+        plugin = self.make_plugin()
+        plugin.conf.update({
+            "persona_name": "菲比",
+            "persona_trigger_keywords": ["菲比"],
+        })
+
+        self.assertFalse(
+            plugin._looks_like_persona_photo_request(
+                "菲比做一张原神联动金铲铲的宣传海报 4:3 4K"
+            )
+        )
+        self.assertFalse(plugin._looks_like_persona_photo_request("菲比来一张宣传海报"))
+        self.assertTrue(plugin._looks_like_persona_photo_request("菲比拍一张生活照 4:5 4K"))
+        self.assertTrue(plugin._looks_like_persona_photo_request("菲比来一张自拍"))
+
+    async def test_draw_tool_uses_original_message_for_persona_fallback(self):
+        plugin = self.make_plugin()
+        plugin._persona_mode = True
+        plugin.conf.update({
+            "persona_name": "菲比",
+            "persona_trigger_keywords": ["菲比"],
+        })
+        plugin.persona_photo_tool = AsyncMock(side_effect=AssertionError("poster was misrouted"))
+        plugin._check_image_cooldown = lambda uid: (False, 0)
+        plugin._resolve_tool_requested_count = lambda *args, **kwargs: 1
+        plugin._process_prompt_and_preset = lambda prompt: (prompt, "自定义", "")
+        plugin._check_quota = AsyncMock(return_value={"allowed": True, "source": "free"})
+        plugin._update_image_cooldown = lambda uid: None
+        plugin._clear_session_image_cache_if_idle = AsyncMock()
+        plugin._register_pending_generation = AsyncMock()
+        plugin._run_background_task = AsyncMock(return_value=(True, ""))
+        plugin._get_text_to_image_model = lambda: "image-model"
+        plugin._is_vip_user = lambda uid, event: False
+        plugin._get_rebellious_hint = lambda prompt, uid, event: ""
+        event = types.SimpleNamespace(
+            message_str="菲比做一张原神联动金铲铲的宣传海报 4:3 4K",
+            unified_msg_origin="test-session",
+            get_sender_id=lambda: "user",
+            get_group_id=lambda: "group",
+            send=AsyncMock(),
+        )
+
+        expanded_prompt = "菲比做一张原神联动金铲铲的宣传海报，CG级别渲染"
+        result = await plugin.text_to_image_tool(
+            event,
+            prompt=expanded_prompt,
+            aspect_ratio="4:3",
+            resolution="4K",
+        )
+
+        plugin.persona_photo_tool.assert_not_awaited()
+        self.assertEqual(plugin._run_background_task.await_args.args[1], [])
+        self.assertIn(expanded_prompt, plugin._run_background_task.await_args.args[2])
+        self.assertTrue(result.startswith("[TOOL_SUCCESS]"))
+
+    async def test_draw_tool_does_not_classify_expanded_prompt_when_event_has_no_message(self):
+        plugin = self.make_plugin()
+        plugin._persona_mode = True
+        plugin.conf.update({
+            "persona_name": "菲比",
+            "persona_trigger_keywords": ["菲比"],
+        })
+        plugin.persona_photo_tool = AsyncMock(side_effect=AssertionError("expanded prompt was misrouted"))
+        plugin._check_image_cooldown = lambda uid: (False, 0)
+        plugin._resolve_tool_requested_count = lambda *args, **kwargs: 1
+        plugin._process_prompt_and_preset = lambda prompt: (prompt, "自定义", "")
+        plugin._check_quota = AsyncMock(return_value={"allowed": True, "source": "free"})
+        plugin._update_image_cooldown = lambda uid: None
+        plugin._clear_session_image_cache_if_idle = AsyncMock()
+        plugin._register_pending_generation = AsyncMock()
+        plugin._run_background_task = AsyncMock(return_value=(True, ""))
+        plugin._get_text_to_image_model = lambda: "image-model"
+        plugin._is_vip_user = lambda uid, event: False
+        plugin._get_rebellious_hint = lambda prompt, uid, event: ""
+        event = types.SimpleNamespace(
+            message_str="",
+            unified_msg_origin="test-session",
+            get_sender_id=lambda: "user",
+            get_group_id=lambda: "group",
+            send=AsyncMock(),
+        )
+
+        result = await plugin.text_to_image_tool(
+            event,
+            prompt="Generate a natural daily life photo of 菲比, preserve the persona reference image",
+            aspect_ratio="4:3",
+            resolution="4K",
+        )
+
+        plugin.persona_photo_tool.assert_not_awaited()
+        self.assertEqual(plugin._run_background_task.await_args.args[1], [])
+        self.assertTrue(result.startswith("[TOOL_SUCCESS]"))
+
+    async def test_smart_tool_uses_original_message_for_persona_fallback(self):
+        plugin = self.make_plugin()
+        plugin._persona_mode = True
+        plugin._context_rounds = 20
+        plugin._auto_detect_confidence = 0.8
+        plugin.conf.update({
+            "persona_name": "菲比",
+            "persona_trigger_keywords": ["菲比"],
+        })
+        plugin.persona_photo_tool = AsyncMock(side_effect=AssertionError("expanded prompt was misrouted"))
+        plugin._check_image_cooldown = lambda uid: (False, 0)
+        plugin._extract_message_info = lambda event: {
+            "content": event.message_str,
+            "has_image": False,
+        }
+        plugin.ctx_mgr = types.SimpleNamespace(get_recent_messages=AsyncMock(return_value=[]))
+        plugin._has_recent_session_image_context = AsyncMock(return_value=False)
+        plugin._get_conf_bool = lambda key, default=True: False if key == "llm_show_progress" else default
+        plugin._process_prompt_and_preset = lambda prompt: (prompt, "自定义", "")
+        plugin._check_quota = AsyncMock(return_value={"allowed": True, "source": "free"})
+        plugin._update_image_cooldown = lambda uid: None
+        plugin._register_pending_generation = AsyncMock()
+        plugin._run_background_task = AsyncMock(return_value=(True, ""))
+        plugin._is_vip_user = lambda uid, event: False
+        plugin._get_rebellious_hint = lambda prompt, uid, event: ""
+        event = types.SimpleNamespace(
+            message_str="菲比做一张原神联动金铲铲的宣传海报 4:3 4K",
+            unified_msg_origin="test-session",
+            get_sender_id=lambda: "user",
+            get_group_id=lambda: "group",
+            send=AsyncMock(),
+        )
+        analyzer = plugin.smart_generate_tool.__func__.__globals__["LLMTaskAnalyzer"]
+        with patch.object(
+            analyzer,
+            "analyze_task_type",
+            return_value={
+                "task_type": "text_to_image",
+                "confidence": 0.95,
+                "reason": "poster",
+                "suggested_prompt": "菲比做一张原神联动金铲铲的宣传海报",
+            },
+            create=True,
+        ):
+            result = await plugin.smart_generate_tool(
+                event,
+                user_request="Generate a natural daily life photo of 菲比, preserve the persona reference image",
+            )
+
+        plugin.persona_photo_tool.assert_not_awaited()
+        self.assertEqual(plugin._run_background_task.await_args.args[1], [])
+        self.assertTrue(result.startswith("[TOOL_SUCCESS]"))
+
     async def test_persona_failure_returns_failure_without_sending_raw_error(self):
         plugin, event = self.make_persona("拍一张照片")
         plugin._run_background_task.return_value = (False, "HTTP 500 internal provider error")
