@@ -1,4 +1,5 @@
 import io
+import math
 import re
 from typing import Dict, Optional
 
@@ -33,6 +34,37 @@ _SIZE_TO_PARAMS = {
     for aspect_ratio, size in ratios.items()
 }
 
+# 非标准比例没有预设尺寸，按目标面积等比推算：面积取各档常用预设定面积，
+# 保证 9:20、20:9 这类比例的出图体积与同档标准比例接近。
+_TARGET_AREA_BY_RESOLUTION = {
+    "1K": 1024 * 1024,
+    "2K": 2048 * 1536,
+    "4K": 3840 * 2160,
+}
+_MAX_SIZE_SIDE = 4096
+_SIZE_ALIGN = 16
+
+
+def _parse_aspect_ratio_pair(value: Optional[str]) -> Optional[tuple[int, int]]:
+    """把 ``9:20`` / ``9/20`` / ``9*20`` / ``9x20`` 这类写法解析成最简整数比。"""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    for separator in ("：", "/", "x", "X", "×", "*"):
+        text = text.replace(separator, ":")
+    text = re.sub(r"\s+", "", text)
+    match = re.fullmatch(r"(\d+):(\d+)", text)
+    if not match:
+        return None
+    w, h = int(match.group(1)), int(match.group(2))
+    if w <= 0 or h <= 0:
+        return None
+    ratio = w / h
+    if ratio < 0.1 or ratio > 10.0:
+        return None
+    divisor = math.gcd(w, h)
+    return (w // divisor, h // divisor)
+
 
 def normalize_resolution(value: Optional[str], default: str = "1K") -> str:
     text = str(value or "").strip().upper().replace(" ", "")
@@ -44,15 +76,63 @@ def normalize_resolution(value: Optional[str], default: str = "1K") -> str:
 
 
 def normalize_aspect_ratio(value: Optional[str], default: str = "1:1") -> str:
-    text = str(value or "").strip()
-    for separator in ("：", "/", "x", "X", "×", "*"):
-        text = text.replace(separator, ":")
-    text = re.sub(r"\s+", "", text)
-    return text if text in SUPPORTED_ASPECT_RATIOS else default
+    """归一化为最简 ``W:H``；保留 9:20 这类非标准比例，非法值回退默认比例。"""
+    parsed = _parse_aspect_ratio_pair(value)
+    if parsed:
+        return f"{parsed[0]}:{parsed[1]}"
+    parsed_default = _parse_aspect_ratio_pair(default)
+    return f"{parsed_default[0]}:{parsed_default[1]}" if parsed_default else "1:1"
+
+
+def find_closest_standard_aspect_ratio(aspect_ratio: str) -> str:
+    """把任意比例吸附到最接近的预设比例。
+
+    Gemini 的 ``imageConfig.aspectRatio`` 只接受枚举值，发送前需要用它兜底。
+    """
+    parsed = _parse_aspect_ratio_pair(aspect_ratio)
+    if not parsed:
+        return "1:1"
+    actual_ratio = parsed[0] / parsed[1]
+    return min(
+        SUPPORTED_ASPECT_RATIOS,
+        key=lambda item: abs(actual_ratio - (int(item.split(":")[0]) / int(item.split(":")[1]))),
+    )
+
+
+def compute_size_for_aspect_ratio(resolution: str, aspect_ratio: str) -> str:
+    """返回该分辨率下的像素尺寸。
+
+    预设比例直接用映射表；非标准比例按目标面积等比计算，宽高取 16 的整数倍，
+    长边不超过 4096，避免 9:20 这类竖图被改成更宽的比例。
+    """
+    norm_res = normalize_resolution(resolution)
+    norm_ratio = normalize_aspect_ratio(aspect_ratio)
+    preset_map = IMAGE_SIZE_MAP.get(norm_res, IMAGE_SIZE_MAP["1K"])
+    if norm_ratio in preset_map:
+        return preset_map[norm_ratio]
+
+    parsed = _parse_aspect_ratio_pair(norm_ratio)
+    if not parsed:
+        return preset_map["1:1"]
+    rw, rh = parsed
+    target_area = _TARGET_AREA_BY_RESOLUTION.get(norm_res, 1024 * 1024)
+
+    raw_w = math.sqrt(target_area * (rw / rh))
+    raw_h = raw_w * rh / rw
+
+    # 两边使用同一缩放系数，不能单独截断长边，否则竖幅比例会被改掉。
+    scale = min(1.0, _MAX_SIZE_SIDE / max(raw_w, raw_h))
+    width = max(256, int(round((raw_w * scale) / _SIZE_ALIGN)) * _SIZE_ALIGN)
+    height = max(256, int(round((raw_h * scale) / _SIZE_ALIGN)) * _SIZE_ALIGN)
+    return f"{width}x{height}"
 
 
 def detect_aspect_ratio_from_image(image_data: bytes, default: str = "1:1") -> str:
-    """读取图片尺寸，并吸附到最接近的常规宽高比。"""
+    """读取图片尺寸，返回最简宽高比。
+
+    这里保留原图的真实比例（如手机长截图 9:20），不再吸附到预设比例，
+    否则图生图会按错误比例生成，画面被拉伸。
+    """
     if not image_data:
         return normalize_aspect_ratio(default)
     try:
@@ -61,11 +141,8 @@ def detect_aspect_ratio_from_image(image_data: bytes, default: str = "1:1") -> s
         if width <= 0 or height <= 0:
             return normalize_aspect_ratio(default)
 
-        actual_ratio = width / height
-        return min(
-            SUPPORTED_ASPECT_RATIOS,
-            key=lambda item: abs(actual_ratio - (int(item.split(":")[0]) / int(item.split(":")[1]))),
-        )
+        parsed = _parse_aspect_ratio_pair(f"{width}:{height}")
+        return f"{parsed[0]}:{parsed[1]}" if parsed else normalize_aspect_ratio(default)
     except Exception:
         return normalize_aspect_ratio(default)
 
@@ -77,10 +154,11 @@ def resolve_image_generation_params(
     resolution: Optional[str] = None,
     aspect_ratio: Optional[str] = None,
 ) -> Dict[str, str]:
-    """从提示词和显式参数中解析图片分辨率、比例及 OpenAI size。
+    """解析图片分辨率、比例及接口 size。
 
-    显式参数优先于提示词；提示词优先于配置默认值。若提示词包含映射表中的
-    精确像素尺寸（如 3840x2160），会同时反推出 4K 与 16:9。
+    优先级：显式参数 > 提示词 > 配置默认值。显式参数接受任意 ``W:H``；
+    提示词解析保持向后兼容，只识别预设比例和映射表中的精确像素尺寸
+    （如 3840x2160 → 4K + 16:9），避免把 ``20:30`` 这类文本误判成画幅。
     """
     text = str(prompt or "")
     detected_resolution = None
@@ -116,5 +194,5 @@ def resolve_image_generation_params(
     return {
         "resolution": final_resolution,
         "aspect_ratio": final_ratio,
-        "size": IMAGE_SIZE_MAP[final_resolution][final_ratio],
+        "size": compute_size_for_aspect_ratio(final_resolution, final_ratio),
     }
