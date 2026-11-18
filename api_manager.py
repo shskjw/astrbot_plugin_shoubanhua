@@ -10,7 +10,11 @@ from urllib.parse import urlparse
 import aiohttp
 from typing import List, Dict
 from astrbot import logger
-from .generation_params import detect_aspect_ratio_from_image, resolve_image_generation_params
+from .generation_params import (
+    detect_aspect_ratio_from_image,
+    find_closest_standard_aspect_ratio,
+    resolve_image_generation_params,
+)
 from .utils import normalize_api_root
 
 
@@ -1107,6 +1111,15 @@ class ApiManager:
                 logger.info(f"Gemini API 地址已按接口模式规范化为: {url}")
             headers["x-goog-api-key"] = key
 
+            # Gemini 的 imageConfig.aspectRatio 只接受固定枚举，先吸附再发送，
+            # 否则 9:20、20:9 这类任意比例会直接 400。
+            provider_aspect_ratio = find_closest_standard_aspect_ratio(generation_params["aspect_ratio"])
+            if provider_aspect_ratio != generation_params["aspect_ratio"]:
+                logger.info(
+                    f"Gemini 仅支持标准比例，已将 {generation_params['aspect_ratio']} "
+                    f"吸附为 {provider_aspect_ratio}"
+                )
+
             parts = [{"text": final_prompt}]
             for img in images:
                 mime = self.get_mime_type(img)
@@ -1118,7 +1131,7 @@ class ApiManager:
                     "maxOutputTokens": 4096,
                     "responseModalities": ["TEXT", "IMAGE"],
                     "imageConfig": {
-                        "aspectRatio": generation_params["aspect_ratio"],
+                        "aspectRatio": provider_aspect_ratio,
                         "imageSize": generation_params["resolution"],
                     },
                 },
@@ -1165,8 +1178,9 @@ class ApiManager:
                                               "HARM_CATEGORY_CIVIC_INTEGRITY"]]
 
                 # 兼容通过 OpenAI chat/completions 转发 Gemini 图片模型的中转站。
+                # 这类中转最终仍走 Gemini，比例同样需要吸附到标准枚举。
                 payload["image_config"] = {
-                    "aspect_ratio": generation_params["aspect_ratio"],
+                    "aspect_ratio": find_closest_standard_aspect_ratio(generation_params["aspect_ratio"]),
                     "image_size": generation_params["resolution"],
                 }
         
